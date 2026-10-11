@@ -49,7 +49,8 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
     public record Claim(String nodeKey, String worldId, String mailbox, String domainId,
                         long planSequence, int position, long expectedVersion, long worldEpoch,
                         long expireTick, HolderKind holderKind, String holderSiteId,
-                        Set<String> writeSet, Object levelRef) {
+                        Set<String> writeSet, Object levelRef,
+                        WriteControlledSlots.WriteSpace space) {
     }
 
     /** One batch a claim landed, named the way the commit log identifies a batch. It is reported for
@@ -85,6 +86,8 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
     private final Map<String, LongAdder> landedByNode = new ConcurrentHashMap<>();
 
     private volatile WriteControlledSlots table = WriteControlledSlots.NOTHING;
+    private volatile Function<JobGraph.Node, WriteControlledSlots.WriteSpace> writeSpaces =
+        node -> WriteControlledSlots.WriteSpace.NONE;
     private volatile Map<String, Claim> declarations = Map.of();
     private volatile String lastWindow = "";
     private volatile boolean enabled;
@@ -123,6 +126,14 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
     /** Names the claim table a seated slot is registered in. */
     public void table(WriteControlledSlots slots) {
         this.table = slots == null ? WriteControlledSlots.NOTHING : slots;
+    }
+
+    /** Names where the spatial range a declared job writes in is read from. The plan a deployment
+     * freezes today declares a world, a domain and a level and no range, so no claim is made until
+     * a reader is wired in: a write set that cannot be placed is never turned into a claim. */
+    public void writeSpaces(Function<JobGraph.Node, WriteControlledSlots.WriteSpace> reader) {
+        this.writeSpaces = reader == null
+            ? node -> WriteControlledSlots.WriteSpace.NONE : reader;
     }
 
     /** Decides whether a declared write set is turned into a claim at all. Off, no window seats or
@@ -223,10 +234,11 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
             long generation = ++generations;
             WriteControlledSlots.Slot slot = new WriteControlledSlots.Slot(
                 new WriteControlledSlots.SlotKey(claim.worldId(), claim.domainId(),
-                    WriteLevel.REGION, claim.mailbox(), claim.planSequence()),
+                    WriteLevel.REGION, WriteControlledSlots.SlotKey.segmentOf(claim.space()),
+                    claim.planSequence()),
                 claim.levelRef(), claim.nodeKey(), claim.position(), claim.expectedVersion(),
                 generation, claim.worldEpoch(), claim.expireTick(), claim.holderKind(),
-                claim.holderSiteId(), claim.writeSet());
+                claim.holderSiteId(), claim.writeSet(), claim.space());
             if (table.register(slot) != WriteControlledSlots.Refusal.NONE) {
                 refused++;
                 continue;
@@ -481,6 +493,14 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
             emptyWriteSet++;
             return null;
         }
+        WriteControlledSlots.WriteSpace space = writeSpaces.apply(node);
+        if (space == null || !space.wellFormed()) {
+            // A claim names the writes of one job, and a write is placed by the range it falls in.
+            // A declaration that names no range leaves the write set unplaceable, so no slot is
+            // declared for it and its writes keep the path they had.
+            emptyWriteSet++;
+            return null;
+        }
         JobDeclaration.OwnerDemand demand = demandOf(node);
         if (demand == null) {
             noDemand++;
@@ -505,7 +525,7 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
         int hold = Math.max(1, demand.holdTicks());
         return new Claim(node.key(), node.worldId(), mailbox, node.domainId(), planSequence,
             node.position(), version, epoch, tick + hold, demand.holderKind(), demand.holderSiteId(),
-            Set.copyOf(paths), level);
+            Set.copyOf(paths), level, space);
     }
 
     private static JobDeclaration.OwnerDemand demandOf(JobGraph.Node node) {

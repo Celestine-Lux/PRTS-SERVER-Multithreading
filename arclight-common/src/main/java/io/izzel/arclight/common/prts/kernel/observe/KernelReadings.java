@@ -323,6 +323,9 @@ public final class KernelReadings {
         add(lines, "write.controlled.last.position", decision == null ? -1 : decision.position());
         add(lines, "write.controlled.last.write_set_digest", decision == null ? "none"
             : decision.writeSetDigest());
+        add(lines, "write.controlled.last.space_digest", decision == null ? "none"
+            : decision.spaceDigest());
+        add(lines, "write.controlled.last.covering", decision == null ? 0 : decision.covering());
         WriteControlledSlots.WriteRefusal refusal = slots.lastRefusal();
         add(lines, "write.controlled.last_refusal.reason", refusal == null ? "none"
             : refusal.reason());
@@ -352,6 +355,10 @@ public final class KernelReadings {
             : refusal.slotGeneration());
         add(lines, "write.controlled.last_refusal.write_set_digest", refusal == null ? "none"
             : refusal.writeSetDigest());
+        add(lines, "write.controlled.last_refusal.space_digest", refusal == null ? "none"
+            : refusal.spaceDigest());
+        add(lines, "write.controlled.last_refusal.covering", refusal == null ? 0
+            : refusal.covering());
     }
 
     private static void intentQueue(List<String> lines, KernelModule module) {

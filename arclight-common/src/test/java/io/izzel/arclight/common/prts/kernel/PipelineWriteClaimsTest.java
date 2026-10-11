@@ -21,11 +21,15 @@ import io.izzel.arclight.common.prts.kernel.shares.ShareClass;
 import io.izzel.arclight.common.prts.kernel.sites.IntentPayloadDirectory;
 import io.izzel.arclight.common.prts.kernel.sites.WriteClaimTable;
 import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots;
+import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots.CellKind;
 import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots.Verdict;
+import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots.WritePosition;
+import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots.WriteSpace;
 import io.izzel.arclight.common.prts.kernel.sites.WritePath;
 import io.izzel.arclight.common.prts.kernel.sites.WritePathCounters;
 import io.izzel.arclight.common.prts.kernel.sites.WorldWriteGuard;
 import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
+import net.minecraft.core.SectionPos;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -35,6 +39,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The claim a declared write set becomes, and the write it covers.
@@ -58,6 +63,13 @@ class PipelineWriteClaimsTest {
     private static final Object LEVEL = new Object();
     private static final Object OTHER_LEVEL = new Object();
 
+    /** The one section the fixture declares every job writes in, and one position inside it. A
+     * deployment reads the range out of the declaration a job carries; no such declaration exists
+     * yet, so the reader here is the fixture and the default reader names none. */
+    private static final WriteSpace SPACE =
+        WriteSpace.of(CellKind.SECTION, SectionPos.asLong(0, 4, 0));
+    private static final WritePosition WITNESS = WritePosition.at(8, 64, 8);
+
     @Test
     void aDeclaredJobOfAClaimedDomainClaimsTheWritePathKeyOfItsOwnWriteSet() {
         Scratch scratch = new Scratch();
@@ -74,7 +86,24 @@ class PipelineWriteClaimsTest {
         assertEquals(Set.of(WritePath.BLOCK_WRITE.key()), claim.writeSet());
         assertFalse(claim.writeSet().contains("*"), "the table never hands out a wildcard");
         assertTrue(claim.expectedVersion() > 0L, "a claim names the version its slot carries");
+        assertTrue(claim.space().wellFormed(), "a claim names the range its writes fall in");
         assertEquals(scratch.claims.worldOf(LEVEL), WORLD, "the level is placed");
+    }
+
+    @Test
+    void aJobWhoseDeclarationNamesNoRangeIsNeverClaimed() {
+        Scratch scratch = new Scratch();
+        scratch.claims.writeSpaces(null);
+        scratch.declare(ROUNDS);
+
+        assertEquals(0, scratch.claims.active(), "a write set that cannot be placed makes no claim");
+        assertEquals(1L, scratch.claims.emptyWriteSetCount());
+        scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
+        assertEquals(0, scratch.slots.slots(), "no slot is declared for an unplaceable write set");
+        assertEquals(0L, scratch.claims.seatedCount());
+        assertEquals(0L, scratch.slots.registeredCount(), "the register point is never reached");
+        assertEquals(Verdict.DEFAULT_PATH, scratch.judge(WritePath.BLOCK_WRITE.key()));
+        assertEquals(0L, scratch.slots.rejectedCount());
     }
 
     @Test
@@ -86,29 +115,31 @@ class PipelineWriteClaimsTest {
         assertEquals(1, scratch.slots.slots(), "the claim is seated while its job runs");
         assertEquals(1L, scratch.claims.seatedCount());
 
-        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL), "the covered write leaves the short path");
-        WriteControlledSlots.Decision decision = scratch.slots.lastDecision();
-        assertEquals(Verdict.CAPTURED, decision.verdict());
-        assertEquals(NODE_KEY, decision.planNodeKey());
-        assertEquals(PLAN_SEQUENCE, decision.planSequence());
-        assertEquals(scratch.graph.nodes().get(0).position(), decision.position());
-        assertFalse(decision.writeSetDigest().isEmpty());
+        WriteControlledSlots.Slot claim = scratch.capture();
+        assertEquals(NODE_KEY, scratch.slots.lastDecision().planNodeKey());
+        assertEquals(PLAN_SEQUENCE, scratch.slots.lastDecision().planSequence());
+        assertEquals(scratch.graph.nodes().get(0).position(), scratch.slots.lastDecision().position());
+        assertFalse(claim.pathDigest().isEmpty());
+        assertFalse(claim.spaceDigest().isEmpty());
 
-        assertTrue(scratch.guard.admitBlockWrite(LEVEL, WORLD, null), "the judged path takes it");
-        assertEquals(WriteDisposition.GRANT, scratch.guard.lastDecision().disposition(),
-            () -> "code=" + scratch.guard.lastDecision().code());
+        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL),
+            "a write a declared range could cover leaves the short path");
+        assertEquals(Verdict.REJECTED, scratch.slots.lastDecision().verdict(),
+            "the short path names no position, so the write is refused and not matched by world");
+        assertEquals("segment", scratch.slots.lastRefusal().reason());
+        assertNull(scratch.slots.lastCoveredSlot(), "a refused write seats no claim either");
+
+        scratch.claims.noteLanded(claim, WORLD);
         assertEquals(1L, scratch.claims.landedWriteCount());
-        assertEquals(1L, scratch.guard.landedWrites());
-        assertEquals(1L, scratch.guard.claimedWrites());
 
         scratch.claims.ownerTaskEnd(WORLD, MAILBOX);
         assertEquals(0, scratch.slots.slots());
         assertEquals(1L, scratch.claims.disarmedCount());
-        assertEquals(0, scratch.guard.classifyBlockWrite(LEVEL),
+        assertEquals(Verdict.DEFAULT_PATH, scratch.judge(WritePath.BLOCK_WRITE.key()),
             "the write after the window is not a write of that job");
         assertEquals(1L, scratch.slots.defaultPathCount());
         assertEquals(1L, scratch.slots.capturedCount());
-        assertEquals(0L, scratch.slots.rejectedCount());
+        assertEquals(1L, scratch.slots.rejectedCount());
         assertTrue(scratch.slots.conservationHolds());
     }
 
@@ -118,8 +149,7 @@ class PipelineWriteClaimsTest {
         scratch.declare(ROUNDS);
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
 
-        assertEquals(Verdict.DEFAULT_PATH,
-            scratch.slots.judge(LEVEL, WritePath.KERNEL_COMMIT.key(), TICK).verdict());
+        assertEquals(Verdict.DEFAULT_PATH, scratch.judge(WritePath.KERNEL_COMMIT.key()));
         assertEquals(0L, scratch.slots.rejectedCount(), "a write outside the set is never refused");
         assertEquals(1L, scratch.slots.defaultPathCount());
 
@@ -152,9 +182,9 @@ class PipelineWriteClaimsTest {
         scratch.claims.ownerTaskBegin(PrtsPipelineRows.UNPLACED_WORLD, MAILBOX);
         assertEquals(1L, scratch.claims.unplacedWindowCount());
         assertEquals(1, scratch.slots.slots(), "the declared job of that mailbox is seated");
-        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL),
+        scratch.capture();
+        assertEquals(Verdict.CAPTURED, scratch.slots.lastDecision().verdict(),
             "the level the write arrives on decides which claim covers it");
-        assertEquals(Verdict.CAPTURED, scratch.slots.lastDecision().verdict());
         scratch.claims.ownerTaskEnd(PrtsPipelineRows.UNPLACED_WORLD, MAILBOX);
         assertEquals(0, scratch.slots.slots());
         assertEquals(1L, scratch.claims.disarmedCount());
@@ -231,7 +261,7 @@ class PipelineWriteClaimsTest {
         assertEquals(Set.of(WritePath.BLOCK_WRITE.key()), rows.get(0).writeSet());
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
         assertEquals(1, scratch.slots.slots());
-        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL),
+        assertEquals(Verdict.CAPTURED, scratch.judge(WritePath.BLOCK_WRITE.key()),
             "the write of its own world is covered, the other world is not");
     }
 
@@ -253,8 +283,10 @@ class PipelineWriteClaimsTest {
         assertEquals("version", scratchOf(scratch -> scratch.versions.advance(WORLD, WriteLevel.REGION,
             DOMAIN)));
         assertEquals("version", scratchOf(scratch -> scratch.versions.reset()));
-        assertEquals("expiry", scratchOf(scratch -> scratch.guard.refresh(true, false, false,
-            TICK + 41L)));
+        assertEquals("expiry", scratchOf(scratch -> {
+            scratch.guard.refresh(true, false, false, TICK + 41L);
+            scratch.tick = TICK + 41L;
+        }));
         assertEquals("world", scratchOf(scratch -> scratch.source.world = OTHER_WORLD));
         assertEquals("plan", scratchOf(scratch -> scratch.source.planHolds = false));
         assertEquals("plan_sequence", scratchOf(scratch -> scratch.source.step =
@@ -272,8 +304,7 @@ class PipelineWriteClaimsTest {
             version, 0L, 0L, HolderKind.REGISTERED, OTHER_HOLDER)));
 
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
-        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL));
-        assertEquals(Verdict.REJECTED, scratch.slots.lastDecision().verdict());
+        assertEquals(Verdict.REJECTED, scratch.judge(WritePath.BLOCK_WRITE.key()));
         assertEquals("owner", scratch.slots.lastRefusal().reason());
         assertEquals(HOLDER, scratch.slots.lastRefusal().siteId(),
             "the refusal names the holder the slot was declared with");
@@ -317,8 +348,7 @@ class PipelineWriteClaimsTest {
         assertTrue(reports.isEmpty());
 
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
-        scratch.guard.classifyBlockWrite(LEVEL);
-        assertTrue(scratch.guard.admitBlockWrite(LEVEL, WORLD, null));
+        scratch.claims.noteLanded(scratch.capture(), WORLD);
         scratch.claims.ownerTaskEnd(WORLD, MAILBOX);
         assertEquals(1, scratch.claims.reportLanded(graph, reports::add));
         PipelineWriteClaims.Report report = reports.get(0);
@@ -337,8 +367,7 @@ class PipelineWriteClaimsTest {
         Scratch scratch = new Scratch();
         scratch.declare(ROUNDS);
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
-        scratch.guard.classifyBlockWrite(LEVEL);
-        assertTrue(scratch.guard.admitBlockWrite(LEVEL, WORLD, null));
+        scratch.claims.noteLanded(scratch.capture(), WORLD);
         scratch.claims.ownerTaskEnd(WORLD, MAILBOX);
         List<PipelineWriteClaims.Report> reports = new ArrayList<>();
 
@@ -389,8 +418,8 @@ class PipelineWriteClaimsTest {
         scratch.declare(ROUNDS);
         move.accept(scratch);
         scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
-        assertEquals(1, scratch.guard.classifyBlockWrite(LEVEL),
-            "a covered write whose contract fails does not take the short path");
+        assertEquals(Verdict.REJECTED, scratch.judge(WritePath.BLOCK_WRITE.key()),
+            "a covered write whose contract fails is refused");
         assertEquals(Verdict.REJECTED, scratch.slots.lastDecision().verdict());
         String reason = scratch.slots.lastRefusal().reason();
         assertNotNull(scratch.slots.lastRefusal().writeSetDigest());
@@ -408,6 +437,7 @@ class PipelineWriteClaimsTest {
 
         private boolean judge = true;
         private boolean levelPresent = true;
+        private long tick = TICK;
         private JobGraph graph;
 
         private final WritePathCounters counters = new WritePathCounters();
@@ -441,11 +471,25 @@ class PipelineWriteClaimsTest {
             slots.refresh(true);
             grants.refresh(true);
             claims.table(slots);
+            claims.writeSpaces(node -> SPACE);
             claims.refresh(true);
         }
 
         /** Plans the rounds the pipeline ran and turns the declared write set into a claim, the way
          * the plan freeze does: version first, then the right, then the claim. */
+        /** Captures one write of the running job through the claim table itself: the position a
+         * write is made at reaches the table with the payload of the judged path, which is wired in
+         * a later change, so the range is driven here with an explicit position. */
+        private WriteControlledSlots.Slot capture() {
+            assertEquals(Verdict.CAPTURED, judge(WritePath.BLOCK_WRITE.key()),
+                () -> "refusal=" + slots.lastRefusal());
+            return slots.lastCoveredSlot();
+        }
+
+        private Verdict judge(String domainKey) {
+            return slots.judge(LEVEL, domainKey, WITNESS, tick).verdict();
+        }
+
         private JobGraph declare(long rounds) {
             for (long round = 0; round < rounds; round++) {
                 jobs.ownerRound(WORLD, MAILBOX);
