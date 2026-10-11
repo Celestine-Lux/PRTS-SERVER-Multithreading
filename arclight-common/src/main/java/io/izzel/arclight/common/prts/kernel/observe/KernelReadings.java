@@ -100,6 +100,7 @@ public final class KernelReadings {
         exits(lines, module);
         pipelineRows(lines, module);
         pipelineJobs(lines, module);
+        pipelineRights(lines, module);
         tickDigest(lines, module);
         arrivalDigest(lines, module);
         loadObservation(lines, module);
@@ -392,6 +393,8 @@ public final class KernelReadings {
         OwnerRegistry owners = module.owners();
         OwnerGrantPoint grants = module.ownerGrants();
         add(lines, "token.active", owners.activeTokens());
+        add(lines, "token.acquire_calls", owners.acquireCalls());
+        add(lines, "token.release_calls", owners.releaseCalls());
         add(lines, "token.acquired", owners.acquiredCount());
         add(lines, "token.reacquired", owners.reacquiredCount());
         add(lines, "token.released", owners.releasedCount());
@@ -1315,6 +1318,19 @@ public final class KernelReadings {
         for (int index = 0; index < traced.size(); index++) {
             add(lines, "r02.node." + (index + 1), traced.get(index));
         }
+    }
+
+    /** The write rights the jobs of the chunk pipeline hold, reviewed against the write sets their
+     * own declarations froze: which key holds a credential, whether the version it names is the one
+     * the slot of that key carries, whether the domains actually held are covered by the declared
+     * sets, and whether an observed domain set has a writer the write face could attribute it to. A
+     * right is not a write: nothing here counts a landing. */
+    private static void pipelineRights(List<String> lines, KernelModule module) {
+        long blockWrites = module.guard().counters().attemptsAt(WritePath.BLOCK_WRITE);
+        PipelineRightReview.Review review = PipelineRightReview.of(module.plans().latest(),
+            module.owners(), module.versionSlots(), module.ownerGrants(), blockWrites,
+            module.controlledSlots().slots());
+        lines.addAll(review.lines());
     }
 
     /** The write domains one node carries, each as its world, domain and level. */

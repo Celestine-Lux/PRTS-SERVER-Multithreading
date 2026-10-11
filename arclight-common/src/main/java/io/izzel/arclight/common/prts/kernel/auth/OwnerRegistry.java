@@ -85,6 +85,16 @@ public final class OwnerRegistry {
         return Map.copyOf(tokens);
     }
 
+    /** How often a domain was asked for; every acquisition leaves by one of the three counts. */
+    public long acquireCalls() {
+        return acquireCalls.get();
+    }
+
+    /** How often a domain was released; every release leaves by one of the two counts. */
+    public long releaseCalls() {
+        return releaseCalls.get();
+    }
+
     public long acquiredCount() {
         return acquired.get();
     }

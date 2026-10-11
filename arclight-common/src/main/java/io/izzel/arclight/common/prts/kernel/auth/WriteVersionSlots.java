@@ -60,6 +60,17 @@ public final class WriteVersionSlots {
         return version;
     }
 
+    /** The version a domain's slot carries right now, without counting a lookup: a review of the
+     * right a plan handed out asks which value that right names, and asking must not move the reading
+     * it is there to explain. A missing slot is the declared absence. */
+    public long peek(String worldId, WriteLevel level, String domainId) {
+        if (worldId == null || domainId == null) {
+            return NOT_CARRIED;
+        }
+        Long version = slots.get(new OwnershipDomain(worldId, level, domainId));
+        return version == null ? NOT_CARRIED : version;
+    }
+
     /** Grants the slot of one declared write domain. The first grant mints a value, a later one
      * keeps the value already there, because only an invalidation retires a version. */
     public long grant(String worldId, WriteLevel level, String domainId) {

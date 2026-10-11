@@ -7,6 +7,7 @@ import io.izzel.arclight.common.prts.kernel.auth.OwnerToken;
 import io.izzel.arclight.common.prts.kernel.auth.WriteLevel;
 import io.izzel.arclight.common.prts.kernel.auth.WriteVersionSlots;
 
+import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -66,6 +67,19 @@ public final class WriteControlledSlots {
         }
     }
 
+    /** The fold of a declared write set, over the keys of the set: two sets that declare the same
+     * keys fold to the same digest, so the digest names a set wherever it is read - in the slot a
+     * claim carries, and in the review that compares a declared set with the set actually held. */
+    public static String fold(Collection<String> writeSet) {
+        long hash = FOLD_BASIS;
+        for (String key : new TreeSet<>(writeSet == null ? Set.of() : writeSet)) {
+            for (int index = 0; index < key.length(); index++) {
+                hash = (hash ^ key.charAt(index)) * FOLD_PRIME;
+            }
+        }
+        return Long.toHexString(hash);
+    }
+
     /** One declared slot: the write set it covers and the contract a covered write has to satisfy.
      * Every field the design asks a slot to carry is here, and the write set is the only thing that
      * moves a write off the default path. */
@@ -80,13 +94,7 @@ public final class WriteControlledSlots {
         /** The fold of the declared write set: two slots that declare the same set fold to the same
          * digest, and a write it carries it as the batch identity of the claim. */
         public String writeSetDigest() {
-            long hash = FOLD_BASIS;
-            for (String key : new TreeSet<>(writeSet)) {
-                for (int index = 0; index < key.length(); index++) {
-                    hash = (hash ^ key.charAt(index)) * FOLD_PRIME;
-                }
-            }
-            return Long.toHexString(hash);
+            return fold(writeSet);
         }
     }
 
