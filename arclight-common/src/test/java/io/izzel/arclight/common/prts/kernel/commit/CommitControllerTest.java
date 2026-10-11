@@ -1,0 +1,455 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+package io.izzel.arclight.common.prts.kernel.commit;
+
+import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** The one control path of a controlled write, exercised on a synthetic publish action: what a
+ * reservation takes before the side effect, what each terminal does with it, where a reset may
+ * happen, and what a refusal leaves behind. No host supplier and no world take part. */
+class CommitControllerTest {
+
+    private static final String WORLD = "world-a";
+    private static final String DOMAIN = "entity";
+    private static final String NODE = "a/0";
+    private static final long EFFECT = 9L;
+    private static final long OTHER_LIFETIME = 5150L;
+
+    /** A plan that can be rebuilt under a line that already took its place. */
+    private static final class Plans implements CommitLog.OrderSource {
+
+        long plan = 7L;
+        int position = 0;
+        int resolveCalls;
+
+        @Override
+        public CommitLog.Resolved resolve(String worldId, String domainId, String nodeKey) {
+            resolveCalls++;
+            if (!WORLD.equals(worldId) || !DOMAIN.equals(domainId) || nodeKey == null) {
+                return null;
+            }
+            return switch (nodeKey) {
+                case "a/0" -> new CommitLog.Resolved(plan, position, false);
+                case "a/1" -> new CommitLog.Resolved(plan, position + 1, false);
+                case "a/2" -> new CommitLog.Resolved(plan + 1L, 0, false);
+                default -> null;
+            };
+        }
+    }
+
+    private static final class Fixture {
+
+        final Plans plans = new Plans();
+        final EffectStore store;
+        final CommitLog log;
+        final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
+        final CommitReservation reservations;
+
+        Fixture(int ringCap, int storeBytes, int storeRecords) {
+            store = new EffectStore(storeBytes, storeRecords);
+            log = new CommitLog(() -> ringCap, plans, store);
+            reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
+        }
+
+        CommitTicket.ReserveRequest request(String node, long plan, int position, int rows,
+                                            long effectRef, long instance) {
+            CommitNamespaces.Namespace producer = new CommitNamespaces.Namespace("producer",
+                OTHER_LIFETIME, 0L, 77L);
+            CommitNamespaces.Namespace controller = new CommitNamespaces.Namespace("owner-a",
+                reservations.controller().lifetime(), epochs.current(), 91L);
+            CommitLog.Identity identity = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, instance, 5L,
+                3L, "published", plan, effectRef, producer, controller);
+            return new CommitTicket.ReserveRequest(WORLD, DOMAIN, node, CommitLog.Batch.Kind.APPLY,
+                plan, position, plan, 4242L, rows, identity, controller,
+                effect(effectRef, "publish", new String[] {"a=1", "b=2"}, rows),
+                effect(effectRef, "publish", new String[] {"p=1", "p=2"}, rows),
+                effect(effectRef, "publish", new String[] {"e=1", "e=2"}, rows));
+        }
+
+        CommitTicket.ReserveRequest request(int rows) {
+            return request(NODE, plans.plan, plans.position, rows, EFFECT, 11L);
+        }
+    }
+
+    private static EffectStore.Effect effect(long ref, String operation, String[] rows, int count) {
+        List<String> content = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            content.add(index < rows.length ? rows[index] : "extra=" + index);
+        }
+        return new EffectStore.Effect(ref, operation, "declared", content);
+    }
+
+    private static CommitTicket.Outcome outcome(CommitTicket.Terminal terminal, int units) {
+        return new CommitTicket.Outcome(terminal, "publish", List.of("a=1", "b=2"), units, "");
+    }
+
+    private static CommitLog.Batch batch(String node) {
+        return new CommitLog.Batch(WORLD, DOMAIN, node, CommitLog.Batch.Kind.APPLY, 7L, 4242L, 2);
+    }
+
+    @Test
+    void aResetInsideThePublishActionWaitsForTheTerminalLine() {
+        Fixture f = new Fixture(2, 4096, 4);
+        long epoch = f.epochs.current();
+        CommitController[] holder = new CommitController[1];
+        AtomicReference<String> during = new AtomicReference<>();
+        holder[0] = new CommitController(f.reservations, ticket -> {
+            CommitController.ResetDecision decision = holder[0].resetAtSafePoint();
+            during.set(decision.reason() + "/" + (f.epochs.current() - epoch) + "/"
+                + f.reservations.outstanding() + "/" + f.reservations.publishing() + "/"
+                + f.log.reservedSlots() + "/" + f.store.capacitySlots());
+            return outcome(CommitTicket.Terminal.PUBLISHED, 3);
+        });
+        CommitController.SubmitResult result = holder[0].submit(f.request(2));
+
+        assertEquals("reentrant-publish/0/1/1/1/1", during.get(),
+            "mid-publish nothing moved: not the epoch, not the ticket, not one reservation");
+        assertTrue(result.admitted());
+        assertEquals(CommitTicket.Terminal.PUBLISHED, result.terminal());
+        assertEquals(1L, f.epochs.current() - epoch, "the deferred reset moved the generation once");
+        assertEquals(1L, holder[0].resets());
+        assertEquals(1L, holder[0].deferredResets());
+        assertEquals(1L, holder[0].resetReentrantRefusals());
+        assertFalse(holder[0].pendingReset());
+        assertEquals(0, f.reservations.outstanding());
+        assertEquals(0, f.log.reservedSlots());
+        assertEquals(0, f.store.capacitySlots());
+        assertEquals(1, f.log.lastResetTyped().typedSteps().size(),
+            "the line was recorded before the reset ended the lifecycle");
+        assertEquals(7L, f.log.lastResetTyped().typedSteps().get(0).planSequence());
+        assertEquals(0L, f.log.sequence(), "the reset started the log over after the line was read");
+
+        CommitReservation.FinalizeResult late = f.reservations.finalize(result.ticket(),
+            outcome(CommitTicket.Terminal.PUBLISHED, 3));
+        assertFalse(late.finalized(), "a terminal is never rewritten");
+        assertEquals("unknown-ticket", late.diagnostic());
+        assertEquals(1L, f.reservations.publishedTotal());
+    }
+
+    @Test
+    void aTicketOfAnEarlierGenerationIsRefusedInsteadOfQuietlyDropped() {
+        Fixture f = new Fixture(2, 4096, 4);
+        CommitTicket ticket = f.reservations.reserve(f.request(2)).ticket();
+        f.epochs.advance();
+
+        CommitReservation.FinalizeResult result = f.reservations.finalize(ticket,
+            outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        assertFalse(result.finalized());
+        assertEquals("stale-ticket", result.diagnostic());
+        assertEquals(1L, f.reservations.staleRefusals());
+        assertEquals(1, f.reservations.outstanding(), "the refused terminal left the ticket where it was");
+    }
+
+    @Test
+    void onlyASuccessfulPublishCountsAsPublished() {
+        Fixture success = new Fixture(2, 4096, 4);
+        CommitController published = new CommitController(success.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PUBLISHED, 3));
+        CommitController.SubmitResult first = published.submit(success.request(2));
+        assertEquals(1, first.successBatch());
+        assertEquals(3L, first.unitCount());
+        assertEquals(1L, success.reservations.publishedTotal());
+        assertEquals(1L, published.acceptedPublished());
+        assertEquals(3L, published.publishedUnits());
+        assertEquals(0L, success.reservations.partialTotal());
+
+        Fixture partial = new Fixture(2, 4096, 4);
+        CommitController half = new CommitController(partial.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PARTIAL, 1));
+        CommitController.SubmitResult second = half.submit(partial.request(2));
+        assertEquals(0, second.successBatch(), "a partial publish is not a successful batch");
+        assertEquals(0L, partial.reservations.publishedTotal());
+        assertEquals(1L, partial.reservations.partialTotal());
+        assertEquals(1, partial.log.ringDepth(), "a partial publish still writes its terminal line");
+
+        Fixture failed = new Fixture(2, 4096, 4);
+        CommitController broken = new CommitController(failed.reservations,
+            ticket -> outcome(CommitTicket.Terminal.FAILED, 0));
+        CommitController.SubmitResult third = broken.submit(failed.request(2));
+        assertEquals(0, third.successBatch());
+        assertEquals(1L, failed.reservations.failedTotal());
+        assertEquals(0L, failed.reservations.publishedTotal());
+
+        Fixture thrown = new Fixture(2, 4096, 4);
+        CommitController throwing = new CommitController(thrown.reservations, ticket -> {
+            throw new IllegalStateException("the publish action failed");
+        });
+        CommitController.SubmitResult fourth = throwing.submit(thrown.request(2));
+        assertEquals(CommitTicket.Terminal.FAILED, fourth.terminal());
+        assertEquals(1L, throwing.publishFailures());
+        assertEquals(1L, throwing.supplierCalls());
+        assertEquals(1L, thrown.reservations.failedTotal());
+        assertEquals("publisher-threw", thrown.reservations.terminalLedger().get(0).note());
+    }
+
+    @Test
+    void finalizeAsksNoPlanAndTakesNoCapacity() {
+        Fixture f = new Fixture(4, 4096, 4);
+        AtomicReference<String> during = new AtomicReference<>();
+        CommitController controller = new CommitController(f.reservations, ticket -> {
+            during.set(f.plans.resolveCalls + "/" + f.log.reservationsTaken() + "/" + f.store.tickets());
+            return outcome(CommitTicket.Terminal.PUBLISHED, 2);
+        });
+        CommitController.SubmitResult result = controller.submit(f.request(2));
+
+        assertEquals(during.get(), f.plans.resolveCalls + "/" + f.log.reservationsTaken() + "/"
+            + f.store.tickets(), "finalize resolved nothing and reserved nothing a second time");
+        assertEquals(1L, f.log.reservationsTaken());
+        assertEquals(1L, f.log.reservationsConsumed());
+        assertEquals(1L, f.store.capacityFinalized());
+        assertTrue(result.admitted());
+    }
+
+    @Test
+    void aRefusedRequestTakesNothingAndCallsNoPublishAction() {
+        Fixture f = new Fixture(2, 4096, 2);
+        CommitController controller = new CommitController(f.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        assertTrue(controller.submit(f.request("a/0", 7L, 0, 2, EFFECT, 11L)).admitted());
+
+        int slots = f.log.reservedSlots();
+        int capacitySlots = f.store.capacitySlots();
+        int reservedBytes = f.store.reservedBytes();
+        int capacityBytes = f.store.capacityReservedBytes();
+        int capacityRecords = f.store.capacityReservedRecords();
+        long sequence = f.log.sequence();
+        CommitController.SubmitResult refused = controller.submit(f.request("a/1", 7L, 1, 2, 12L, 12L));
+
+        assertFalse(refused.admitted());
+        assertEquals("effect-room", refused.diagnostic(), "the room of the record is what ran out");
+        assertEquals(1L, controller.supplierCalls(), "only the accepted write reached the action");
+        assertEquals(slots, f.log.reservedSlots());
+        assertEquals(capacitySlots, f.store.capacitySlots());
+        assertEquals(reservedBytes, f.store.reservedBytes());
+        assertEquals(capacityBytes, f.store.capacityReservedBytes());
+        assertEquals(capacityRecords, f.store.capacityReservedRecords());
+        assertEquals(sequence, f.log.sequence(), "a refused reservation takes no report number");
+        assertEquals(1, f.store.records(), "the refused reservation left no record behind");
+
+        CommitController.SubmitResult unplanned = controller.submit(f.request("a/2", 7L, 0, 2, 13L, 13L));
+        assertFalse(unplanned.admitted());
+        assertEquals("plan-ref-mismatch", unplanned.diagnostic());
+        assertEquals(1L, controller.supplierCalls());
+        assertEquals(sequence, f.log.sequence());
+    }
+
+    @Test
+    void theRoomOfTheRingAndThePlaceOfThePlanAreTwoColumns() {
+        Fixture f = new Fixture(2, 4096, 4);
+        CommitController controller = new CommitController(f.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        CommitTicket.ReserveRequest ahead = f.request("a/1", 7L, 1, 2, EFFECT, 11L);
+        assertTrue(f.reservations.reserve(ahead).admitted(), "one of the two slots is held");
+
+        f.log.beginTick(1);
+        CommitLog.Verdict before = f.log.reach(batch("a/0"));
+        assertTrue(before.logged(), "the place before the reservation is still free to the plain path");
+        assertEquals(1, f.log.ringDepth(), "the remaining slot was used, not the reserved one");
+        assertEquals(0, f.log.ringCapacity() - f.log.ringDepth() - f.log.reservedSlots(),
+            "both slots are accounted for: one holds a line, one holds a reservation");
+        assertEquals(0L, f.log.refusedFull());
+
+        long sequence = f.log.sequence();
+        CommitLog.Verdict duplicate = f.log.reach(batch("a/1"));
+        assertFalse(duplicate.logged());
+        assertEquals(RejectCode.COMMIT_ORDER_VIOLATION, duplicate.code(),
+            "a duplicated place is an order refusal, not a full ring");
+        assertEquals(1L, f.log.hybridOrderRefusals());
+        assertEquals(1, f.log.ringDepth(), "the refused line took no slot");
+        assertEquals(sequence + 1L, f.log.sequence(), "a plain refusal still takes its number");
+
+        assertNull(f.reservations.reserve(f.request("a/2", 8L, 0, 2, 14L, 14L)).ticket(),
+            "both slots are taken: the ring has no room left");
+        assertEquals("ring-room", f.reservations.reserve(f.request("a/2", 8L, 0, 2, 14L, 14L))
+            .diagnostic());
+
+        Fixture full = new Fixture(1, 4096, 4);
+        assertNotNull(full.reservations.reserve(full.request("a/1", 7L, 1, 2, EFFECT, 11L)).ticket());
+        full.log.beginTick(1);
+        CommitLog.Verdict crowded = full.log.reach(batch("a/0"));
+        assertFalse(crowded.logged());
+        assertEquals(RejectCode.QUEUE_CAP_EXCEEDED, crowded.code(),
+            "a ring with no room is a capacity refusal, and says so with its own code");
+    }
+
+    @Test
+    void aCancelledReservationGivesItsPlaceBackToThePlainPath() {
+        Fixture f = new Fixture(2, 4096, 4);
+        CommitTicket ticket = f.reservations.reserve(f.request("a/1", 7L, 1, 2, EFFECT, 11L)).ticket();
+        f.log.beginTick(1);
+        assertFalse(f.log.reach(batch("a/1")).logged(), "the place is held while the ticket lives");
+
+        long sequence = f.log.sequence();
+        assertTrue(f.reservations.release(ticket, CommitTicket.ReleaseReason.CANCELLED).released());
+        assertEquals(0, f.log.heldPlans());
+        assertEquals(sequence, f.log.sequence(), "a give-back writes no line and takes no number");
+        assertTrue(f.log.reach(batch("a/1")).logged(), "the place is free again");
+        assertEquals(1L, f.reservations.releasedCount());
+        assertEquals("RELEASED", f.reservations.terminalLedger().get(0).state());
+    }
+
+    @Test
+    void aRebuiltPlanGivesAnUnstartedTicketBackAndLeavesAPublishingOneAlone() {
+        Fixture f = new Fixture(2, 4096, 4);
+        CommitTicket unstarted = f.reservations.reserve(f.request(2)).ticket();
+        f.plans.position = 3;
+        CommitReservation.ReleaseResult rebuilt = f.reservations.revalidate(unstarted);
+        assertTrue(rebuilt.released());
+        assertEquals("plan-rebuilt", rebuilt.diagnostic());
+        assertEquals(0, f.log.reservedSlots());
+        assertEquals(0, f.store.capacitySlots());
+        CommitReservation.ReserveResult again = f.reservations.reserve(f.request("a/0", 7L, 0, 2, 22L, 22L));
+        assertFalse(again.admitted(), "the same node name no longer carries the frozen place");
+        assertEquals("plan-ref-mismatch", again.diagnostic());
+    }
+
+    @Test
+    void aRebuiltPlanDoesNotMoveTheLineATicketAlreadyReserved() {
+        Fixture f = new Fixture(4, 4096, 4);
+        AtomicReference<String> during = new AtomicReference<>();
+        CommitController controller = new CommitController(f.reservations, ticket -> {
+            f.plans.position = 3;
+            during.set(f.plans.resolveCalls + "");
+            return outcome(CommitTicket.Terminal.PUBLISHED, 2);
+        });
+        CommitController.SubmitResult result = controller.submit(f.request(2));
+        assertTrue(result.admitted());
+        assertEquals(during.get(), f.plans.resolveCalls + "",
+            "the record of the terminal asked the plan nothing");
+        f.log.closeTick();
+        CommitLog.TypedStep step = f.log.lastTyped().typedSteps().get(0);
+        assertEquals(7L, step.planSequence(), "the line kept the place the plan froze into the ticket");
+        assertEquals(0, step.position());
+    }
+
+    @Test
+    void aTerminalThatOutgrowsItsPromiseIsAFaultAndStopsTheRoom() {
+        Fixture f = new Fixture(4, 4096, 4);
+        CommitTicket.ReserveRequest request = f.request(2);
+        CommitTicket ticket = f.reservations.reserve(request).ticket();
+        assertNotNull(ticket);
+        assertTrue(f.reservations.beginPublish(ticket));
+        CommitTicket.Outcome grown = new CommitTicket.Outcome(CommitTicket.Terminal.PARTIAL, "publish",
+            List.of("a=1", "b=2"), 1, "a-note-nobody-promised-for");
+        CommitReservation.FinalizeResult result = f.reservations.finalize(ticket, grown);
+
+        assertFalse(result.finalized(), "a record past its bound is not written");
+        assertEquals("record-refused", result.diagnostic());
+        assertEquals(1L, f.store.integrityFaults());
+        assertEquals("reserved-bound-exceeded", f.store.integrityReason());
+        assertTrue(f.store.halted());
+        assertEquals(1, f.store.unresolvedTerminals().size(),
+            "the item that could not be written is still readable");
+        assertEquals(1, f.reservations.outstanding(), "the reservation was not thrown away either");
+        assertEquals(0, f.log.ringDepth(), "no line was written for a record that does not exist");
+
+        CommitController controller = new CommitController(f.reservations,
+            line -> outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        CommitController.SubmitResult after = controller.submit(f.request("a/1", 7L, 1, 2, 21L, 21L));
+        assertFalse(after.admitted(), "a store that faulted hands out no more room");
+        assertEquals("log-integrity-fault", after.diagnostic());
+        assertEquals(0L, controller.supplierCalls(), "the publish action is not called for it");
+    }
+
+    @Test
+    void theTerminalLedgerIsBoundedAndOneToOne() {
+        Fixture f = new Fixture(4, 65536, 200);
+        CommitController controller = new CommitController(f.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        for (int index = 0; index < 70; index++) {
+            f.plans.position = index;
+            assertTrue(controller.submit(f.request("a/0", 7L, index, 2, 100L + index, 500L + index))
+                .admitted(), "write " + index);
+            assertTrue(f.reservations.conservationHolds(), "conservation at write " + index);
+            f.log.closeTick();
+        }
+        assertEquals(70L, f.reservations.reserveSuccess());
+        assertEquals(70L, f.reservations.finalized());
+        assertEquals(0, f.reservations.outstanding());
+        assertEquals(0L, f.reservations.releasedCount());
+        assertEquals(70L, f.reservations.unitTotal());
+        assertEquals(64, f.reservations.terminalLedger().size(),
+            "the ledger is bounded and the newest entries are the ones it keeps");
+        assertTrue(f.reservations.ledgerEvicted() > 0L, "a ledger past its bound says how much it dropped");
+        assertEquals(70L, f.log.sequence(), "one line per terminal");
+    }
+
+    @Test
+    void withNothingBoundThePlainProjectionIsTheOneItAlwaysWas() {
+        Fixture f = new Fixture(2, 4096, 4);
+        f.log.beginTick(1L);
+        assertTrue(f.log.reach(batch("a/0")).logged());
+
+        CommitLog.Entry entry = f.log.rings().get(0).peek();
+        assertEquals(CommitLog.Identity.NONE, entry.identity(),
+            "every column of the versioned face is at its declared default");
+        assertEquals(0L, entry.handle());
+        assertEquals(CommitLog.NO_INSTANCE, entry.identity().instanceId());
+        assertEquals(CommitLog.NO_WORLD_EPOCH, entry.identity().worldEpoch());
+        assertEquals(CommitLog.NO_EFFECT, entry.identity().effectRef());
+        assertEquals("", entry.identity().targetStatus());
+        assertEquals(1L, f.log.accepted(), "and the plain counters moved as they always did");
+        assertEquals(1L, f.log.sequence());
+        f.log.closeTick();
+        assertEquals(CommitLog.SCHEMA_UNDECLARED, f.log.lastTyped().schemaVersion(),
+            "a tick of plain reports declares no versioned protocol");
+        assertEquals(1, f.log.lastTyped().plainSteps().size());
+        assertTrue(f.log.lastTyped().typedSteps().isEmpty());
+        assertEquals(0L, f.log.typedStored());
+        assertEquals(0L, f.log.ticketStored());
+        assertEquals(0L, f.log.ticketRefused());
+        assertEquals(0L, f.log.hybridOrderRefusals());
+        assertEquals(0, f.log.heldPlans());
+        assertEquals(0, f.log.reservedSlots());
+        assertEquals(0, f.store.capacitySlots());
+        assertEquals(0L, f.log.crossLogRefusals());
+        assertEquals(0L, f.log.staleTicketRefusals());
+        assertEquals(0L, f.log.integrityFaults());
+    }
+
+    @Test
+    void everyControlOperationRunsOnTheOwnerThreadAndRefusesAnother() throws Exception {
+        Fixture f = new Fixture(2, 4096, 4);
+        CommitController controller = new CommitController(f.reservations,
+            ticket -> outcome(CommitTicket.Terminal.PUBLISHED, 1));
+        assertSame(Thread.currentThread(), f.reservations.ownerThread());
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            AtomicReference<CommitReservation.ReserveResult> reserved = new AtomicReference<>();
+            AtomicReference<CommitController.ResetDecision> reset = new AtomicReference<>();
+            pool.submit(() -> {
+                reserved.set(f.reservations.reserve(f.request(2)));
+                reset.set(controller.resetAtSafePoint());
+            }).get(30, TimeUnit.SECONDS);
+
+            assertFalse(reserved.get().admitted());
+            assertEquals("off-owner-thread", reserved.get().diagnostic());
+            assertFalse(reset.get().granted());
+            assertEquals("off-owner-thread", reset.get().reason());
+            assertEquals(1L, controller.resetHandOffs(), "the reset is handed off, not run elsewhere");
+            assertEquals(0L, controller.resets());
+            assertEquals(0L, f.epochs.current());
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(0, f.log.reservedSlots());
+        assertEquals(0, f.store.capacitySlots());
+        assertEquals(0L, controller.supplierCalls());
+        assertEquals("SYNTHETIC", controller.publisherWiring(), "no host supplier is bound here");
+        assertNotNull(controller.reservations());
+    }
+}

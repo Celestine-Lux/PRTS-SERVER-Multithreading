@@ -11,6 +11,7 @@ import io.izzel.arclight.common.prts.kernel.auth.WriteVersionSlots;
 import io.izzel.arclight.common.prts.kernel.codes.DegradeLevel;
 import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import io.izzel.arclight.common.prts.kernel.codes.WriteDisposition;
+import io.izzel.arclight.common.prts.kernel.commit.CommitController;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.exits.DualExits;
@@ -210,6 +211,7 @@ public final class KernelModule {
     private ControlFrame control = ControlFrame.empty();
     private TickPlanStore.Control previousControl = TickPlanStore.Control.missing();
     private CommitLog.Replay lastCommitReplay;
+    private CommitController commitController;
     private long planSequence;
     private long worldGeneration;
     private List<String> plannedWorlds = List.of();
@@ -1172,8 +1174,38 @@ public final class KernelModule {
         return control;
     }
 
-    /** Clears the live counters. */
+    /** The safe point a reset of the commit lifecycle is asked for. A build with no controller
+     * bound has no lifecycle to isolate and keeps the path it always had. */
+    private boolean commitSafePoint() {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return true;
+        }
+        return controller.enterReset().granted();
+    }
+
+    /** Binds the controller whose lifecycle this module ends when it clears its counters. With
+     * nothing bound the reset is the one it always was. */
+    public void bindCommitController(CommitController controller) {
+        this.commitController = controller;
+    }
+
+    public CommitController commitController() {
+        return commitController;
+    }
+
+    /** Whether a controller is bound to this module: the readout says so of itself. */
+    public String commitControllerWiring() {
+        return commitController == null ? "NOT_WIRED" : "BOUND";
+    }
+
+    /** Clears the live counters. Where a commit controller is bound, its owner safe point is asked
+     * first: while a publish action or a publishing line is in flight the whole reset is refused,
+     * nothing is cleared and no generation advances. */
     public void resetReadings() {
+        if (!commitSafePoint()) {
+            return;
+        }
         for (KernelDomain domain : domains) {
             domain.reset();
         }

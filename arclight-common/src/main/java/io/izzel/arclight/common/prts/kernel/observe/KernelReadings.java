@@ -10,7 +10,9 @@ import io.izzel.arclight.common.prts.kernel.auth.WriteVersionSlots;
 import io.izzel.arclight.common.prts.kernel.codes.DegradeLevel;
 import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import io.izzel.arclight.common.prts.kernel.codes.RejectTrigger;
+import io.izzel.arclight.common.prts.kernel.commit.CommitController;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
+import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
@@ -785,6 +787,13 @@ public final class KernelReadings {
         add(lines, "commit.first_divergence_position", commits.firstDivergencePosition());
         add(lines, "commit.plan_order_matches", commits.orderViolations() == 0L ? 1 : 0);
         add(lines, "commit.ticks", commits.ticks());
+        add(lines, "commit.ticket_stored", commits.ticketStored());
+        add(lines, "commit.ticket_refused", commits.ticketRefused());
+        add(lines, "commit.hybrid_order_refusals", commits.hybridOrderRefusals());
+        add(lines, "commit.cross_log_refusals", commits.crossLogRefusals());
+        add(lines, "commit.stale_ticket_refusals", commits.staleTicketRefusals());
+        add(lines, "commit.integrity_faults", commits.integrityFaults());
+        add(lines, "commit.held_plans", commits.heldPlans());
         add(lines, "commit.replay_logged_steps", replay == null ? 0 : replay.loggedSteps());
         add(lines, "commit.replay_log_digest", replay == null ? 0L
             : Long.toHexString(replay.logDigest()));
@@ -797,8 +806,10 @@ public final class KernelReadings {
             add(lines, prefix + "pushed", ring.pushed());
             add(lines, prefix + "popped", ring.popped());
             add(lines, prefix + "refused_full", ring.refusedFull());
+            add(lines, prefix + "permission_refusals", ring.permissionRefusals());
         }
         versionedFace(lines, commits);
+        controllerFace(lines, module, commits.effects());
     }
 
     /** The declared versioned face of the commit log. Every key of it is new and only added: with
@@ -827,6 +838,88 @@ public final class KernelReadings {
         add(lines, "product.commit.reservation_refusals", commits.reservationRefusals());
         add(lines, "product.commit.refusal", declared.refusal().isEmpty() ? "-" : declared.refusal());
         add(lines, "product.commit.store_wiring", effects == null ? "NOT_WIRED" : "BOUND");
+        add(lines, "product.commit.effect_capacity_reserved_bytes",
+            effects == null ? 0 : effects.capacityReservedBytes());
+        add(lines, "product.commit.effect_capacity_reserved_records",
+            effects == null ? 0 : effects.capacityReservedRecords());
+        add(lines, "product.commit.effect_capacity_slots", effects == null ? 0 : effects.capacitySlots());
+        add(lines, "product.commit.effect_foreign_handles", effects == null ? 0L : effects.foreignHandles());
+        add(lines, "product.commit.effect_integrity_faults", effects == null ? 0L : effects.integrityFaults());
+        add(lines, "product.commit.effect_state",
+            effects == null ? "NOT_WIRED" : (effects.halted() ? "HALTED" : "OK"));
+    }
+
+    /** The face of the commit controller. With none bound every key of it reads zero, a dash or
+     * NOT_WIRED, and the publish action column says what the controller would run. */
+    private static void controllerFace(List<String> lines, KernelModule module, EffectStore effects) {
+        CommitController controller = module.commitController();
+        CommitReservation reservations = controller == null ? null : controller.reservations();
+        add(lines, "product.commit.controller_wiring", module.commitControllerWiring());
+        add(lines, "product.commit.controller_publisher",
+            controller == null ? "NONE" : controller.publisherWiring());
+        add(lines, "product.commit.controller_owner",
+            reservations == null ? "-" : reservations.controller().ownerId());
+        add(lines, "product.commit.controller_reset_epoch", controller == null ? 0L : controller.epoch());
+        add(lines, "product.commit.controller_reset_pending",
+            controller != null && controller.pendingReset() ? 1 : 0);
+        add(lines, "product.commit.submits", controller == null ? 0L : controller.submits());
+        add(lines, "product.commit.supplier_calls", controller == null ? 0L : controller.supplierCalls());
+        add(lines, "product.commit.reserve_success",
+            reservations == null ? 0L : reservations.reserveSuccess());
+        add(lines, "product.commit.finalized", reservations == null ? 0L : reservations.finalized());
+        add(lines, "product.commit.released_total",
+            reservations == null ? 0L : reservations.releasedCount());
+        add(lines, "product.commit.outstanding", reservations == null ? 0 : reservations.outstanding());
+        add(lines, "product.commit.publishing", reservations == null ? 0 : reservations.publishing());
+        add(lines, "product.commit.published_total",
+            reservations == null ? 0L : reservations.publishedTotal());
+        add(lines, "product.commit.partial_total", reservations == null ? 0L : reservations.partialTotal());
+        add(lines, "product.commit.failed_total", reservations == null ? 0L : reservations.failedTotal());
+        add(lines, "product.commit.published_units", reservations == null ? 0L : reservations.unitTotal());
+        add(lines, "product.commit.conservation",
+            reservations == null || reservations.conservationHolds() ? 1 : 0);
+        add(lines, "product.commit.double_finalize",
+            reservations == null ? 0L : reservations.doubleFinalize());
+        add(lines, "product.commit.unknown_ticket",
+            reservations == null ? 0L : reservations.unknownTicket());
+        add(lines, "product.commit.stale_refusals", reservations == null ? 0L : reservations.staleRefusals());
+        add(lines, "product.commit.cross_log_refusals",
+            reservations == null ? 0L : reservations.crossLogRefusals());
+        add(lines, "product.commit.off_thread_refusals", reservations == null ? 0L
+            : reservations.offThreadRefusals() + (controller == null ? 0L : controller.resetOffThread()));
+        add(lines, "product.commit.reserve_refusals",
+            reservations == null ? 0L : reservations.reservationRefusals());
+        add(lines, "product.commit.request_refusals",
+            reservations == null ? 0L : reservations.requestRefusals());
+        add(lines, "product.commit.reset_voided", reservations == null ? 0L : reservations.resetVoided());
+        add(lines, "product.commit.reset_during_publish",
+            controller == null ? 0L : controller.resetWhilePublishing());
+        add(lines, "product.commit.reset_reentrant_refusals",
+            controller == null ? 0L : controller.resetReentrantRefusals());
+        add(lines, "product.commit.reset_handoffs", controller == null ? 0L : controller.resetHandOffs());
+        add(lines, "product.commit.resets", controller == null ? 0L : controller.resets());
+        add(lines, "product.commit.resets_deferred",
+            controller == null ? 0L : controller.deferredResets());
+        add(lines, "product.commit.terminal_ledger_entries",
+            reservations == null ? 0 : reservations.terminalLedger().size());
+        add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
+        add(lines, "product.commit.effect_unresolved_terminals",
+            effects == null ? 0 : effects.unresolvedTerminals().size());
+    }
+
+    private static String terminalLedger(CommitReservation reservations) {
+        if (reservations == null || reservations.terminalLedger().isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (CommitReservation.TerminalEntry entry : reservations.terminalLedger()) {
+            if (builder.length() > 0) {
+                builder.append(",");
+            }
+            builder.append(entry.ticketId()).append(':').append(entry.state()).append(':')
+                .append(entry.unitCount());
+        }
+        return builder.toString();
     }
 
     private static String joinIds(List<Long> ids) {

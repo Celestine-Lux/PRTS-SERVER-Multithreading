@@ -150,6 +150,75 @@ public final class CommitLog {
                            long resetEpoch) {
     }
 
+    /** One permission to touch the inside of one ring of this log: fill one slot, read one slot or
+     * clear the ring. Only the log mints one, at the point where it decided the touch is allowed.
+     * A fill spends its permission and names the reservation it fills, so a spent permission, one
+     * of another ring of the same pair, one of an earlier lifecycle or a null one is refused. */
+    static final class RingAuthority {
+
+        enum Kind {
+            FILL,
+            READ,
+            CLEAR
+        }
+
+        private final Kind kind;
+        private final long logLifetime;
+        private final long ringId;
+        private final String worldId;
+        private final String domainId;
+        private final long slotTicket;
+        private final Object key;
+        private boolean spent;
+
+        private RingAuthority(Kind kind, long logLifetime, long ringId, String worldId,
+                              String domainId, long slotTicket, Object key) {
+            this.kind = kind;
+            this.logLifetime = logLifetime;
+            this.ringId = ringId;
+            this.worldId = worldId;
+            this.domainId = domainId;
+            this.slotTicket = slotTicket;
+            this.key = key;
+        }
+
+        Object key() {
+            return key;
+        }
+
+        Kind kind() {
+            return kind;
+        }
+
+        long logLifetime() {
+            return logLifetime;
+        }
+
+        long ringId() {
+            return ringId;
+        }
+
+        String worldId() {
+            return worldId;
+        }
+
+        String domainId() {
+            return domainId;
+        }
+
+        long slotTicket() {
+            return slotTicket;
+        }
+
+        boolean spend() {
+            if (spent) {
+                return false;
+            }
+            spent = true;
+            return true;
+        }
+    }
+
     /** The one entry a producer reaches. A producer with no sink bound keeps its own path unchanged;
      * a producer with one reports what it did and is answered whether that was the planned order. The
      * answer is a verdict, not an interception. */
@@ -262,7 +331,10 @@ public final class CommitLog {
     private long firstDivergencePosition = -1L;
     private final EffectStore effects;
     private final long lifetime = CommitNamespaces.Lifetimes.mint();
+    private final Object ringKey = new Object();
     private final Map<Long, RingSlot> heldSlots = new LinkedHashMap<>();
+    private final Map<Long, long[]> heldPlans = new LinkedHashMap<>();
+    private final Map<String, long[]> reservedFloors = new LinkedHashMap<>();
     private final Map<String, Integer> slotsByKey = new LinkedHashMap<>();
     private final Map<String, String> instanceNamespaces = new LinkedHashMap<>();
     private SchemaReplay lastSchema;
@@ -277,6 +349,12 @@ public final class CommitLog {
     private long typedRefused;
     private long identityCollisions;
     private long effectMissingSteps;
+    private long hybridOrderRefusals;
+    private long ticketStored;
+    private long ticketRefused;
+    private long crossLogRefusals;
+    private long staleTicketRefusals;
+    private long integrityFaults;
 
     public CommitLog(IntSupplier ringCapacity, OrderSource source) {
         this(ringCapacity, source, null);
@@ -346,6 +424,21 @@ public final class CommitLog {
             batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(),
             disposition, code, intent);
         CommitRing ring = ring(batch.worldId(), batch.domainId());
+        long[] floor = reservedFloors.get(ring.key());
+        if (floor != null && resolved != null
+            && (planSequence > floor[0] || (planSequence == floor[0] && position >= floor[1]))) {
+            // A reservation of this pair holds this place: the plain path does not carry the pair's
+            // order past a place a versioned line reserved, nor onto it a second time. With no
+            // reservation held there is no floor and nothing here reads.
+            hybridOrderRefusals++;
+            orderViolations++;
+            dropped++;
+            if (firstDivergencePosition < 0L) {
+                firstDivergencePosition = position;
+            }
+            return new Verdict(false, Entry.Disposition.DROPPED, RejectCode.COMMIT_ORDER_VIOLATION,
+                sequence, (int) position);
+        }
         if (freeSlots(ring) <= 0) {
             // The room a ring has is what its capacity leaves after the slots already handed out, so
             // a plain report never takes a slot a versioned commit is holding. With no slot held the
@@ -355,7 +448,7 @@ public final class CommitLog {
             return new Verdict(false, Entry.Disposition.DROPPED, RejectCode.QUEUE_CAP_EXCEEDED,
                 sequence, (int) position);
         }
-        CommitRing.Push push = ring.push(entry);
+        CommitRing.Push push = ring.push(entry, fill(ring, 0L));
         if (!push.stored()) {
             refusedFull++;
             dropped++;
@@ -378,8 +471,9 @@ public final class CommitLog {
         int read = 0;
         for (String key : keys) {
             CommitRing ring = rings.get(key);
+            RingAuthority permission = read(ring);
             Entry entry;
-            while ((entry = ring.pop()) != null) {
+            while ((entry = ring.pop(permission)) != null) {
                 steps.add(entry.step());
                 hash = fold(hash, entry.planSequence() + ":" + entry.position() + ":"
                     + entry.writeSetDigest() + ":" + entry.disposition());
@@ -465,7 +559,7 @@ public final class CommitLog {
             return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, position);
         }
         String instance = instanceOf(identity);
-        String instanceKey = key(batch.worldId(), batch.domainId()) + "/" + identity.instanceId();
+        String instanceKey = instanceKeyOf(batch.worldId(), batch.domainId(), identity.instanceId());
         String held = instanceNamespaces.get(instanceKey);
         if (held != null && !held.equals(instance)) {
             // One instance number names one instance: the lifecycle, the chunk and the published
@@ -475,7 +569,7 @@ public final class CommitLog {
             return typedRefusal(RejectCode.VERSION_MISMATCH, position);
         }
         CommitRing ring = ring(batch.worldId(), batch.domainId());
-        RingSlot slot = reserveSlot(batch.worldId(), batch.domainId());
+        RingSlot slot = reserveSlot(batch.worldId(), batch.domainId(), resolved.planSequence(), position);
         if (slot == null) {
             return typedRefusal(RejectCode.QUEUE_CAP_EXCEEDED, position);
         }
@@ -500,7 +594,7 @@ public final class CommitLog {
             batch.worldId(), batch.domainId(), batch.nodeKey() == null ? "" : batch.nodeKey(), 0L,
             batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(), disposition,
             null, resolved.intent(), identity);
-        CommitRing.Push push = ring.push(entry);
+        CommitRing.Push push = ring.push(entry, fill(ring, slot.ticket()));
         if (!push.stored()) {
             // A slot was held for this line, so a ring that still refuses it is a defect and not a
             // shortage: the record and the reservation go with it and no half line stays behind.
@@ -523,10 +617,100 @@ public final class CommitLog {
         return new Verdict(true, disposition, null, sequence, position);
     }
 
+    /** Records the terminal line of a reservation taken before the side effect: the order the plan
+     * froze into the ticket, the ring slot and the room the ticket holds, and the record written
+     * inside that room. Nothing is resolved again and nothing is charged again; a ticket of another
+     * log, of another store or of a lifecycle this log has left is refused instead of written. */
+    public Verdict recordTicket(CommitTicket ticket, CommitTicket.Outcome outcome) {
+        if (ticket == null || outcome == null || effects == null) {
+            return ticketRefusal(RejectCode.COUNTER_MISSING, -1);
+        }
+        if (ticket.logLifetime() != lifetime || ticket.effectSlot().storeId() != effects.storeId()) {
+            crossLogRefusals++;
+            return ticketRefusal(RejectCode.COUNTER_MISSING, ticket.position());
+        }
+        RingSlot ringSlot = ticket.ringSlot();
+        RingSlot held = heldSlots.get(ringSlot.ticket());
+        if (held == null || !held.equals(ringSlot) || held.lifetime() != lifetime
+            || held.resetEpoch() != resetEpoch) {
+            staleTicketRefusals++;
+            return ticketRefusal(RejectCode.COUNTER_MISSING, ticket.position());
+        }
+        if (outcome.rows().size() != ticket.batch().rows()) {
+            return ticketRefusal(RejectCode.VERSION_MISMATCH, ticket.position());
+        }
+        EffectStore.CapacityResult finished = effects.finalizeCapacity(ticket.effectSlot(),
+            outcome.asEffect(ticket.identity().effectRef()));
+        if (!finished.admitted()) {
+            // The record outgrew the room that was promised for it: the item stays readable in the
+            // store, the slot stays held and the log counts the fault instead of writing a line
+            // whose record was never stored.
+            integrityFaults++;
+            return ticketRefusal(finished.code() == null ? RejectCode.QUEUE_CAP_EXCEEDED
+                : finished.code(), ticket.position());
+        }
+        boolean published = outcome.terminal() == CommitTicket.Terminal.PUBLISHED;
+        Entry.Disposition disposition = published ? dispositionOf(ticket.batch().kind())
+            : Entry.Disposition.DROPPED;
+        Entry entry = new Entry(++sequence, tickIndex, ticket.planSequence(), ticket.position(),
+            ticket.batch().worldId(), ticket.batch().domainId(), ticket.batch().nodeKey(), 0L,
+            published ? ticket.batch().kind() : Batch.Kind.DROP, ticket.batch().expectedVersion(),
+            ticket.batch().writeSetDigest(), ticket.batch().rows(), disposition, null, false,
+            ticket.identity());
+        CommitRing ring = ring(ticket.batch().worldId(), ticket.batch().domainId());
+        CommitRing.Push push = ring.push(entry, fill(ring, ringSlot.ticket()));
+        if (!push.stored()) {
+            giveBack(ticket.identity().effectRef(), ringSlot);
+            return ticketRefusal(push.code(), ticket.position());
+        }
+        consumeSlot(ringSlot);
+        String pairKey = key(ticket.batch().worldId(), ticket.batch().domainId());
+        lastPlanOfRing.put(pairKey, ticket.planSequence());
+        lastPositionOfRing.put(pairKey, ticket.position());
+        instanceNamespaces.put(instanceKeyOf(ticket.batch().worldId(), ticket.batch().domainId(),
+            ticket.identity().instanceId()), instanceOf(ticket.identity()));
+        switch (disposition) {
+            case ACCEPTED -> accepted++;
+            case MERGED -> merged++;
+            case INTENT -> intents++;
+            case RETRIED -> retried++;
+            case DROPPED -> dropped++;
+        }
+        ticketStored++;
+        watermarks = Math.max(watermarks, ring.depth());
+        return new Verdict(true, disposition, null, sequence, ticket.position());
+    }
+
+    /** Whether this instance number is already held by another lifecycle, chunk or published state.
+     * Read-only: it counts nothing, and it is asked before a reservation is taken. */
+    public boolean instanceCollision(String worldId, String domainId, Identity identity) {
+        String held = instanceNamespaces.get(instanceKeyOf(worldId, domainId, identity.instanceId()));
+        return held != null && !held.equals(instanceOf(identity));
+    }
+
+    private static String instanceKeyOf(String worldId, String domainId, long instanceId) {
+        return key(worldId, domainId) + "/" + instanceId;
+    }
+
+    private Verdict ticketRefusal(RejectCode code, int position) {
+        ticketRefused++;
+        return new Verdict(false, Entry.Disposition.DROPPED, code, sequence, position);
+    }
+
     /** Hands out one ring slot of a pair before anything is stored in it. While the slot is held the
      * pair has that much less room, so a plain report cannot take it; a slot that is never filled is
      * given back by {@link #releaseSlot}. */
     public RingSlot reserveSlot(String worldId, String domainId) {
+        return reserveSlot(worldId, domainId, null);
+    }
+
+    /** The same, with the place the frozen plan gave the line that will fill the slot. While such a
+     * slot is held the plain path may not carry the pair's order onto that place or past it. */
+    public RingSlot reserveSlot(String worldId, String domainId, long planSequence, int position) {
+        return reserveSlot(worldId, domainId, new long[] {planSequence, position});
+    }
+
+    private RingSlot reserveSlot(String worldId, String domainId, long[] plan) {
         CommitRing ring = ring(worldId, domainId);
         if (freeSlots(ring) <= 0) {
             reservationRefusals++;
@@ -535,8 +719,41 @@ public final class CommitLog {
         RingSlot slot = new RingSlot(worldId, domainId, ++slotTickets, lifetime, resetEpoch);
         heldSlots.put(slot.ticket(), slot);
         slotsByKey.merge(key(worldId, domainId), 1, Integer::sum);
+        if (plan != null) {
+            heldPlans.put(slot.ticket(), plan);
+            raiseFloor(key(worldId, domainId), plan[0], (int) plan[1]);
+        }
         reservationsTaken++;
         return slot;
+    }
+
+    private void raiseFloor(String key, long planSequence, int position) {
+        long[] floor = reservedFloors.get(key);
+        if (floor == null || planSequence < floor[0]
+            || (planSequence == floor[0] && position < floor[1])) {
+            reservedFloors.put(key, new long[] {planSequence, position});
+        }
+    }
+
+    private void lowerFloor(String key) {
+        long[] floor = null;
+        for (RingSlot held : heldSlots.values()) {
+            if (!key(held.worldId(), held.domainId()).equals(key)) {
+                continue;
+            }
+            long[] plan = heldPlans.get(held.ticket());
+            if (plan == null) {
+                continue;
+            }
+            if (floor == null || plan[0] < floor[0] || (plan[0] == floor[0] && plan[1] < floor[1])) {
+                floor = plan;
+            }
+        }
+        if (floor == null) {
+            reservedFloors.remove(key);
+        } else {
+            reservedFloors.put(key, floor);
+        }
     }
 
     /** Gives back a slot that was not filled. The handle is answered against the slot this log saved
@@ -577,6 +794,8 @@ public final class CommitLog {
         } else {
             slotsByKey.put(key, count - 1);
         }
+        heldPlans.remove(held.ticket());
+        lowerFloor(key);
     }
 
     /** Gives back the record and the ring slot of a line that is not stored after all. */
@@ -647,7 +866,29 @@ public final class CommitLog {
 
     private CommitRing ring(String worldId, String domainId) {
         return rings.computeIfAbsent(key(worldId, domainId),
-            key -> new CommitRing(worldId, domainId, ringCapacity.getAsInt()));
+            key -> new CommitRing(worldId, domainId, ringCapacity.getAsInt(), lifetime, ringKey));
+    }
+
+    /** A permission to fill one ring, minted only while the reservation it names is still this
+     * log's. With no such reservation the log mints nothing and the ring answers the refusal.
+     * Package private so the ring contract is exercised from a test of this package; the log's own
+     * paths are its only production callers. */
+    RingAuthority fill(CommitRing ring, long slotTicket) {
+        if (slotTicket != 0L && !heldSlots.containsKey(slotTicket)) {
+            return null;
+        }
+        return new RingAuthority(RingAuthority.Kind.FILL, lifetime, ring.ringId(), ring.worldId(),
+            ring.domainId(), slotTicket, ringKey);
+    }
+
+    private RingAuthority read(CommitRing ring) {
+        return new RingAuthority(RingAuthority.Kind.READ, lifetime, ring.ringId(), ring.worldId(),
+            ring.domainId(), 0L, ringKey);
+    }
+
+    private RingAuthority clear(CommitRing ring) {
+        return new RingAuthority(RingAuthority.Kind.CLEAR, lifetime, ring.ringId(), ring.worldId(),
+            ring.domainId(), 0L, ringKey);
     }
 
     private static String key(String worldId, String domainId) {
@@ -675,8 +916,10 @@ public final class CommitLog {
         List<String> keys = new ArrayList<>(rings.keySet());
         keys.sort(String::compareTo);
         for (String key : keys) {
+            CommitRing ring = rings.get(key);
+            RingAuthority permission = read(ring);
             Entry entry;
-            while ((entry = rings.get(key).pop()) != null) {
+            while ((entry = ring.pop(permission)) != null) {
                 if (entry.identity().effectRef() != NO_EFFECT) {
                     typed.add(typedStep(entry));
                 } else {
@@ -810,12 +1053,54 @@ public final class CommitLog {
         return effectMissingSteps;
     }
 
+    /** The plain reports refused because a reservation of their pair held the place they named. */
+    public long hybridOrderRefusals() {
+        return hybridOrderRefusals;
+    }
+
+    /** The lines recorded from a reservation that was taken before the side effect. */
+    public long ticketStored() {
+        return ticketStored;
+    }
+
+    public long ticketRefused() {
+        return ticketRefused;
+    }
+
+    /** Tickets of another log or of another store, answered as unknown instead of written. */
+    public long crossLogRefusals() {
+        return crossLogRefusals;
+    }
+
+    /** Tickets whose slot this log no longer holds: an earlier lifecycle, or a spent reservation. */
+    public long staleTicketRefusals() {
+        return staleTicketRefusals;
+    }
+
+    /** Terminal records that outgrew the room reserved for them. */
+    public long integrityFaults() {
+        return integrityFaults;
+    }
+
+    /** The reservations that carry the place the frozen plan gave them. */
+    public int heldPlans() {
+        return heldPlans.size();
+    }
+
+    /** The identity of this log, minted with it: a ticket names the log it belongs to. */
+    public long logLifetime() {
+        return lifetime;
+    }
+
     /** Ends this lifecycle. The lines the rings still carry are folded into the terminal projection
      * of that lifecycle first, and the record a versioned line points at is copied before the one
      * reference the line holds is given back: a reset that is repeated cannot leave a reference
      * behind and cannot exhaust the store, while a reference held by someone else stays theirs. */
     public void reset() {
         lastReset = drain();
+        for (CommitRing ring : rings.values()) {
+            ring.reset(clear(ring));
+        }
         rings.clear();
         lastPlanOfRing.clear();
         lastPositionOfRing.clear();
@@ -835,6 +1120,8 @@ public final class CommitLog {
         firstDivergencePosition = -1L;
         lastSchema = null;
         heldSlots.clear();
+        heldPlans.clear();
+        reservedFloors.clear();
         slotsByKey.clear();
         instanceNamespaces.clear();
         resetEpoch++;
@@ -846,5 +1133,11 @@ public final class CommitLog {
         typedRefused = 0L;
         identityCollisions = 0L;
         effectMissingSteps = 0L;
+        hybridOrderRefusals = 0L;
+        ticketStored = 0L;
+        ticketRefused = 0L;
+        crossLogRefusals = 0L;
+        staleTicketRefusals = 0L;
+        integrityFaults = 0L;
     }
 }

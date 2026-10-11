@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** The typed effect records one commit line may point at: one immutable record per line that
  * declares one, bounded by the bytes and by the record count the store was built with, and never
@@ -18,6 +19,12 @@ import java.util.TreeSet;
  * freezes what it charged for, so a second record cannot be admitted into room the first one already
  * owns and a reservation cannot be filled with another record of the same length. A store built with
  * no room at all is refused rather than accepted as an empty and always-failing table.
+ *
+ * <p>Room alone may also be reserved, for a line whose outcome is not known until the side effect
+ * has run: that reservation promises how many records and how many bytes the terminal record will
+ * take, and the record is written inside that promise without asking for room again. A terminal
+ * record that outgrows its promise is not written and not thrown away: it is counted as an
+ * integrity fault and stays readable, and the store answers every later reservation with a refusal.
  *
  * <p>The store is in memory only: nothing here writes a file, so nothing here survives a restart.
  * A reference that cannot be resolved is answered as missing and never as an empty record. */
@@ -60,6 +67,16 @@ public final class EffectStore {
     public record Result(boolean admitted, RejectCode code, Slot slot, Recorded record) {
     }
 
+    /** A reservation of room alone: the reference the terminal record will carry, the records and
+     * bytes it may take, and the store that handed it out. The record itself is not known yet, which
+     * is why this is a second protocol and not a relaxation of the first one. */
+    public record CapacitySlot(long ticket, long effectRef, int maxRecords, int maxBytes, long storeId) {
+    }
+
+    /** What one room-only reservation did. */
+    public record CapacityResult(boolean admitted, RejectCode code, CapacitySlot slot, Recorded record) {
+    }
+
     private static final int HEADER_BYTES = 48;
     private static final int ROW_BYTES = 4;
     private static final int FIELD_BYTES = 4;
@@ -67,13 +84,19 @@ public final class EffectStore {
     private static final long OFFSET_BASIS = 0xcbf29ce484222325L;
     private static final long PRIME = 0x100000001b3L;
 
+    private static final AtomicLong STORE_IDS = new AtomicLong(1L);
+
+    private final long storeId = STORE_IDS.getAndIncrement();
     private final int capacityBytes;
     private final int capacityRecords;
     private final Map<Long, Recorded> records = new LinkedHashMap<>();
     private final Map<Long, Slot> slots = new LinkedHashMap<>();
+    private final Map<Long, CapacitySlot> capacitySlots = new LinkedHashMap<>();
     private final Map<Long, Integer> pins = new LinkedHashMap<>();
     private int usedBytes;
     private int reservedBytes;
+    private int capacityReservedBytes;
+    private int capacityReservedRecords;
     private long tickets;
     private long sequence;
     private long stored;
@@ -83,6 +106,13 @@ public final class EffectStore {
     private long evicted;
     private long missing;
     private long evictionRefusals;
+    private long capacityReserved;
+    private long capacityFinalized;
+    private long capacityReleased;
+    private long foreignHandles;
+    private long integrityFaults;
+    private boolean halted;
+    private String integrityReason = "";
 
     /** A store with no byte or no record room is not executable: it is refused here instead of
      * answering every reservation with a refusal while it looks like an empty and healthy table. */
@@ -105,8 +135,8 @@ public final class EffectStore {
         List<String> content = normalize(effect.rows());
         long charge = chargedBytes(effect.operationKind(), effect.outcome(), content);
         if (records.containsKey(effect.effectRef()) || holdsTicketFor(effect.effectRef())
-            || !fitsRecords(records.size(), slots.size() + 1L, capacityRecords)
-            || !fitsBytes(usedBytes, reservedBytes, charge, capacityBytes)) {
+            || !fitsRecords(records.size(), slots.size() + capacityReservedRecords + 1L, capacityRecords)
+            || !fitsBytes(usedBytes, reservedBytes + capacityReservedBytes, charge, capacityBytes)) {
             refused++;
             return new Result(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
         }
@@ -123,6 +153,14 @@ public final class EffectStore {
     public Result commit(Slot slot, Effect effect) {
         Slot held = slot == null ? null : slots.get(slot.ticket());
         if (held == null || effect == null || held.effectRef() != effect.effectRef()) {
+            refused++;
+            return new Result(false, RejectCode.COUNTER_MISSING, null, null);
+        }
+        if (held != slot) {
+            // The handle this store saved is the only one that may fill this slot: a slot of another
+            // store carries the same ticket number and an equal value, and would take the room of a
+            // reservation it never made.
+            foreignHandles++;
             refused++;
             return new Result(false, RejectCode.COUNTER_MISSING, null, null);
         }
@@ -152,14 +190,94 @@ public final class EffectStore {
             && held.contentDigest().equals(digestOf(content));
     }
 
-    /** Gives back a reservation that was not used. A ticket that is not held is a no-op. */
+    /** Gives back a reservation that was not used. A ticket that is not held is a no-op, and a
+     * handle another store handed out is refused instead of giving back this store's room. */
     public boolean release(Slot slot) {
-        Slot held = slot == null ? null : slots.remove(slot.ticket());
-        if (held == null) {
+        Slot held = slot == null ? null : slots.get(slot.ticket());
+        if (held == null || held != slot) {
+            if (slot != null) {
+                foreignHandles++;
+            }
             return false;
         }
+        slots.remove(held.ticket());
         reservedBytes -= held.bytes();
         released++;
+        return true;
+    }
+
+    /** Charges room for a record whose outcome is not known yet: the room covers the largest of the
+     * terminal variants the caller declares, and the record is written later inside that promise. */
+    public CapacityResult reserveCapacity(long effectRef, int maxRecords, int maxBytes) {
+        if (halted) {
+            refused++;
+            return new CapacityResult(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
+        }
+        if (effectRef <= 0L || maxRecords <= 0 || maxBytes <= 0) {
+            refused++;
+            return new CapacityResult(false, RejectCode.COUNTER_MISSING, null, null);
+        }
+        if (records.containsKey(effectRef) || holdsTicketFor(effectRef)
+            || !fitsRecords(records.size(), slots.size() + capacityReservedRecords + (long) maxRecords,
+                capacityRecords)
+            || !fitsBytes(usedBytes, reservedBytes + capacityReservedBytes + (long) maxBytes, 0L,
+                capacityBytes)) {
+            refused++;
+            return new CapacityResult(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
+        }
+        CapacitySlot slot = new CapacitySlot(++tickets, effectRef, maxRecords, maxBytes, storeId);
+        capacitySlots.put(slot.ticket(), slot);
+        capacityReservedBytes += maxBytes;
+        capacityReservedRecords += maxRecords;
+        capacityReserved++;
+        return new CapacityResult(true, null, slot, null);
+    }
+
+    /** Writes the terminal record inside the room that was reserved for it. The promise is the
+     * bound: a record that outgrows it is not written, not billed and not dropped quietly. */
+    public CapacityResult finalizeCapacity(CapacitySlot slot, Effect terminal) {
+        CapacitySlot held = slot == null ? null : capacitySlots.get(slot.ticket());
+        if (held == null || held != slot || slot.storeId() != storeId || terminal == null
+            || terminal.effectRef() != held.effectRef()) {
+            foreignHandles++;
+            return new CapacityResult(false, RejectCode.COUNTER_MISSING, null, null);
+        }
+        List<String> content = normalize(terminal.rows());
+        long charge = chargedBytes(terminal.operationKind(), terminal.outcome(), content);
+        if (content.size() > held.maxRecords() || charge > held.maxBytes()) {
+            // The prompt bound was wrong or the outcome grew past it. The room is not raised after
+            // the side effect, and the audit is not thrown away: the item stays reserved and
+            // readable while the store stops handing out room.
+            integrityFaults++;
+            halted = true;
+            integrityReason = "reserved-bound-exceeded";
+            return new CapacityResult(false, RejectCode.QUEUE_CAP_EXCEEDED, held, null);
+        }
+        capacitySlots.remove(held.ticket());
+        capacityReservedBytes -= held.maxBytes();
+        capacityReservedRecords -= held.maxRecords();
+        Recorded record = new Recorded(terminal.effectRef(), terminal.operationKind(),
+            terminal.outcome(), declaredOf(content), content, digestOf(content), (int) charge, ++sequence);
+        records.put(record.effectRef(), record);
+        pins.put(record.effectRef(), 1);
+        usedBytes += record.bytes();
+        stored++;
+        committed++;
+        capacityFinalized++;
+        return new CapacityResult(true, null, null, record);
+    }
+
+    /** Gives back room that was reserved and not used. */
+    public boolean releaseCapacity(CapacitySlot slot) {
+        CapacitySlot held = slot == null ? null : capacitySlots.get(slot.ticket());
+        if (held == null || held != slot || slot.storeId() != storeId) {
+            foreignHandles++;
+            return false;
+        }
+        capacitySlots.remove(held.ticket());
+        capacityReservedBytes -= held.maxBytes();
+        capacityReservedRecords -= held.maxRecords();
+        capacityReleased++;
         return true;
     }
 
@@ -219,7 +337,23 @@ public final class EffectStore {
                 return true;
             }
         }
+        for (CapacitySlot slot : capacitySlots.values()) {
+            if (slot.effectRef() == effectRef) {
+                return true;
+            }
+        }
         return false;
+    }
+
+    /** The room one record of these rows is charged for, as the reservation will charge it: the
+     * caller that promises a bound computes it with the same rule the store bills with. */
+    public static List<String> normalizedRows(List<String> rows) {
+        return normalize(rows == null ? List.of() : rows);
+    }
+
+    public static long chargeOf(String operationKind, String outcome, List<String> rows) {
+        return chargedBytes(operationKind == null ? "" : operationKind,
+            outcome == null ? "" : outcome, normalize(rows == null ? List.of() : rows));
     }
 
     private static List<String> normalize(List<String> rows) {
@@ -363,6 +497,64 @@ public final class EffectStore {
 
     public long evictionRefusals() {
         return evictionRefusals;
+    }
+
+    /** The store's own identity. It is minted here and rides on every room-only handle. */
+    public long storeId() {
+        return storeId;
+    }
+
+    public int capacityReservedBytes() {
+        return capacityReservedBytes;
+    }
+
+    public int capacityReservedRecords() {
+        return capacityReservedRecords;
+    }
+
+    /** The room-only reservations handed out and neither filled nor given back. */
+    public int capacitySlots() {
+        return capacitySlots.size();
+    }
+
+    public long capacityReserved() {
+        return capacityReserved;
+    }
+
+    public long capacityFinalized() {
+        return capacityFinalized;
+    }
+
+    public long capacityReleased() {
+        return capacityReleased;
+    }
+
+    /** Handles of another store, of an earlier lifecycle or of no reservation at all. */
+    public long foreignHandles() {
+        return foreignHandles;
+    }
+
+    public long integrityFaults() {
+        return integrityFaults;
+    }
+
+    /** Whether a terminal record outgrew its promise: the store then hands out no more room. */
+    public boolean halted() {
+        return halted;
+    }
+
+    public String integrityReason() {
+        return integrityReason;
+    }
+
+    /** The terminal items that are still waiting for room: bounded by the record capacity and
+     * readable, so a fault leaves a trace instead of a lost audit. */
+    public List<String> unresolvedTerminals() {
+        List<String> pending = new ArrayList<>();
+        for (CapacitySlot slot : capacitySlots.values()) {
+            pending.add(slot.effectRef() + "@" + slot.maxRecords() + "r/" + slot.maxBytes() + "b");
+        }
+        return pending;
     }
 
     public List<Long> references() {
