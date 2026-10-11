@@ -434,7 +434,7 @@ public final class CommitLog {
             return new Verdict(false, Entry.Disposition.DROPPED, RejectCode.QUEUE_CAP_EXCEEDED,
                 sequence, (int) position);
         }
-        CommitRing.Push push = ring.push(entry, fill(ring, 0L));
+        CommitRing.Push push = store(ring, 0L, entry);
         if (!push.stored()) {
             refusedFull++;
             dropped++;
@@ -600,7 +600,7 @@ public final class CommitLog {
             batch.worldId(), batch.domainId(), batch.nodeKey() == null ? "" : batch.nodeKey(), 0L,
             batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(), disposition,
             null, resolved.intent(), identity);
-        CommitRing.Push push = ring.push(entry, fill(ring, slot.ticket()));
+        CommitRing.Push push = store(ring, slot.ticket(), entry);
         if (!push.stored()) {
             // A slot was held for this line, so a ring that still refuses it is a defect and not a
             // shortage: the record and the reservation go with it and no half line stays behind.
@@ -646,6 +646,13 @@ public final class CommitLog {
             return ticketRefusal(RejectCode.VERSION_MISMATCH, ticket.position());
         }
         String pairKey = key(ticket.batch().worldId(), ticket.batch().domainId());
+        if (!ringSlot.worldId().equals(ticket.batch().worldId())
+            || !ringSlot.domainId().equals(ticket.batch().domainId())) {
+            // The slot a ticket holds is one of the pair the ticket publishes to: a handle of one
+            // pair is never a permission to write into the ring of another.
+            crossLogRefusals++;
+            return ticketRefusal(RejectCode.COUNTER_MISSING, ticket.position());
+        }
         long[] frozen = heldPlans.get(ringSlot.ticket());
         if (frozen == null || frozen[0] != ticket.planSequence() || frozen[1] != ticket.position()
             || !ascending(ticket.batch().worldId(), ticket.batch().domainId(), ticket.planSequence(),
@@ -677,7 +684,7 @@ public final class CommitLog {
             ticket.batch().writeSetDigest(), ticket.batch().rows(), disposition, null, false,
             ticket.identity());
         CommitRing ring = ring(ticket.batch().worldId(), ticket.batch().domainId());
-        CommitRing.Push push = ring.push(entry, fill(ring, ringSlot.ticket()));
+        CommitRing.Push push = store(ring, ringSlot.ticket(), entry);
         if (!push.stored()) {
             giveBack(ticket.identity().effectRef(), ringSlot);
             return ticketRefusal(push.code(), ticket.position());
@@ -756,6 +763,14 @@ public final class CommitLog {
      * that has no room. */
     public boolean placeAscending(String worldId, String domainId, long planSequence, int position) {
         return ascending(worldId, domainId, planSequence, position);
+    }
+
+    /** Whether this place is the next one the pair may hand to a side effect: no reservation of the
+     * pair holds a place before it. Read-only, like the check above: the side effect of a later place
+     * waits until the earlier one ended. */
+    public boolean placeRunnable(String worldId, String domainId, long planSequence, int position) {
+        long[] floor = reservedFloors.get(key(worldId, domainId));
+        return floor == null || (floor[0] == planSequence && floor[1] == position);
     }
 
     private void raiseFloor(String key, long planSequence, int position) {
@@ -918,14 +933,32 @@ public final class CommitLog {
             key -> new CommitRing(worldId, domainId, ringCapacity.getAsInt(), lifetime, ringKey));
     }
 
-    /** A permission to fill one ring, minted only while the reservation it names is still this
-     * log's. With no such reservation the log mints nothing and the ring answers the refusal.
-     * Package private so the ring contract is exercised from a test of this package; the log's own
-     * paths are its only production callers. */
-    RingAuthority fill(CommitRing ring, long slotTicket) {
-        if (slotTicket != 0L && !heldSlots.containsKey(slotTicket)) {
+    /** The one place a ring is filled: the permission is looked up and spent in the same call, so
+     * a line the log refused to admit takes no entry with it. */
+    private CommitRing.Push store(CommitRing ring, long slotTicket, Entry entry) {
+        return ring.push(entry, fill(ring, slotTicket));
+    }
+
+    /** A permission to fill one ring, minted only where the log already decided the touch is
+     * allowed and only while the reservation it names is this log's, of this ring's pair, of this
+     * lifecycle and of this reset generation. Nothing outside the log can mint one and every mint is
+     * spent by the push that follows it in the same call, so a permission never outlives the
+     * reservation that justified it. */
+    private RingAuthority fill(CommitRing ring, long slotTicket) {
+        if (slotTicket == 0L) {
+            // The plain path is admitted by the room check that precedes it, and the mint repeats it
+            // rather than trusting the caller: a line that was never admitted gets no permission.
+            return freeSlots(ring) > 0 ? mint(ring, 0L) : null;
+        }
+        RingSlot held = heldSlots.get(slotTicket);
+        if (held == null || held.lifetime() != lifetime || held.resetEpoch() != resetEpoch
+            || !ring.worldId().equals(held.worldId()) || !ring.domainId().equals(held.domainId())) {
             return null;
         }
+        return mint(ring, slotTicket);
+    }
+
+    private RingAuthority mint(CommitRing ring, long slotTicket) {
         return new RingAuthority(RingAuthority.Kind.FILL, lifetime, ring.ringId(), ring.worldId(),
             ring.domainId(), slotTicket, ringKey);
     }

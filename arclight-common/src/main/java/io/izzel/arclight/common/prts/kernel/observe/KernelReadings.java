@@ -873,11 +873,21 @@ public final class KernelReadings {
         add(lines, "product.commit.publishing", reservations == null ? 0 : reservations.publishing());
         add(lines, "product.commit.pending_dispositions",
             reservations == null ? "-" : pendingDispositions(reservations));
+        add(lines, "product.commit.state_entries", reservations == null ? 0 : reservations.stateEntries());
+        add(lines, "product.commit.finished_entries",
+            reservations == null ? 0 : reservations.finishedEntries());
+        add(lines, "product.commit.closed", reservations == null || !reservations.closed() ? 0 : 1);
+        add(lines, "product.commit.publish_refusals",
+            reservations == null ? 0L : reservations.publishRefusals());
+        add(lines, "product.commit.refused_starts", controller == null ? 0L : controller.refusedStarts());
+        add(lines, "product.commit.module_reset_pending", module.commitResetPending() ? 1 : 0);
         add(lines, "product.commit.published_total",
             reservations == null ? 0L : reservations.publishedTotal());
         add(lines, "product.commit.partial_total", reservations == null ? 0L : reservations.partialTotal());
         add(lines, "product.commit.failed_total", reservations == null ? 0L : reservations.failedTotal());
         add(lines, "product.commit.published_units", reservations == null ? 0L : reservations.unitTotal());
+        add(lines, "product.commit.partial_units", reservations == null ? 0L : reservations.partialUnits());
+        add(lines, "product.commit.failed_units", reservations == null ? 0L : reservations.failedUnits());
         add(lines, "product.commit.conservation",
             reservations == null || reservations.conservationHolds() ? 1 : 0);
         add(lines, "product.commit.double_finalize",
@@ -921,7 +931,7 @@ public final class KernelReadings {
                 builder.append(",");
             }
             builder.append(pending.ticketId()).append(':').append(pending.code()).append(':')
-                .append(pending.attempts());
+                .append(pending.diagnostic()).append(':').append(pending.attempts());
         }
         return builder.toString();
     }

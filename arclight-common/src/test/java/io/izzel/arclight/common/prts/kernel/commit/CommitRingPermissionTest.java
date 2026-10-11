@@ -5,7 +5,6 @@ import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Modifier;
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -14,8 +13,10 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** What may fill, read or clear a ring: only the log, only for one ring of one pair, and only once
- * per fill. */
+/** What may fill, read or clear a ring: only the log, only for one ring of one pair, and only once per
+ * admission. The permission is minted inside the log and spent by the push that follows it in the same
+ * call, so no code outside the log can hold one at all: the cases below drive the real paths and read
+ * the ring they left behind. */
 class CommitRingPermissionTest {
 
     private static final String WORLD = "world-a";
@@ -60,62 +61,43 @@ class CommitRingPermissionTest {
     }
 
     @Test
-    void onePermissionFillsOneSlot() {
+    void theLogFillsARingOnlyWhereItsOwnChecksAdmittedTheLine() {
         CommitLog log = log(2);
-        CommitLog.RingSlot slot = log.reserveSlot(WORLD, DOMAIN);
-        CommitRing ring = ringOf(log, WORLD, DOMAIN);
-        CommitLog.RingAuthority permission = log.fill(ring, slot.ticket());
-        assertNotNull(permission);
-        assertTrue(ring.push(entry(), permission).stored());
+        log.beginTick(1L);
+        assertTrue(log.reach(batch()).logged());
 
-        CommitRing.Push again = ring.push(entry(), permission);
-        assertFalse(again.stored(), "a permission is spent by the fill it allowed");
-        assertEquals(RejectCode.COMMIT_ORDER_VIOLATION, again.code());
+        CommitRing ring = ringOf(log, WORLD, DOMAIN);
+
+        assertEquals(1, ring.depth(), "the admitted line is the one entry of the ring");
+        assertEquals(1L, ring.pushed());
+        assertFalse(ring.push(entry(), null).stored(), "a line nobody admitted takes no entry");
         assertEquals(1, ring.depth());
+        assertEquals(1, log.ringDepth());
     }
 
     @Test
-    void aPermissionOfAnotherRingOfTheSamePairIsRefused() {
-        CommitLog log = log(2);
+    void aRingWithNoRoomTakesNoEntryFromTheNextLine() {
+        CommitLog log = log(1);
         log.beginTick(1L);
-        log.reach(batch());
-        CommitRing before = ringOf(log, WORLD, DOMAIN);
-        log.reset();
-        log.beginTick(1L);
-        log.reach(batch());
-        CommitRing after = ringOf(log, WORLD, DOMAIN);
-        assertNotSame(before, after, "the reset leaves a new ring for the same pair");
+        assertTrue(log.reach(batch()).logged());
 
-        CommitRing.Push push = before.push(entry(), log.fill(after, 0L));
-        assertFalse(push.stored(), "a permission of the new ring is not a permission of the old one");
-        assertEquals(RejectCode.COMMIT_ORDER_VIOLATION, push.code());
-        assertEquals(0, before.depth());
+        CommitLog.Verdict full = log.reach(batch());
+
+        assertFalse(full.logged());
+        assertEquals(RejectCode.QUEUE_CAP_EXCEEDED, full.code());
+        assertEquals(1L, log.refusedFull());
+        assertEquals(1, log.ringDepth(), "the ring still carries the one entry it admitted");
+        assertEquals(1, log.ringCapacity());
     }
 
     @Test
-    void aPermissionOfAnotherLogIsRefused() {
-        CommitLog first = log(2);
-        CommitLog second = log(2);
-        first.beginTick(1L);
-        first.reach(batch());
-        second.beginTick(1L);
-        second.reach(batch());
-        CommitLog.RingAuthority permission = first.fill(ringOf(first, WORLD, DOMAIN), 0L);
-        CommitRing other = ringOf(second, WORLD, DOMAIN);
-        assertFalse(other.push(entry(), permission).stored(),
-            "the pair is the same and the log is not");
-        assertEquals(1L, other.permissionRefusals());
-    }
-
-    @Test
-    void aSlotThisLogNoLongerHoldsMintsNothing() {
+    void aSlotThisLogNoLongerHoldsIsNotASlotOfThisOne() {
         CommitLog log = log(2);
         CommitLog.RingSlot slot = log.reserveSlot(WORLD, DOMAIN);
-        CommitRing ring = ringOf(log, WORLD, DOMAIN);
-        assertNotNull(log.fill(ring, slot.ticket()));
-        assertTrue(log.releaseSlot(slot));
-        assertNull(log.fill(ring, slot.ticket()), "a given-back slot mints no permission");
-        assertFalse(ring.push(entry(), log.fill(ring, slot.ticket())).stored());
+        assertNotNull(slot);
+        assertTrue(log.releaseSlot(slot), "a slot that was given back is not held any more");
+        assertFalse(log.releaseSlot(slot), "and giving it back twice moves nothing");
+        assertEquals(0, log.reservedSlots());
     }
 
     @Test
@@ -135,7 +117,23 @@ class CommitRingPermissionTest {
     }
 
     @Test
-    void theMutatorsAreOutOfReachOfAnotherPackage() throws Exception {
+    void aResetLeavesANewRingAndTheOldOneWhereItWas() {
+        CommitLog log = log(2);
+        log.beginTick(1L);
+        log.reach(batch());
+        CommitRing before = ringOf(log, WORLD, DOMAIN);
+        log.reset();
+        log.beginTick(1L);
+        log.reach(batch());
+        CommitRing after = ringOf(log, WORLD, DOMAIN);
+
+        assertNotSame(before, after, "the reset leaves a new ring for the same pair");
+        assertFalse(before.push(entry(), null).stored(), "the old ring takes nothing more");
+        assertEquals(1, after.depth());
+    }
+
+    @Test
+    void theMutatorsAndTheMintAreOutOfReachOfAnotherPackage() throws Exception {
         assertFalse(Modifier.isPublic(CommitRing.class.getDeclaredMethod("push", CommitLog.Entry.class,
             CommitLog.RingAuthority.class).getModifiers()));
         assertFalse(Modifier.isPublic(CommitRing.class.getDeclaredMethod("pop",
@@ -144,8 +142,11 @@ class CommitRingPermissionTest {
             CommitLog.RingAuthority.class).getModifiers()));
         assertFalse(Modifier.isPublic(CommitRing.class.getDeclaredConstructor(String.class,
             String.class, int.class, long.class, Object.class).getModifiers()));
-        assertFalse(Modifier.isPublic(CommitLog.class.getDeclaredMethod("fill", CommitRing.class,
-            long.class).getModifiers()), "the mint is not public either");
+        assertTrue(Modifier.isPrivate(CommitLog.class.getDeclaredMethod("fill", CommitRing.class,
+            long.class).getModifiers()), "the mint is the log's own and no package can ask for one");
+        assertTrue(Modifier.isPrivate(CommitLog.class.getDeclaredMethod("store", CommitRing.class,
+            long.class, CommitLog.Entry.class).getModifiers()),
+            "the one place a ring is filled is inside the log");
         for (var constructor : CommitLog.RingAuthority.class.getDeclaredConstructors()) {
             assertFalse(Modifier.isPublic(constructor.getModifiers()),
                 "a permission cannot be built outside the log");

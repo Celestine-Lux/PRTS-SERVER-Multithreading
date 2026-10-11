@@ -76,8 +76,12 @@ class PendingDispositionReadingsTest {
         KernelModule.instance().bindCommitController(controller);
         try {
             List<String> export = export();
-            assertEquals("product.commit.pending_dispositions=1:QUEUE_CAP_EXCEEDED:1",
+            assertEquals("product.commit.pending_dispositions=1:QUEUE_CAP_EXCEEDED:record-refused:1",
                 line(export, "product.commit.pending_dispositions"));
+            assertEquals("product.commit.state_entries=3",
+                line(export, "product.commit.state_entries"),
+                "one reservation in flight is one entry in each of the three tables");
+            assertEquals("product.commit.closed=0", line(export, "product.commit.closed"));
             assertEquals("product.commit.publishing=0", line(export, "product.commit.publishing"),
                 "the item is not publishing any more");
             assertEquals("product.commit.outstanding=1", line(export, "product.commit.outstanding"),
@@ -85,6 +89,42 @@ class PendingDispositionReadingsTest {
             assertEquals("product.commit.conservation=1", line(export, "product.commit.conservation"));
         } finally {
             KernelModule.instance().bindCommitController(null);
+        }
+    }
+
+    @Test
+    void aResetAskedForInsideAPublishActionIsCarriedOutOnceByItsOwner() {
+        System.setProperty("arclight.prts.kernel", "true");
+        EffectStore store = new EffectStore(4096, 4);
+        CommitLog.OrderSource plans =
+            (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
+        CommitLog log = new CommitLog(() -> 4, plans, store);
+        CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
+        CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
+        KernelModule module = KernelModule.instance();
+        CommitController[] holder = new CommitController[1];
+        String[] inside = new String[1];
+        holder[0] = new CommitController(reservations, ticket -> {
+            module.resetReadings();
+            inside[0] = module.commitResetPending() + "/" + holder[0].resets() + "/" + epochs.current();
+            return new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish", List.of("a=1"),
+                1, "");
+        });
+        module.bindCommitController(holder[0]);
+        try {
+            assertTrue(holder[0].submit(request(reservations)).admitted());
+
+            assertEquals("true/0/0", inside[0],
+                "the module owes the whole reset and nothing was cleared while the action ran");
+            assertEquals(1L, holder[0].resets(), "the lifecycle was reset once, at its safe point");
+            assertEquals(1L, epochs.current(), "and the generation moved once");
+            assertTrue(module.commitResetPending(), "the module still owes the clear of its counters");
+            assertTrue(module.drainCommitReset(), "which it carries out at its next safe point");
+            assertFalse(module.commitResetPending());
+            assertEquals(1L, holder[0].resets(), "without ending a second lifecycle");
+            assertEquals(1L, epochs.current());
+        } finally {
+            module.bindCommitController(null);
         }
     }
 

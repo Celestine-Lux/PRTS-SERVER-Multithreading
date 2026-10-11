@@ -212,6 +212,7 @@ public final class KernelModule {
     private TickPlanStore.Control previousControl = TickPlanStore.Control.missing();
     private CommitLog.Replay lastCommitReplay;
     private CommitController commitController;
+    private boolean resetPending;
     private long planSequence;
     private long worldGeneration;
     private List<String> plannedWorlds = List.of();
@@ -1174,14 +1175,15 @@ public final class KernelModule {
         return control;
     }
 
-    /** The safe point a reset of the commit lifecycle is asked for. A build with no controller
+    /** The safe point a reset of the commit lifecycle is asked for: the lifecycle of the commit log
+     * is ended there too, so the reset this module carries out is complete. A build with no controller
      * bound has no lifecycle to isolate and keeps the path it always had. */
     private boolean commitSafePoint() {
         CommitController controller = this.commitController;
         if (controller == null) {
             return true;
         }
-        return controller.enterReset().granted();
+        return controller.resetAtSafePoint().granted();
     }
 
     /** Binds the controller whose lifecycle this module ends when it clears its counters. With
@@ -1194,6 +1196,24 @@ public final class KernelModule {
         return commitController;
     }
 
+    /** Whether this module owes a reset it could not carry out when it was asked for. */
+    public boolean commitResetPending() {
+        return resetPending;
+    }
+
+    /** Carries out the reset this module owes, in full, once, at an owner safe point. Nothing is done
+     * when it owes none, and the lifecycle of the commit log is not reset a second time here: the
+     * controller carries that one out at its own safe point, and this call clears what is left. */
+    public boolean drainCommitReset() {
+        CommitController controller = this.commitController;
+        if (!resetPending || (controller != null && controller.reservations().publishing() > 0)) {
+            return false;
+        }
+        resetPending = false;
+        clearReadings();
+        return true;
+    }
+
     /** Whether a controller is bound to this module: the readout says so of itself. */
     public String commitControllerWiring() {
         return commitController == null ? "NOT_WIRED" : "BOUND";
@@ -1204,8 +1224,17 @@ public final class KernelModule {
      * nothing is cleared and no generation advances. */
     public void resetReadings() {
         if (!commitSafePoint()) {
+            // The module owns the request, and it is a request for the whole reset and not only for the
+            // lifecycle of the commit log: nothing is cleared now, and the request is carried out once
+            // at the next safe point this module is asked to clear at.
+            resetPending = true;
             return;
         }
+        resetPending = false;
+        clearReadings();
+    }
+
+    private void clearReadings() {
         for (KernelDomain domain : domains) {
             domain.reset();
         }

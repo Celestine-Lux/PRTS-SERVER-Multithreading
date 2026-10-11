@@ -52,10 +52,10 @@ class CommitLogOrderGuardTest {
             new EffectStore.Effect(effectRef, "publish", "PUBLISHED", List.of("a=1", "b=2")));
     }
 
-    private static CommitTicket.ReserveRequest request(String nodeKey, long plan, int position,
-                                                       long effectRef, long instance) {
-        CommitNamespaces.Namespace controller =
-            new CommitNamespaces.Namespace("controller", 5150L, 0L, 91L);
+    private static CommitTicket.ReserveRequest request(CommitReservation reservations, String nodeKey,
+                                                       long plan, int position, long effectRef,
+                                                       long instance) {
+        CommitNamespaces.Namespace controller = reservations.controller();
         List<String> rows = List.of("a=1", "b=2");
         EffectStore.Effect variant = new EffectStore.Effect(effectRef, "publish", "PUBLISHED", rows);
         return new CommitTicket.ReserveRequest(WORLD, DOMAIN, nodeKey, CommitLog.Batch.Kind.APPLY,
@@ -82,13 +82,15 @@ class CommitLogOrderGuardTest {
         CommitLog log = new CommitLog(() -> 4, new Places(), store);
         CommitReservation reservations = new CommitReservation(log, store, new Places(), "owner-a",
             new CommitNamespaces.ResetEpochs());
-        CommitTicket first = reservations.reserve(request("7/0", 7L, 0, 100L, 41L)).ticket();
-        CommitTicket second = reservations.reserve(request("7/1", 7L, 1, 101L, 42L)).ticket();
-        assertNotNull(first);
+        // The later place is taken and started first; only then does an earlier place of the pair
+        // arrive, which is what a plan built around the first reservation looks like.
+        CommitTicket second = reservations.reserve(request(reservations, "7/1", 7L, 1, 101L, 42L)).ticket();
         assertNotNull(second);
         log.beginTick(1L);
-        assertTrue(reservations.beginPublish(first));
-        assertTrue(reservations.beginPublish(second));
+        assertTrue(reservations.beginPublish(second), "it is the earliest place the pair holds so far");
+        CommitTicket first = reservations.reserve(request(reservations, "7/0", 7L, 0, 100L, 41L)).ticket();
+        assertNotNull(first);
+        assertTrue(reservations.beginPublish(first), "and now the earlier place may run too");
 
         CommitReservation.FinalizeResult reversed = reservations.finalize(second, outcome());
 
@@ -208,7 +210,8 @@ class CommitLogOrderGuardTest {
         assertEquals(1L, log.reservationRefusals());
         assertEquals(0, log.reservedSlots());
 
-        CommitReservation.ReserveResult passed = reservations.reserve(request("7/1", 7L, 1, 100L, 42L));
+        CommitReservation.ReserveResult passed =
+            reservations.reserve(request(reservations, "7/1", 7L, 1, 100L, 42L));
 
         assertFalse(passed.admitted(), "a reservation for a place that is gone could only be refused");
         assertEquals(RejectCode.COMMIT_ORDER_VIOLATION, passed.code());

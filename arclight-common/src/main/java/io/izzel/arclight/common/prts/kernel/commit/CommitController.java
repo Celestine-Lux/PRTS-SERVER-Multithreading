@@ -12,11 +12,12 @@ import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
  * nothing else: no host supplier is bound, no world is written, and the controller has no production
  * caller. The column that says so reads SYNTHETIC.
  *
- * <p>The controller is confined to one owner thread, and its reset is a safe point: while a publish
- * action is running, or while a line is publishing, a destructive reset is refused and remembered as
- * pending. It is carried out at the next safe point, after the terminal line of every in-flight
- * reservation was recorded, and the reset generation moves by one only when that happens. A reset
- * asked for from another thread is refused and handed off rather than run on the caller's thread. */
+ * <p>The controller is confined to the owner thread of the reservations it judges, and its reset is a
+ * safe point: while a publish action is running, or while a line is publishing, a destructive reset is
+ * refused and remembered as pending. It is carried out at the next safe point, after the terminal line
+ * of every in-flight reservation was recorded, and the reset generation moves by one only when that
+ * happens. A request that arrives from another thread is refused there and taken over to that same
+ * safe point instead of running on the caller's thread. */
 public final class CommitController {
 
     /** What one publish action is. It reports the state it reached and the units it published. */
@@ -38,14 +39,14 @@ public final class CommitController {
 
     private final CommitReservation reservations;
     private final Publisher publisher;
-    private Thread ownerThread;
-    private boolean inPublish;
-    private boolean pendingReset;
+    private int publishDepth;
+    private volatile boolean pendingReset;
     private long submits;
     private long supplierCalls;
     private long acceptedPublished;
     private long publishedUnits;
     private long refusals;
+    private long refusedStarts;
     private long publishFailures;
     private long resetReentrantRefusals;
     private long resetWhilePublishing;
@@ -54,10 +55,11 @@ public final class CommitController {
     private long resets;
     private long deferredResets;
 
+    /** The owner thread is the one the reservations were bound to and is asked of them on every
+     * call: a holder that re-bound would otherwise be judged by a thread the controller remembered. */
     public CommitController(CommitReservation reservations, Publisher publisher) {
         this.reservations = reservations;
         this.publisher = publisher;
-        this.ownerThread = reservations.ownerThread();
     }
 
     public CommitReservation reservations() {
@@ -71,7 +73,7 @@ public final class CommitController {
 
     /** Runs the whole path for one controlled write, on the owner thread. */
     public SubmitResult submit(CommitTicket.ReserveRequest request) {
-        if (Thread.currentThread() != ownerThread) {
+        if (!reservations.ownsThread()) {
             refusals++;
             return new SubmitResult(false, null, RejectCode.COUNTER_MISSING, "off-owner-thread", 0, 0L,
                 null);
@@ -84,7 +86,15 @@ public final class CommitController {
             return new SubmitResult(false, null, reserved.code(), reserved.diagnostic(), 0, 0L, null);
         }
         CommitTicket ticket = reserved.ticket();
-        reservations.beginPublish(ticket);
+        if (!reservations.beginPublish(ticket)) {
+            // The side effect does not run for a line the holder will not start: the reservation goes
+            // back rather than holding a slot for a line that never ran, and the caller is told so.
+            reservations.release(ticket, CommitTicket.ReleaseReason.CANCELLED);
+            refusals++;
+            refusedStarts++;
+            return new SubmitResult(false, null, RejectCode.COMMIT_ORDER_VIOLATION,
+                "publish-not-started", 0, 0L, ticket);
+        }
         CommitTicket.Outcome outcome = publish(ticket, request);
         CommitReservation.FinalizeResult done = reservations.finalize(ticket, outcome);
         if (done.finalized() && done.terminal() == CommitTicket.Terminal.PUBLISHED) {
@@ -101,18 +111,20 @@ public final class CommitController {
             return new CommitTicket.Outcome(CommitTicket.Terminal.FAILED,
                 request.failed().operationKind(), request.failed().rows(), 0, "publisher-threw");
         }
-        inPublish = true;
+        publishDepth++;
         try {
             supplierCalls++;
             CommitTicket.Outcome reported = publisher.publish(ticket);
             return reported != null ? reported : new CommitTicket.Outcome(CommitTicket.Terminal.FAILED,
                 request.failed().operationKind(), request.failed().rows(), 0, "publisher-silent");
         } catch (RuntimeException | Error failure) {
+            // An action that threw may already have written what it was doing. What it reached is not
+            // known here, so the terminal is the partial one: a failure would claim nothing happened.
             publishFailures++;
-            return new CommitTicket.Outcome(CommitTicket.Terminal.FAILED,
-                request.failed().operationKind(), request.failed().rows(), 0, "publisher-threw");
+            return new CommitTicket.Outcome(CommitTicket.Terminal.PARTIAL,
+                request.partial().operationKind(), request.partial().rows(), 0, "publisher-threw");
         } finally {
-            inPublish = false;
+            publishDepth--;
         }
     }
 
@@ -142,12 +154,15 @@ public final class CommitController {
 
     private ResetDecision refuseReset() {
         long epoch = epoch();
-        if (Thread.currentThread() != ownerThread) {
+        if (!reservations.ownsThread()) {
+            // Not run here and not dropped either: the request is taken over and lands at the next
+            // owner safe point, so the caller knows the generation it just read has not moved.
             resetOffThread++;
             resetHandOffs++;
+            pendingReset = true;
             return new ResetDecision(false, "off-owner-thread", 0, reservations.publishing(), epoch);
         }
-        if (inPublish) {
+        if (publishDepth > 0) {
             resetReentrantRefusals++;
             pendingReset = true;
             return new ResetDecision(false, "reentrant-publish", 0, reservations.publishing(), epoch);
@@ -160,8 +175,24 @@ public final class CommitController {
         return null;
     }
 
+    /** The whole reset the module asked for, run once at the owner safe point: a request taken over
+     * from another thread and a request refused inside a publish action both land here. */
+    public ResetDecision resetCarriedOut() {
+        if (!pendingReset) {
+            return new ResetDecision(false, "nothing-pending", 0, reservations.publishing(), epoch());
+        }
+        deferredResets++;
+        return resetAtSafePoint();
+    }
+
+    /** Ends this controller: nothing new is taken, every reservation that never published is given
+     * back, and the items whose side effect has run keep their room and stay readable. */
+    public CommitReservation.CloseResult close() {
+        return reservations.close();
+    }
+
     private void drainPendingReset() {
-        if (!pendingReset || inPublish || reservations.publishing() > 0) {
+        if (!pendingReset || publishDepth > 0 || reservations.publishing() > 0) {
             return;
         }
         deferredResets++;
@@ -196,6 +227,11 @@ public final class CommitController {
 
     public long refusals() {
         return refusals;
+    }
+
+    /** The side effects that were not started because the holder refused to begin them. */
+    public long refusedStarts() {
+        return refusedStarts;
     }
 
     public long publishFailures() {

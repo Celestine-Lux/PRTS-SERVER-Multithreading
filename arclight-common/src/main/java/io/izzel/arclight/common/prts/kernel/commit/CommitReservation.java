@@ -63,7 +63,12 @@ public final class CommitReservation {
      * was refused and how often it was tried. The table is bounded by the reservations still in
      * flight, and an entry leaves it when the ticket ends. */
     public record Pending(long ticketId, long effectRef, long planSequence, int position,
-                          RejectCode code, int attempts) {
+                          RejectCode code, String diagnostic, int attempts) {
+    }
+
+    /** What closing the holder did: the items it gave back, the ones whose side effect has run and
+     * whose line is not written, and the ones still publishing. */
+    public record CloseResult(int givenBack, int unrecorded, int publishing) {
     }
 
     private record Refusal(RejectCode code, String diagnostic) {
@@ -80,6 +85,7 @@ public final class CommitReservation {
     private final Map<Long, Phase> phases = new LinkedHashMap<>();
     private final Map<Long, Pending> pendings = new LinkedHashMap<>();
     private final Deque<TerminalEntry> ledger = new ArrayDeque<>();
+    private final Deque<Long> finished = new ArrayDeque<>();
     private Thread ownerThread = Thread.currentThread();
     private long ticketIds;
     private long reserveSuccess;
@@ -89,6 +95,8 @@ public final class CommitReservation {
     private long partialTotal;
     private long failedTotal;
     private long unitTotal;
+    private long partialUnits;
+    private long failedUnits;
     private long doubleFinalize;
     private long unknownTicket;
     private long crossLogRefusals;
@@ -98,7 +106,9 @@ public final class CommitReservation {
     private long reservationRefusals;
     private long resetVoided;
     private long resetDuringPublish;
+    private long publishRefusals;
     private long ledgerEvicted;
+    private boolean closed;
 
     public CommitReservation(CommitLog log, EffectStore store, CommitLog.OrderSource plans,
                              String ownerId, CommitNamespaces.ResetEpochs epochs) {
@@ -110,9 +120,15 @@ public final class CommitReservation {
             epochs.current(), CommitNamespaces.NO_THREAD);
     }
 
-    /** Binds the thread every control operation of this holder must run on. */
-    public void bindOwnerThread(Thread thread) {
+    /** Binds the thread every control operation of this holder must run on. The owner is not moved
+     * while a reservation is in flight: the holder and the controller that judges by it must not end
+     * up naming two threads. */
+    public boolean bindOwnerThread(Thread thread) {
+        if (!tickets.isEmpty()) {
+            return false;
+        }
         this.ownerThread = thread == null ? Thread.currentThread() : thread;
+        return true;
     }
 
     public Thread ownerThread() {
@@ -137,8 +153,13 @@ public final class CommitReservation {
         return epochs.current();
     }
 
-    /** Enters the next lifecycle. Called by the controller that reached the owner safe point. */
+    /** Enters the next lifecycle. Called by the controller that reached the owner safe point: a
+     * call from another thread is refused and counted, and the generation stays where it was. */
     public long advanceReset() {
+        if (Thread.currentThread() != ownerThread) {
+            offThreadRefusals++;
+            return epochs.current();
+        }
         return epochs.advance();
     }
 
@@ -151,6 +172,10 @@ public final class CommitReservation {
         if (Thread.currentThread() != ownerThread) {
             offThreadRefusals++;
             return new ReserveResult(false, RejectCode.COUNTER_MISSING, "off-owner-thread", null);
+        }
+        if (closed) {
+            requestRefusals++;
+            return new ReserveResult(false, RejectCode.QUEUE_CAP_EXCEEDED, "lifecycle-closed", null);
         }
         Refusal refusal = validate(request);
         if (refusal != null) {
@@ -210,6 +235,13 @@ public final class CommitReservation {
             || identity.authorizationGeneration() == CommitLog.NO_AUTHORIZATION_GENERATION) {
             return new Refusal(RejectCode.VERSION_MISMATCH, "authorization-mismatch");
         }
+        if (request.controller() == null
+            || !request.controller().lifecycleKey().equals(controller().lifecycleKey())) {
+            // The request names the lifecycle it is taken under. Whether the producer and the world
+            // are really the ones this line writes to is a question only a bound host can answer, and
+            // it is not asked here.
+            return new Refusal(RejectCode.VERSION_MISMATCH, "controller-namespace-mismatch");
+        }
         CommitLog.Resolved resolved = plans == null ? null
             : plans.resolve(request.worldId(), request.domainId(), request.nodeKey());
         if (resolved == null || resolved.planSequence() != request.planSequence()
@@ -262,14 +294,33 @@ public final class CommitReservation {
     }
 
     /** Says that the side effect of this ticket is about to run. It runs on the owner thread like
-     * every other control operation: a call from another thread is refused and counted, and the
-     * reservation is left exactly where it was. */
+     * every other control operation, for the handle this holder minted and for the lifecycle it was
+     * minted under, and only where the pair may run it: a reservation whose place an earlier one of
+     * the pair still holds does not start its side effect at all. Every refusal here leaves the
+     * phases, the reservations and the places exactly where they were. */
     public boolean beginPublish(CommitTicket ticket) {
         if (Thread.currentThread() != ownerThread) {
             offThreadRefusals++;
             return false;
         }
-        if (ticket == null || phases.get(ticket.ticketId()) != Phase.RESERVED) {
+        if (ticket == null || tickets.get(ticket.ticketId()) != ticket) {
+            unknownTicket++;
+            return false;
+        }
+        if (ticket.logLifetime() != log.logLifetime() || ticket.effectSlot().storeId() != store.storeId()
+            || ticket.controller().lifetime() != controller.lifetime()
+            || ticket.controller().resetEpoch() != epochs.current()) {
+            crossLogRefusals++;
+            return false;
+        }
+        if (phases.get(ticket.ticketId()) != Phase.RESERVED) {
+            return false;
+        }
+        if (!log.placeRunnable(ticket.batch().worldId(), ticket.batch().domainId(),
+            ticket.planSequence(), ticket.position())) {
+            // An earlier place of this pair has not ended: the side effect of a later one waits for it
+            // instead of running ahead of the line the ring is about to take.
+            publishRefusals++;
             return false;
         }
         phases.put(ticket.ticketId(), Phase.PUBLISHING);
@@ -286,6 +337,10 @@ public final class CommitReservation {
             unknownTicket++;
             return refused(RejectCode.COUNTER_MISSING, "unknown-ticket", null);
         }
+        if (finished.contains(ticket.ticketId())) {
+            doubleFinalize++;
+            return refused(RejectCode.COUNTER_MISSING, "already-finalized", outcome.terminal());
+        }
         if (tickets.get(ticket.ticketId()) != ticket) {
             unknownTicket++;
             return refused(RejectCode.COUNTER_MISSING, "unknown-ticket", outcome.terminal());
@@ -301,7 +356,7 @@ public final class CommitReservation {
                 // Its side effect has run and this lifecycle can no longer write its line: the item is
                 // carried as one waiting for a disposition, not as a publish still in flight.
                 phases.put(ticket.ticketId(), Phase.UNRECORDED);
-                pend(ticket, RejectCode.COUNTER_MISSING);
+                pend(ticket, RejectCode.COUNTER_MISSING, "stale-ticket");
             }
             return refused(RejectCode.COUNTER_MISSING, "stale-ticket", outcome.terminal());
         }
@@ -314,27 +369,51 @@ public final class CommitReservation {
             requestRefusals++;
             return refused(RejectCode.COMMIT_ORDER_VIOLATION, "not-publishing", outcome.terminal());
         }
-        CommitLog.Verdict verdict = log.recordTicket(ticket, outcome);
+        String malformed = malformedOutcome(outcome, ticket);
+        if (malformed != null) {
+            // A terminal that cannot be read is not a terminal. The item stops reading as a publish and
+            // is carried as one whose line is not written, with the reason it is waiting on.
+            phases.put(ticket.ticketId(), Phase.UNRECORDED);
+            pend(ticket, RejectCode.VERSION_MISMATCH, malformed);
+            return refused(RejectCode.VERSION_MISMATCH, malformed, outcome.terminal());
+        }
+        CommitLog.Verdict verdict;
+        try {
+            verdict = log.recordTicket(ticket, outcome);
+        } catch (RuntimeException | Error thrown) {
+            phases.put(ticket.ticketId(), Phase.UNRECORDED);
+            pend(ticket, RejectCode.COUNTER_MISSING, "record-threw");
+            return refused(RejectCode.COUNTER_MISSING, "record-threw", outcome.terminal());
+        }
         if (!verdict.logged()) {
             // The side effect has run and the line is not written. The ticket leaves the publishing
             // state for the one that says so and is readable as an item still waiting for its line;
             // a later call may still write it, and the counters say how often it was tried.
             RejectCode refusedCode = verdict.code() == null ? RejectCode.COUNTER_MISSING : verdict.code();
             phases.put(ticket.ticketId(), Phase.UNRECORDED);
-            pend(ticket, refusedCode);
+            pend(ticket, refusedCode, "record-refused");
             return refused(refusedCode, "record-refused", outcome.terminal());
         }
-        phases.put(ticket.ticketId(), Phase.FINISHED);
+        phases.remove(ticket.ticketId());
         tickets.remove(ticket.ticketId());
         pendings.remove(ticket.ticketId());
+        remember(ticket.ticketId());
         finalized++;
         int successBatch = outcome.terminal() == CommitTicket.Terminal.PUBLISHED ? 1 : 0;
         switch (outcome.terminal()) {
-            case PUBLISHED -> publishedTotal++;
-            case PARTIAL -> partialTotal++;
-            case FAILED -> failedTotal++;
+            case PUBLISHED -> {
+                publishedTotal++;
+                unitTotal += outcome.unitCount();
+            }
+            case PARTIAL -> {
+                partialTotal++;
+                partialUnits += outcome.unitCount();
+            }
+            case FAILED -> {
+                failedTotal++;
+                failedUnits += outcome.unitCount();
+            }
         }
-        unitTotal += outcome.unitCount();
         append(new TerminalEntry(ticket.ticketId(), ticket.identity().effectRef(),
             outcome.terminal().name(), ticket.planSequence(), ticket.position(),
             outcome.unitCount(), successBatch, outcome.note()));
@@ -402,10 +481,38 @@ public final class CommitReservation {
         pendings.remove(ticket.ticketId());
     }
 
-    private void pend(CommitTicket ticket, RejectCode code) {
+    private void pend(CommitTicket ticket, RejectCode code, String diagnostic) {
         Pending held = pendings.get(ticket.ticketId());
         pendings.put(ticket.ticketId(), new Pending(ticket.ticketId(), ticket.identity().effectRef(),
-            ticket.planSequence(), ticket.position(), code, held == null ? 1 : held.attempts() + 1));
+            ticket.planSequence(), ticket.position(), code, diagnostic,
+            held == null ? 1 : held.attempts() + 1));
+    }
+
+    /** Why a terminal cannot be read as one, or null when it can. A unit count is a number of
+     * published things: a negative one is not a count, and a terminal without a state or without an
+     * operation names nothing to record. Whether the payload fits the promise the reservation made is
+     * judged by the store, which faults and stops handing out room when it does not. */
+    private static String malformedOutcome(CommitTicket.Outcome outcome, CommitTicket ticket) {
+        if (outcome.terminal() == null) {
+            return "terminal-undeclared";
+        }
+        if (outcome.unitCount() < 0) {
+            return "unit-count-negative";
+        }
+        if (outcome.operationKind().isEmpty()) {
+            return "operation-undeclared";
+        }
+        if (outcome.rows().size() != ticket.batch().rows()) {
+            return "row-count-mismatch";
+        }
+        return null;
+    }
+
+    private void remember(long ticketId) {
+        finished.addLast(ticketId);
+        while (finished.size() > LEDGER_LIMIT) {
+            finished.removeFirst();
+        }
     }
 
     private FinalizeResult refused(RejectCode code, String diagnostic, CommitTicket.Terminal terminal) {
@@ -427,6 +534,32 @@ public final class CommitReservation {
             offThreadRefusals++;
             return new ResetResult(0, publishing());
         }
+        int voided = giveBackUnpublished("VOIDED", "reset");
+        finished.clear();
+        int publishing = publishing();
+        resetDuringPublish += publishing;
+        return new ResetResult(voided, publishing);
+    }
+
+    /** Stops this holder from taking anything new and gives back every reservation that never
+     * published. A reset ends one generation and keeps the holder; a close ends the holder, and the
+     * items whose side effect has run keep their room, their slot and their entry: a line that may
+     * have been published by the host is not thrown away with the table it was waiting in. */
+    public CloseResult close() {
+        if (Thread.currentThread() != ownerThread) {
+            offThreadRefusals++;
+            return new CloseResult(0, pendings.size(), publishing());
+        }
+        closed = true;
+        int givenBack = giveBackUnpublished("CLOSED", "close");
+        finished.clear();
+        return new CloseResult(givenBack, pendings.size(), publishing());
+    }
+
+    /** Gives back every reservation of this holder that never published and writes one terminal
+     * entry for each. What it gave back is counted as released: the balance of the lifecycle closes
+     * over a reset and over a close alike. */
+    private int giveBackUnpublished(String state, String note) {
         List<Long> voided = new ArrayList<>();
         for (Map.Entry<Long, Phase> entry : phases.entrySet()) {
             if (entry.getValue() == Phase.RESERVED) {
@@ -439,16 +572,12 @@ public final class CommitReservation {
                 continue;
             }
             giveBack(ticket);
-            // A reservation voided here is one given back, and the balance of the lifecycle counts it
-            // as one: reserve = finalized + released + outstanding holds across a reset too.
             released++;
             resetVoided++;
-            append(new TerminalEntry(id, ticket.identity().effectRef(), "VOIDED", ticket.planSequence(),
-                ticket.position(), 0, 0, "reset"));
+            append(new TerminalEntry(id, ticket.identity().effectRef(), state, ticket.planSequence(),
+                ticket.position(), 0, 0, note));
         }
-        int publishing = publishing();
-        resetDuringPublish += publishing;
-        return new ResetResult(voided.size(), publishing);
+        return voided.size();
     }
 
     /** The reservations still in flight, by the state they are in. */
@@ -475,6 +604,22 @@ public final class CommitReservation {
 
     public int pendingCount() {
         return pendings.size();
+    }
+
+    /** The entries this holder keeps for the reservations in flight: an ended ticket leaves none
+     * behind, so the table cannot grow with the number of lines a lifecycle took. */
+    public int stateEntries() {
+        return tickets.size() + phases.size() + pendings.size();
+    }
+
+    /** The ids of the tickets that ended recently, kept only to answer a repeated terminal. */
+    public int finishedEntries() {
+        return finished.size();
+    }
+
+    /** Whether this holder takes nothing new. */
+    public boolean closed() {
+        return closed;
     }
 
     /** Whether every reservation ever taken is finalized, given back, or still in flight. */
@@ -511,9 +656,20 @@ public final class CommitReservation {
     }
 
     /** The physical units the published lines reported. It is never read out of the rows of a
-     * record or the field names it declares. */
+     * record or the field names it declares, and a terminal that did not publish counts here not at
+     * all: those units are read through {@link #partialUnits()} and {@link #failedUnits()}. */
     public long unitTotal() {
         return unitTotal;
+    }
+
+    /** The units the partial terminals reported, kept apart from the published ones. */
+    public long partialUnits() {
+        return partialUnits;
+    }
+
+    /** The units the failed terminals reported, kept apart from the published ones. */
+    public long failedUnits() {
+        return failedUnits;
     }
 
     public long doubleFinalize() {
@@ -554,5 +710,10 @@ public final class CommitReservation {
 
     public long ledgerEvicted() {
         return ledgerEvicted;
+    }
+
+    /** The side effects that were not started because an earlier place of their pair had not ended. */
+    public long publishRefusals() {
+        return publishRefusals;
     }
 }

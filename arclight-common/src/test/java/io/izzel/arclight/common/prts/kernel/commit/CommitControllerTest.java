@@ -189,10 +189,14 @@ class CommitControllerTest {
             throw new IllegalStateException("the publish action failed");
         });
         CommitController.SubmitResult fourth = throwing.submit(thrown.request(2));
-        assertEquals(CommitTicket.Terminal.FAILED, fourth.terminal());
+        // An action that threw may already have written what it was doing, and nothing here can tell
+        // whether it did: the terminal is the partial one, because a failure would claim it did not.
+        assertEquals(CommitTicket.Terminal.PARTIAL, fourth.terminal());
         assertEquals(1L, throwing.publishFailures());
         assertEquals(1L, throwing.supplierCalls());
-        assertEquals(1L, thrown.reservations.failedTotal());
+        assertEquals(0L, thrown.reservations.publishedTotal());
+        assertEquals(1L, thrown.reservations.partialTotal());
+        assertEquals(0L, thrown.reservations.failedTotal());
         assertEquals("publisher-threw", thrown.reservations.terminalLedger().get(0).note());
     }
 
