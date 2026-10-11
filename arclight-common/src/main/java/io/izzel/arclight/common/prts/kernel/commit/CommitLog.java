@@ -518,6 +518,11 @@ public final class CommitLog {
         return effects;
     }
 
+    /** The order source this log asks: a chain of the same shape is told apart by this reference. */
+    public OrderSource orderSource() {
+        return source;
+    }
+
     /** The number of steps two runs of the same input differ in; -1 means one of them is missing. */
     public static int compareRuns(Replay left, Replay right) {
         return Replay.compare(left, right);

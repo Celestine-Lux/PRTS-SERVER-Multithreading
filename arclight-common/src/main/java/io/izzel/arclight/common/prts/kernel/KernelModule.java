@@ -13,7 +13,9 @@ import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import io.izzel.arclight.common.prts.kernel.codes.WriteDisposition;
 import io.izzel.arclight.common.prts.kernel.commit.CommitController;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
+import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
+import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.exits.DualExits;
 import io.izzel.arclight.common.prts.kernel.safety.SafetyNet;
 import io.izzel.arclight.common.prts.kernel.safety.ZeroEffectDetector;
@@ -187,8 +189,15 @@ public final class KernelModule {
         KernelSettings::safetyCascadeCap);
     private final ZeroEffectDetector zeroEffect = new ZeroEffectDetector();
     private final DualExits exits = new DualExits(KernelSettings.exitWindowTicks());
-    private final CommitLog commits = new CommitLog(KernelSettings::commitRingCap,
-        this::resolveCommitOrder);
+    /** The one plan authority of this module. A chain is adopted only when the log it carries asks
+     * this very instance, so the identity of an order source is a reference and not a shape. */
+    private final CommitLog.OrderSource commitOrderSource = this::resolveCommitOrder;
+    /** The log this module built for itself: the path every tick uses while nothing is bound. */
+    private final CommitLog ownCommits = new CommitLog(KernelSettings::commitRingCap,
+        commitOrderSource);
+    /** The log in use: the module's own until a whole chain is adopted, and the log of that chain
+     * afterwards. Only an install moves it, and an install moves it whole or not at all. */
+    private CommitLog commits = ownCommits;
     private long tickIndex;
     private int waitCrossStreak;
     private boolean waitSiteTapInstalled;
@@ -213,6 +222,9 @@ public final class KernelModule {
     private CommitLog.Replay lastCommitReplay;
     private CommitController commitController;
     private boolean resetPending;
+    private String commitBindingRefusal = "";
+    private long commitBindingLogLifetime;
+    private long commitBindingStoreId;
     private long planSequence;
     private long worldGeneration;
     private List<String> plannedWorlds = List.of();
@@ -1192,14 +1204,157 @@ public final class KernelModule {
         return true;
     }
 
-    /** Binds the controller that coordinates the reset this module carries out when it clears its
-     * counters. With nothing bound the reset is the one it always was. */
-    public void bindCommitController(CommitController controller) {
+    /** What one install of a whole chain did: the columns of the binding, or the piece that refused
+     * it. A refusal names the piece and leaves every field of the module exactly where it was. */
+    public record CommitBinding(boolean bound, String refusal, long logLifetime, long storeId) {
+    }
+
+    /** Adopts one whole chain — the log, the store that log carries and the holder that mints its
+     * tickets — as the single commit chain of this module, on the owner thread of the host and only
+     * while the declared face is executable. Every check runs before anything is taken, and a
+     * candidate that fails one of them is refused as a whole: the module keeps the log it had, binds
+     * no controller and reads NOT_WIRED. Two chains are told apart by reference, never by shape. */
+    public CommitBinding installCommitChain(CommitLog candidate, CommitController controller) {
+        CommitReservation reservations = controller == null ? null : controller.reservations();
+        String refusal = checkChain(candidate, controller, reservations);
+        if (refusal != null) {
+            commitBindingRefusal = refusal;
+            return new CommitBinding(false, refusal, 0L, 0L);
+        }
+        this.commits = candidate;
         this.commitController = controller;
+        this.commitBindingRefusal = "";
+        this.commitBindingLogLifetime = candidate.logLifetime();
+        this.commitBindingStoreId = reservations.store().storeId();
+        return new CommitBinding(true, "", commitBindingLogLifetime, commitBindingStoreId);
+    }
+
+    private String checkChain(CommitLog candidate, CommitController controller,
+                              CommitReservation reservations) {
+        if (reservations == null) {
+            return "controller-missing";
+        }
+        if (candidate == null) {
+            return "chain-log-missing";
+        }
+        if (reservations.log() != candidate) {
+            // Two chains of the same shape are the normal case and not the exception: both mint a
+            // first ticket of one and name the same owner. Only the log the holder itself mints in
+            // may become the log of this module.
+            return "chain-log-mismatch";
+        }
+        EffectStore store = reservations.store();
+        if (store == null || candidate.effects() != store) {
+            return "chain-store-mismatch";
+        }
+        if (candidate.orderSource() != commitOrderSource) {
+            // The plan authority of the adopted log has to be the one instance of this module, or
+            // the order a commit is judged by is not the order this module froze.
+            return "order-source-mismatch";
+        }
+        if (store.halted()) {
+            return "store-halted";
+        }
+        if (store.storeId() == 0L || candidate.logLifetime() == 0L) {
+            return "chain-identity-missing";
+        }
+        if (store.capacityBytes() <= 0 || store.capacityRecords() <= 0) {
+            return "store-room-missing";
+        }
+        if (!guard.serverThreadBound()) {
+            return "owner-thread-unbound";
+        }
+        if (!guard.onServerThread()) {
+            return "off-owner-thread";
+        }
+        if (reservations.ownerThread() != Thread.currentThread()) {
+            return "owner-thread-mismatch";
+        }
+        KernelSettings.ProductCommit declared = KernelSettings.productCommit();
+        if (declared.schemaVersion() != CommitLog.SCHEMA_TYPED) {
+            return "declared-schema-mismatch";
+        }
+        if (!declared.executable()) {
+            return "declared-face-off";
+        }
+        if (commitController != null && commitController != controller) {
+            return "already-bound";
+        }
+        return null;
+    }
+
+    /** Gives the module back its own log. The chain it adopted stays exactly as it is: every item
+     * that waits for a line and every line in flight keeps its room and stays readable, nothing is
+     * disposed of, retried or reported as a success. A rollback is refused while such an obligation
+     * is outstanding, so the evidence cannot be hidden by taking the module off the chain. */
+    public boolean rollbackCommitChain() {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return false;
+        }
+        CommitReservation reservations = controller.reservations();
+        if (reservations.publishing() > 0) {
+            commitBindingRefusal = "rollback-publishing";
+            return false;
+        }
+        if (reservations.pendingCount() > 0) {
+            commitBindingRefusal = "rollback-pending-dispositions";
+            return false;
+        }
+        this.commitController = null;
+        this.commits = ownCommits;
+        this.commitBindingRefusal = "";
+        this.commitBindingLogLifetime = 0L;
+        this.commitBindingStoreId = 0L;
+        return true;
     }
 
     public CommitController commitController() {
         return commitController;
+    }
+
+    /** The one plan authority of this module: a caller that builds a chain to be adopted binds this
+     * instance, and an install that finds another one refuses the candidate whole. */
+    public CommitLog.OrderSource commitOrderSource() {
+        return commitOrderSource;
+    }
+
+    /** Whether the log in use is the log of the chain that was adopted: the invariant of an install,
+     * read back instead of assumed. */
+    public boolean commitChainIsTheOneLog() {
+        CommitController controller = this.commitController;
+        return controller != null && controller.reservations().log() == commits;
+    }
+
+    /** Whether the plan authority of the log in use is the one instance of this module. */
+    public boolean commitOrderSourceBound() {
+        return commitController != null && commits.orderSource() == commitOrderSource;
+    }
+
+    /** The piece that refused the last install or rollback, or an empty string. */
+    public String commitBindingRefusal() {
+        return commitBindingRefusal;
+    }
+
+    /** The lifetime of the adopted log, zero while nothing is adopted. */
+    public long commitBindingLogLifetime() {
+        return commitBindingLogLifetime;
+    }
+
+    /** The identity of the adopted store, zero while nothing is adopted. */
+    public long commitBindingStoreId() {
+        return commitBindingStoreId;
+    }
+
+    /** Whether the host has named the thread the owner of a chain is judged by. Read where it is
+     * bound and never inferred from the name of a thread. */
+    public boolean commitOwnerThreadBound() {
+        return guard.serverThreadBound();
+    }
+
+    /** The registered site the owner was bound as, or an empty string while it is unbound. */
+    public String commitOwnerSite() {
+        return guard.serverSiteId();
     }
 
     /** Whether this module owes a reset it could not carry out when it was asked for. */
@@ -1284,6 +1439,7 @@ public final class KernelModule {
         versionSlots.reset();
         ownerGrants.reset();
         controlledSlots.reset();
+        commitBindingRefusal = "";
         commits.reset();
         safety.reset();
         zeroEffect.reset();

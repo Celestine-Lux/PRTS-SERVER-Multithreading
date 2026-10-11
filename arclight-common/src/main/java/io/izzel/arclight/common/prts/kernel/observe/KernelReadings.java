@@ -862,6 +862,19 @@ public final class KernelReadings {
             controller != null && controller.executable() ? 1 : 0);
         add(lines, "product.commit.controller_owner",
             reservations == null ? "-" : reservations.controller().ownerId());
+        // Where the owner of a chain is read: the thread the host bound, by the site it was bound
+        // with and never by the name of a thread. Both columns read while nothing is bound.
+        add(lines, "product.commit.owner_thread_bound", module.commitOwnerThreadBound() ? 1 : 0);
+        add(lines, "product.commit.owner_thread",
+            module.commitOwnerThreadBound() ? module.commitOwnerSite() : "-");
+        // What one install did: the piece that refused it, and the identity of the chain it took.
+        add(lines, "product.commit.binding_refusal",
+            module.commitBindingRefusal().isEmpty() ? "-" : module.commitBindingRefusal());
+        add(lines, "product.commit.binding_log_lifetime", module.commitBindingLogLifetime());
+        add(lines, "product.commit.binding_store_id", module.commitBindingStoreId());
+        add(lines, "product.commit.binding_chain_log", module.commitChainIsTheOneLog() ? 1 : 0);
+        add(lines, "product.commit.binding_order_source",
+            module.commitOrderSourceBound() ? 1 : 0);
         add(lines, "product.commit.controller_reset_epoch", controller == null ? 0L : controller.epoch());
         add(lines, "product.commit.controller_reset_pending", module.commitResetPending() ? 1 : 0);
         add(lines, "product.commit.submits", controller == null ? 0L : controller.submits());

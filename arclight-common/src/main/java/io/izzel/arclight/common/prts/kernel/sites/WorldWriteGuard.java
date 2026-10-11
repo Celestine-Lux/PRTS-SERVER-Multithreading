@@ -156,6 +156,12 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         return serverThread != null;
     }
 
+    /** The registered site the server thread was bound as: the owner of the commit chain is read
+     * here by the identity it was bound with, never by the name of a thread. */
+    public String serverSiteId() {
+        return serverThread == null ? "" : serverHolder.siteId();
+    }
+
     /** Declares a thread as a registered site. */
     public void registerHolder(Thread thread, HolderKind kind, String siteId) {
         declared.put(thread, new HolderIdentity(kind, siteId));

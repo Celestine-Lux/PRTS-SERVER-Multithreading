@@ -7,17 +7,19 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import io.izzel.arclight.common.prts.kernel.observe.KernelReadings;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Who carries out a reset of the commit lifecycle and how often: the module owns the whole request
@@ -47,7 +49,7 @@ class KernelModuleResetOwnerTest {
         final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(65536, 64);
-        final CommitLog log = new CommitLog(() -> 8, plans, store);
+        final CommitLog log = new CommitLog(() -> 8, module.commitOrderSource(), store);
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);
@@ -55,7 +57,8 @@ class KernelModuleResetOwnerTest {
 
         Chain(CommitController.Publisher publisher) {
             controller = new CommitController(reservations, publisher);
-            module.bindCommitController(controller);
+            assertTrue(module.installCommitChain(log, controller).bound(),
+                "the whole chain is taken or none of it is");
         }
 
         CommitTicket.ReserveRequest request(long instance) {
@@ -87,21 +90,25 @@ class KernelModuleResetOwnerTest {
     }
 
     @BeforeEach
-    void switchTheKernelOn() {
+    void switchTheKernelOnAndNameTheOwnerThread() throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
+        // The declared face is written for the length of one test, and one tick is what names the
+        // thread a chain is installed on: the install is owner-only and names no thread of its own.
+        ExecutableProductFace.declare();
+        KernelModule.instance().serverTick(List.of(WORLD));
     }
 
     @AfterEach
-    void leaveTheModuleAsItWas() {
+    void leaveTheModuleAsItWas() throws IOException {
         System.clearProperty("arclight.prts.kernel");
         KernelModule module = KernelModule.instance();
         // A driven tick hands its observation seams out; the module is a singleton, so they are handed
         // back here rather than left to the test that runs next.
         module.removeWaitSiteTap();
         module.removeWritePathTap();
-        module.bindCommitController(null);
         module.resetReadings();
-        module.bindCommitController(null);
+        module.rollbackCommitChain();
+        ExecutableProductFace.restore();
     }
 
     @Test
@@ -126,10 +133,12 @@ class KernelModuleResetOwnerTest {
         assertEquals(2L, c.controller.resets(), "and it is a second decision");
         assertEquals(2L, c.epochs.current(), "of a second generation");
 
-        assertNull(c.log.lastResetTyped(),
-            "the log this chain publishes into is not the one the module owns: making those one "
-                + "object is what the binding step has to establish, and the clear of the module "
-                + "does not reach into another holder's log");
+        assertNotNull(c.log.lastResetTyped(),
+            "the log this chain publishes into is the log the module adopted: the clear of the "
+                + "module ends that lifecycle and leaves its projection here");
+        assertEquals(0, c.log.lastResetTyped().typedSteps().size(),
+            "and no line was ever written into it, so the projection is empty");
+        assertEquals(0L, c.log.sequence(), "the sequence of the adopted log moved with the clear");
     }
 
     @Test
@@ -163,10 +172,13 @@ class KernelModuleResetOwnerTest {
         assertTrue(module.drainCommitReset(), "the module carries it out at its next safe point");
         assertEquals(1L, c.controller.resets());
         assertEquals(1L, c.epochs.current());
-        assertEquals(1L, c.log.sequence(),
-            "the line of the chain is where the action wrote it: the clear belongs to the log the "
-                + "module owns and not to this one");
-        assertNull(c.log.lastResetTyped(), "so there is no projection of it here either");
+        assertEquals(0L, c.log.sequence(),
+            "the line of the chain was written into the log the module adopted, and the clear of "
+                + "the module ended that lifecycle");
+        assertNotNull(c.log.lastResetTyped(),
+            "so the line is folded into the terminal projection of that lifecycle");
+        assertEquals(1, c.log.lastResetTyped().typedSteps().size(),
+            "exactly the one line the action wrote");
     }
 
     @Test
@@ -190,12 +202,14 @@ class KernelModuleResetOwnerTest {
 
         assertTrue(c.reservations.finalize(ticket, published()).finalized(),
             "the terminal line of the item in flight is written first");
-        assertEquals(1L, c.log.sequence());
+        assertEquals(1L, c.log.sequence(), "the terminal line was written before the reset ran");
         assertTrue(module.drainCommitReset(), "and then the request the module owes runs");
         assertEquals(1L, c.controller.resets());
         assertEquals(1L, c.epochs.current());
-        assertEquals(1L, c.log.sequence(), "the terminal line was written before the reset ran");
-        assertNull(c.log.lastResetTyped());
+        assertEquals(0L, c.log.sequence(), "the clear of the module ended the lifecycle of its log");
+        assertNotNull(c.log.lastResetTyped());
+        assertEquals(1, c.log.lastResetTyped().typedSteps().size(),
+            "and the line it still carried is the projection it left behind");
     }
 
     @Test
@@ -223,6 +237,9 @@ class KernelModuleResetOwnerTest {
         assertEquals("1", reading(module, "product.commit.reset_pending_dispositions"));
         assertEquals("1", reading(module, "product.commit.conservation"),
             "and conservation on its own does not say the room came back");
+        assertFalse(module.rollbackCommitChain(),
+            "and a rollback does not take the module off a chain that still owes a line");
+        assertEquals("rollback-pending-dispositions", reading(module, "product.commit.binding_refusal"));
 
         assertTrue(c.reservations.finalize(ticket, published()).finalized(),
             "the owner hands the waiting item its line");

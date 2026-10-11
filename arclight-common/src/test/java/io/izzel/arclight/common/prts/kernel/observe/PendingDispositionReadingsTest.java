@@ -8,9 +8,11 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -27,10 +29,14 @@ class PendingDispositionReadingsTest {
     private static final String NODE = "a/0";
 
     @AfterEach
-    void clear() {
+    void clear() throws IOException {
         System.clearProperty("arclight.prts.kernel");
-        KernelModule.instance().bindCommitController(null);
-        KernelModule.instance().resetReadings();
+        KernelModule module = KernelModule.instance();
+        module.removeWaitSiteTap();
+        module.removeWritePathTap();
+        module.resetReadings();
+        module.rollbackCommitChain();
+        ExecutableProductFace.restore();
     }
 
     private static List<String> export() {
@@ -48,6 +54,19 @@ class PendingDispositionReadingsTest {
         return hits.get(0);
     }
 
+    /** Names the owner thread the way a host does and installs the chain of the fixture. */
+    private static void hostAndInstall(CommitLog log, CommitController controller) throws IOException {
+        ExecutableProductFace.declare();
+        KernelModule module = KernelModule.instance();
+        module.serverTick(List.of(WORLD));
+        assertTrue(module.installCommitChain(log, controller).bound(),
+            "the whole chain is taken or none of it is");
+    }
+
+    private static CommitTicket.Outcome published() {
+        return new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish", List.of("a=1"), 1, "");
+    }
+
     @Test
     void withNothingBoundTheColumnOfWaitingItemsIsADash() {
         System.setProperty("arclight.prts.kernel", "true");
@@ -57,24 +76,27 @@ class PendingDispositionReadingsTest {
     }
 
     @Test
-    void anItemWaitingForItsLineIsNamedByTheReadout() {
+    void anItemWaitingForItsLineIsNamedByTheReadout() throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
         EffectStore store = new EffectStore(4096, 4);
         CommitLog.OrderSource plans =
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
-        CommitLog log = new CommitLog(() -> 4, plans, store);
+        KernelModule module = KernelModule.instance();
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
-        CommitTicket ticket = reservations.reserve(request(reservations)).ticket();
-        assertTrue(reservations.beginPublish(ticket));
-        CommitTicket.Outcome grown = new CommitTicket.Outcome(CommitTicket.Terminal.PARTIAL, "publish",
-            List.of("a=1"), 1, "a-note-nobody-promised-for");
-        assertFalse(reservations.finalize(ticket, grown).finalized());
         CommitController controller = new CommitController(reservations,
             line -> new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish", List.of("a=1"),
                 1, ""));
-        KernelModule.instance().bindCommitController(controller);
+        // The chain is taken while it is healthy; the item that waits for a line is created after
+        // that, through the very chain the module adopted.
+        hostAndInstall(log, controller);
         try {
+            CommitTicket ticket = reservations.reserve(request(reservations)).ticket();
+            assertTrue(reservations.beginPublish(ticket));
+            CommitTicket.Outcome grown = new CommitTicket.Outcome(CommitTicket.Terminal.PARTIAL,
+                "publish", List.of("a=1"), 1, "a-note-nobody-promised-for");
+            assertFalse(reservations.finalize(ticket, grown).finalized());
             List<String> export = export();
             assertEquals("product.commit.pending_dispositions=1:QUEUE_CAP_EXCEEDED:record-refused:1",
                 line(export, "product.commit.pending_dispositions"));
@@ -87,21 +109,36 @@ class PendingDispositionReadingsTest {
             assertEquals("product.commit.outstanding=1", line(export, "product.commit.outstanding"),
                 "and it is still in flight");
             assertEquals("product.commit.conservation=1", line(export, "product.commit.conservation"));
+            assertFalse(module.rollbackCommitChain(),
+                "a rollback does not take the module off a chain that still owes a line");
+            assertEquals("product.commit.binding_refusal=rollback-pending-dispositions",
+                line(export(), "product.commit.binding_refusal"));
+            assertEquals("product.commit.controller_wiring=BOUND",
+                line(export(), "product.commit.controller_wiring"), "the evidence stays reachable");
+
+            assertTrue(reservations.finalize(ticket, published()).finalized(),
+                "the owner hands the waiting item its line");
+            assertEquals("product.commit.pending=0", line(export(), "product.commit.pending"));
+            assertEquals("product.commit.effect_capacity_slots=0",
+                line(export(), "product.commit.effect_capacity_slots"), "and the room comes back");
+            assertTrue(module.rollbackCommitChain(), "only now is the rollback taken");
+            assertEquals("product.commit.controller_wiring=NOT_WIRED",
+                line(export(), "product.commit.controller_wiring"));
         } finally {
-            KernelModule.instance().bindCommitController(null);
+            module.rollbackCommitChain();
         }
     }
 
     @Test
-    void aResetAskedForInsideAPublishActionIsCarriedOutOnceByItsOwner() {
+    void aResetAskedForInsideAPublishActionIsCarriedOutOnceByItsOwner() throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
         EffectStore store = new EffectStore(4096, 4);
         CommitLog.OrderSource plans =
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
-        CommitLog log = new CommitLog(() -> 4, plans, store);
+        KernelModule module = KernelModule.instance();
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
-        KernelModule module = KernelModule.instance();
         CommitController[] holder = new CommitController[1];
         String[] inside = new String[1];
         holder[0] = new CommitController(reservations, ticket -> {
@@ -110,7 +147,7 @@ class PendingDispositionReadingsTest {
             return new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish", List.of("a=1"),
                 1, "");
         });
-        module.bindCommitController(holder[0]);
+        hostAndInstall(log, holder[0]);
         try {
             assertTrue(holder[0].submit(request(reservations)).admitted());
 
@@ -128,7 +165,7 @@ class PendingDispositionReadingsTest {
             assertEquals(1L, holder[0].resets(), "without ending a second lifecycle");
             assertEquals(1L, epochs.current());
         } finally {
-            module.bindCommitController(null);
+            module.rollbackCommitChain();
         }
     }
 

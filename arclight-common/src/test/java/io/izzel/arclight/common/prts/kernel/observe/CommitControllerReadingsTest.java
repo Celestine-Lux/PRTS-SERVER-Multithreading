@@ -8,14 +8,17 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -47,10 +50,14 @@ class CommitControllerReadingsTest {
         "commit.held_plans");
 
     @AfterEach
-    void clear() {
+    void clear() throws IOException {
         System.clearProperty("arclight.prts.kernel");
-        KernelModule.instance().bindCommitController(null);
-        KernelModule.instance().resetReadings();
+        KernelModule module = KernelModule.instance();
+        module.removeWaitSiteTap();
+        module.removeWritePathTap();
+        module.resetReadings();
+        module.rollbackCommitChain();
+        ExecutableProductFace.restore();
     }
 
     private static List<String> export() {
@@ -93,16 +100,19 @@ class CommitControllerReadingsTest {
     }
 
     @Test
-    void aResetThatArrivesInsideAPublishActionClearsNothingAndIsCarriedOutOnceByTheModule() {
+    void aResetThatArrivesInsideAPublishActionClearsNothingAndIsCarriedOutOnceByTheModule()
+        throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
+        KernelModule module = KernelModule.instance();
+        ExecutableProductFace.declare();
+        module.serverTick(List.of("world-a"));
         EffectStore store = new EffectStore(4096, 8);
         CommitLog.OrderSource plans = (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
-        CommitLog log = new CommitLog(() -> 4, plans, store);
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         final CommitController[] holder = new CommitController[1];
         final String[] inside = new String[1];
-        KernelModule module = KernelModule.instance();
         holder[0] = new CommitController(reservations, ticket -> {
             module.resetReadings();
             inside[0] = holder[0].resetReentrantRefusals() + "/" + holder[0].resets() + "/"
@@ -110,7 +120,7 @@ class CommitControllerReadingsTest {
             return new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish",
                 List.of("a=1"), 1, "");
         });
-        module.bindCommitController(holder[0]);
+        assertTrue(module.installCommitChain(log, holder[0]).bound());
         try {
             holder[0].submit(request(epochs, reservations));
             assertEquals("1/0/0", inside[0],
@@ -132,8 +142,13 @@ class CommitControllerReadingsTest {
             assertEquals(1L, holder[0].resets());
             assertEquals(1L, epochs.current());
             assertFalse(module.commitResetPending());
+            assertNotNull(log.lastResetTyped(),
+                "the clear of the module ended the lifecycle of the log it adopted");
+            assertEquals(1, log.lastResetTyped().typedSteps().size(),
+                "and folded the line that lifecycle still carried into its terminal projection");
+            assertEquals(0L, log.sequence(), "the log of the module is the log of the chain, so it moved");
         } finally {
-            module.bindCommitController(null);
+            module.rollbackCommitChain();
         }
     }
 

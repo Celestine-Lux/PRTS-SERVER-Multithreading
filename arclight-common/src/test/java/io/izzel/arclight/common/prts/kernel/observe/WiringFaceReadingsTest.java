@@ -8,9 +8,11 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,9 +40,10 @@ class WiringFaceReadingsTest {
 
     private static final class Chain {
 
+        final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(4096, 8);
-        final CommitLog log = new CommitLog(() -> 4, plans, store);
+        final CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);
@@ -63,11 +66,23 @@ class WiringFaceReadingsTest {
         }
     }
 
+    /** Names the owner thread the way a host does and installs the chain of the fixture. */
+    private static void hostAndInstall(Chain c) throws IOException {
+        ExecutableProductFace.declare();
+        c.module.serverTick(List.of(WORLD));
+        assertTrue(c.module.installCommitChain(c.log, c.controller).bound(),
+            "the whole chain is taken or none of it is");
+    }
+
     @AfterEach
-    void clear() {
+    void clear() throws IOException {
         System.clearProperty("arclight.prts.kernel");
-        KernelModule.instance().bindCommitController(null);
-        KernelModule.instance().resetReadings();
+        KernelModule module = KernelModule.instance();
+        module.removeWaitSiteTap();
+        module.removeWritePathTap();
+        module.resetReadings();
+        module.rollbackCommitChain();
+        ExecutableProductFace.restore();
     }
 
     private static List<String> export() {
@@ -105,13 +120,23 @@ class WiringFaceReadingsTest {
         assertEquals("product.commit.pending=0", line(export, "product.commit.pending"));
         assertEquals("product.commit.attention=0", line(export, "product.commit.attention"));
         assertEquals("product.commit.conservation=1", line(export, "product.commit.conservation"));
+        assertEquals("product.commit.binding_refusal=-", line(export, "product.commit.binding_refusal"),
+            "a module that installed nothing refuses nothing");
+        assertEquals("product.commit.binding_log_lifetime=0",
+            line(export, "product.commit.binding_log_lifetime"));
+        assertEquals("product.commit.binding_store_id=0",
+            line(export, "product.commit.binding_store_id"));
+        assertEquals("product.commit.binding_chain_log=0",
+            line(export, "product.commit.binding_chain_log"));
+        assertEquals("product.commit.binding_order_source=0",
+            line(export, "product.commit.binding_order_source"));
     }
 
     @Test
-    void aBoundControllerWithoutAnActionReadsAsBoundAndNotExecutable() {
+    void aBoundControllerWithoutAnActionReadsAsBoundAndNotExecutable() throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
         Chain c = new Chain(null);
-        KernelModule.instance().bindCommitController(c.controller);
+        hostAndInstall(c);
         try {
             List<String> before = export();
             assertEquals("product.commit.controller_wiring=BOUND",
@@ -121,6 +146,12 @@ class WiringFaceReadingsTest {
             assertEquals("product.commit.controller_executable=0",
                 line(before, "product.commit.controller_executable"),
                 "being bound and being able to run are two columns");
+            assertEquals("product.commit.binding_chain_log=1",
+                line(before, "product.commit.binding_chain_log"),
+                "the log of the module is the log of the chain it took");
+            assertEquals("product.commit.binding_order_source=1",
+                line(before, "product.commit.binding_order_source"),
+                "and its plan authority is the one instance of the module");
 
             assertFalse(c.controller.submit(c.request()).admitted());
 
@@ -143,16 +174,16 @@ class WiringFaceReadingsTest {
             assertEquals("product.commit.effect_capacity_slots=0",
                 line(after, "product.commit.effect_capacity_slots"));
         } finally {
-            KernelModule.instance().bindCommitController(null);
+            c.module.rollbackCommitChain();
         }
     }
 
     @Test
-    void aBoundControllerWithAnActionReadsAsExecutable() {
+    void aBoundControllerWithAnActionReadsAsExecutable() throws IOException {
         System.setProperty("arclight.prts.kernel", "true");
         Chain c = new Chain(ticket -> new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED,
             "publish", List.of("a=1", "b=2"), 2, ""));
-        KernelModule.instance().bindCommitController(c.controller);
+        hostAndInstall(c);
         try {
             assertTrue(c.controller.submit(c.request()).admitted());
             List<String> export = export();
@@ -165,7 +196,7 @@ class WiringFaceReadingsTest {
                 line(export, "product.commit.not_wired_refusals"));
             assertEquals("product.commit.supplier_calls=1", line(export, "product.commit.supplier_calls"));
         } finally {
-            KernelModule.instance().bindCommitController(null);
+            c.module.rollbackCommitChain();
         }
     }
 }
