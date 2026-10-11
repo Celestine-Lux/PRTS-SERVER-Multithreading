@@ -606,6 +606,12 @@ public final class CommitReservation {
         return pendings.size();
     }
 
+    /** The ticket one item is carried under, or null once it has ended. A disposed item leaves
+     * nothing behind, so the identity a caller held is only good while the item waits. */
+    public CommitTicket ticket(long ticketId) {
+        return tickets.get(ticketId);
+    }
+
     /** The entries this holder keeps for the reservations in flight: an ended ticket leaves none
      * behind, so the table cannot grow with the number of lines a lifecycle took. */
     public int stateEntries() {

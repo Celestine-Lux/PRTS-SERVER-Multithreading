@@ -977,6 +977,37 @@ public final class KernelReadings {
         add(lines, "product.commit.resets", controller == null ? 0L : controller.resets());
         add(lines, "product.commit.resets_deferred",
             controller == null ? 0L : controller.deferredResets());
+        // What a request from another thread is: one entry in a bounded queue the owner answers at a
+        // safe point, the bound that queue refuses over, and the fact that the host calls none of it.
+        add(lines, "product.commit.reset_queued", module.resetQueueDepth());
+        add(lines, "product.commit.reset_queue_capacity", KernelModule.resetQueueCapacity());
+        add(lines, "product.commit.reset_queue_refusals", module.commitResetQueueRefusals());
+        add(lines, "product.commit.reset_queue_sources",
+            module.resetQueueSources().isEmpty() ? "-" : String.join(",", module.resetQueueSources()));
+        add(lines, "product.commit.safe_point_wiring", module.commitHostDriveWiring());
+        add(lines, "product.commit.safe_point_entry", KernelModule.HOST_SAFE_POINT_ENTRY);
+        // What a close sealed: an item whose side effect ran and whose line is not written is not a
+        // cleanup at exit - it keeps its room and its identity, and the owner disposes of it or it
+        // stays readable. The gate columns say whether new work is taken while one is owed.
+        add(lines, "product.commit.chain_sealed", module.commitChainSealed() ? 1 : 0);
+        add(lines, "product.commit.chain_sealed_count", module.commitSealedCount());
+        add(lines, "product.commit.chain_sealed_turn", module.commitSealedTurn());
+        add(lines, "product.commit.chain_sealed_identities", sealedIdentities(module));
+        add(lines, "product.commit.chain_dispositions", chainDispositions(module));
+        add(lines, "product.commit.seal_discards", module.commitSealDiscards());
+        add(lines, "product.commit.disposition_count",
+            controller == null ? 0 : controller.dispositionCount());
+        add(lines, "product.commit.disposition_gate_refusals",
+            controller == null ? 0L : controller.dispositionGateRefusals());
+        add(lines, "product.commit.disposition_gate_reason",
+            controller == null ? "not-wired" : (controller.acceptingNewWork() ? "accepting"
+                : controller.dispositionGateReason()));
+        add(lines, "product.commit.disposition_gate", controller != null && !controller
+            .acceptingNewWork() ? 1 : 0);
+        add(lines, "product.commit.accepting_new_work",
+            controller != null && controller.acceptingNewWork() ? 1 : 0);
+        add(lines, "product.commit.reset_composition", resetComposition(module));
+        add(lines, "product.commit.close_entry", KernelModule.HOST_CLOSE_ENTRY);
         add(lines, "product.commit.terminal_ledger_entries",
             reservations == null ? 0 : reservations.terminalLedger().size());
         add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
@@ -1018,6 +1049,54 @@ public final class KernelReadings {
                 .append(pending.diagnostic()).append(':').append(pending.attempts());
         }
         return builder.toString();
+    }
+
+    /** The identity a diagnostic reads a sealed item back by: the ticket it must hand a line to, why
+     * the line is not written, and how many items are still owed under the seal. */
+    private static String sealedIdentities(KernelModule module) {
+        List<KernelModule.Disposition> items = module.commitSealedIdentities();
+        if (items.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (KernelModule.Disposition item : items) {
+            if (builder.length() > 0) {
+                builder.append(",");
+            }
+            builder.append(item.ticketId()).append(':').append(item.step()).append(':')
+                .append(item.code() == null ? "-" : item.code()).append(':')
+                .append(item.diagnostic()).append(':').append(item.stillOwed());
+        }
+        return builder.toString();
+    }
+
+    /** What the chain holds for a disposition right now, sealed or not: the same identity, read from
+     * the holder that carries the item rather than from the close that sealed it. */
+    private static String chainDispositions(KernelModule module) {
+        List<KernelModule.Disposition> items = module.commitChainDispositions();
+        if (items.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (KernelModule.Disposition item : items) {
+            if (builder.length() > 0) {
+                builder.append(",");
+            }
+            builder.append(item.ticketId()).append(':')
+                .append(item.code() == null ? "-" : item.code()).append(':')
+                .append(item.diagnostic());
+        }
+        return builder.toString();
+    }
+
+    /** What a reset does inside the chain of this module: open, closed with nothing owed, or closed
+     * with an item still waiting for its line. */
+    private static String resetComposition(KernelModule module) {
+        KernelModule.ResetComposition composition = module.describeResetComposition();
+        return composition.blockedBy() + ":owe=" + composition.dispositionOwed() + ":clear="
+            + (composition.clearAllowed() ? 1 : 0) + ":accepting="
+            + (composition.acceptsWork() ? 1 : 0) + ":owedAtSafePoint="
+            + (composition.owedAtSafePoint() ? 1 : 0);
     }
 
     private static String terminalLedger(CommitReservation reservations) {

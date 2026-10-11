@@ -66,7 +66,10 @@ class CommitControllerReadingsTest {
         KernelModule module = KernelModule.instance();
         module.removeWaitSiteTap();
         module.removeWritePathTap();
-        module.resetReadings();
+        // A request another thread left in the queue is answered before the chain goes away, so it is
+        // never carried out by the first safe point of the case that runs next.
+        module.markSafePoint();
+        assertFalse(module.commitResetPending(), "no request outlives the case that made it");
         module.rollbackCommitChain();
         ExecutableProductFace.restore();
     }

@@ -67,7 +67,14 @@ class CommitChainResetRequestTest {
         KernelModule module = KernelModule.instance();
         module.removeWaitSiteTap();
         module.removeWritePathTap();
-        module.resetReadings();
+        // A request another thread left in the queue is answered here, before the chain goes away. The
+        // queue is state of the module, so a case that leaves one in it would otherwise be answered by
+        // the first safe point of the case after it, on a chain that never asked for it. The safe point
+        // is the only thing that answers one: the module is not cleared first, or it would be a fresh
+        // request of this very call that the next case then reads.
+        module.markSafePoint();
+        assertFalse(module.commitResetPending(), "no request outlives the case that made it");
+        assertTrue(module.resetQueueSources().isEmpty(), "and the queue is left empty");
         module.rollbackCommitChain();
         ExecutableProductFace.restore();
     }
@@ -147,7 +154,7 @@ class CommitChainResetRequestTest {
         assertFalse(answer.get().carriedOut(),
             "a clear does not run on a thread the chain does not own");
         assertTrue(answer.get().handedOff());
-        assertEquals("off-owner-thread", answer.get().reason());
+        assertEquals("queued-for-owner-safe-point", answer.get().reason());
         assertEquals(0L, c.controller.resets(), "nothing ran the lifecycle from that thread");
         assertEquals(0L, c.epochs.current(), "and no generation moved");
         assertEquals(sequence, c.log.sequence(), "the log was not ended");
@@ -166,6 +173,52 @@ class CommitChainResetRequestTest {
         assertFalse(module.drainCommitReset(), "the same debt is not carried out twice");
         assertEquals(1L, c.controller.resets(), "a second drain moves neither account");
         assertEquals(1L, c.epochs.current());
+    }
+
+    @Test
+    void aQueueThatIsFullRefusesTheRequestWhereItArrived() throws Exception {
+        Chain c = hostAndInstall();
+        KernelModule module = KernelModule.instance();
+        module.serverTick(List.of(WORLD));
+        long refusals = counter("product.commit.reset_queue_refusals");
+        for (int index = 0; index < KernelModule.resetQueueCapacity(); index++) {
+            String source = "host:console-" + index;
+            KernelModule.ResetRequest accepted = onAnotherThread(module, source);
+            assertTrue(accepted.handedOff(), "one request per source waits for the owner: " + source);
+            assertEquals("queued-for-owner-safe-point", accepted.reason());
+        }
+        assertEquals(KernelModule.resetQueueCapacity(), module.resetQueueDepth(),
+            "the queue holds exactly what it promised to hold");
+
+        KernelModule.ResetRequest refused = onAnotherThread(module, "host:console-overflow");
+
+        assertFalse(refused.handedOff(), "a request the queue cannot take is not handed anywhere");
+        assertEquals("owner-thread-queue-full", refused.reason(),
+            "and the caller is told to ask again on the owner thread");
+        assertEquals(KernelModule.resetQueueCapacity(), module.resetQueueDepth(),
+            "the queue is bounded by refusing, not by dropping what it holds");
+        assertEquals(refusals + 1L, counter("product.commit.reset_queue_refusals"),
+            "the refusal is counted where it happened");
+
+        KernelModule.SafePoint drained = module.markSafePoint();
+
+        assertEquals(KernelModule.resetQueueCapacity(), drained.carried(),
+            "the owner answers every entry of the queue, one generation per entry");
+        assertEquals(0, drained.owed(), "nothing of it is left owed");
+        assertEquals(0, drained.queued(), "and the queue is empty after it");
+        assertEquals((long) KernelModule.resetQueueCapacity(), c.epochs.current(),
+            "each answered request advanced the generation with it");
+        assertFalse(module.commitResetPending(), "nothing is left owed");
+        assertEquals("0", reading("product.commit.reset_queued"), "and the readout says so");
+    }
+
+    private static KernelModule.ResetRequest onAnotherThread(KernelModule module, String source)
+        throws InterruptedException {
+        AtomicReference<KernelModule.ResetRequest> answer = new AtomicReference<>();
+        Thread thread = new Thread(() -> answer.set(module.requestReadingsReset(source)));
+        thread.start();
+        thread.join();
+        return answer.get();
     }
 
     @Test

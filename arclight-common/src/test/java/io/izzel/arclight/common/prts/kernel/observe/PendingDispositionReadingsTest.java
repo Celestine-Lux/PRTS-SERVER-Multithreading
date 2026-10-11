@@ -34,7 +34,8 @@ class PendingDispositionReadingsTest {
         KernelModule module = KernelModule.instance();
         module.removeWaitSiteTap();
         module.removeWritePathTap();
-        module.resetReadings();
+        module.markSafePoint();
+        assertFalse(module.commitResetPending(), "no request outlives the case that made it");
         module.rollbackCommitChain();
         ExecutableProductFace.restore();
     }

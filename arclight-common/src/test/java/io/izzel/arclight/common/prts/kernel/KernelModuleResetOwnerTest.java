@@ -106,7 +106,8 @@ class KernelModuleResetOwnerTest {
         // back here rather than left to the test that runs next.
         module.removeWaitSiteTap();
         module.removeWritePathTap();
-        module.resetReadings();
+        module.markSafePoint();
+        assertFalse(module.commitResetPending(), "no request outlives the case that made it");
         module.rollbackCommitChain();
         ExecutableProductFace.restore();
     }

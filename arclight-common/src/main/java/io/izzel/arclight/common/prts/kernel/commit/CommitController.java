@@ -3,15 +3,12 @@ package io.izzel.arclight.common.prts.kernel.commit;
 
 import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 
-/** The one control path of a controlled write: validate, reserve, publish, finalize, record. The
- * first two steps happen before the first side effect, so an order or a capacity refusal leaves the
- * action uncalled; the last two happen whatever it did, so every line ends exactly once.
- *
- * <p>The action is handed in, and the controller is confined to the owner thread of the reservations
- * it judges. A build without an action refuses every request before the reservation is touched,
- * instead of reporting a run that never happened. Its reset is a safe point: while an action runs or
- * a line publishes, a destructive reset is refused and owed by the caller, and ending the lifecycle
- * of a log is not expressible here at all. */
+/** The one control path of a controlled write: validate, reserve, publish, finalize, record. The first
+ * two steps happen before the first side effect, so an order or a capacity refusal leaves the action
+ * uncalled; the last two happen whatever it did, so every line ends exactly once. The action is handed
+ * in, and the controller is confined to the owner thread of the reservations it judges. A build without
+ * an action refuses a request before the reservation is touched instead of reporting a run that never
+ * happened. Ending the lifecycle of a log is not expressible here at all. */
 public final class CommitController {
 
     /** What one publish action is. It reports the state it reached and the units it published. */
@@ -51,6 +48,7 @@ public final class CommitController {
     private long deferredResets;
     private long resetClosedRefusals;
     private long closeCalls;
+    private long dispositionGateRefusals;
 
     /** The owner is asked of the reservations on every call: a holder that re-bound would otherwise
      * be judged by a thread the controller remembered. */
@@ -85,6 +83,14 @@ public final class CommitController {
             notWiredRefusals++;
             return new SubmitResult(false, null, RejectCode.NATIVE_UNDECLARED, "not-wired", 0, 0L,
                 null);
+        }
+        String gate = dispositionGateReason();
+        if (!gate.isEmpty()) {
+            // An item whose side effect ran and whose line is not written is not left behind by the work
+            // after it: a request for a new line is refused here, counted, until its owner hands that item
+            // its line at the same safe point a reset waits at.
+            dispositionGateRefusals++;
+            return new SubmitResult(false, null, RejectCode.QUEUE_CAP_EXCEEDED, gate, 0, 0L, null);
         }
         submits++;
         CommitReservation.ReserveResult reserved = reservations.reserve(request);
@@ -134,8 +140,8 @@ public final class CommitController {
         }
     }
 
-    /** The owner safe point of a reset, entered only when nothing is publishing and no item waits
-     * for a disposition. What the holder of the log does with a granted decision comes after it. */
+    /** The owner safe point of a reset, entered only when nothing is publishing and no item waits for a
+     * disposition. What the holder of the log does with a granted decision comes after it. */
     public ResetDecision enterReset() {
         ResetDecision refusal = refuseReset();
         if (refusal != null) {
@@ -267,5 +273,36 @@ public final class CommitController {
     /** How often a reset was refused where it was asked for and left to be carried out later. */
     public long deferredResets() {
         return deferredResets;
+    }
+
+
+    public int dispositionCount() {
+        return reservations.pendingCount();
+    }
+
+    /** Why this controller takes no new work, or an empty string while it does. A closed chain takes
+     * nothing by construction; one that owes a disposition takes nothing until the item is disposed of, so
+     * the debt cannot grow behind the one already owed. */
+    public String dispositionGateReason() {
+        if (reservations.closed()) {
+            return "lifecycle-closed";
+        }
+        if (reservations.pendingCount() == 0) {
+            return "";
+        }
+        EffectStore store = reservations.store();
+        // A store that has already stopped handing out room refuses the next request with its own
+        // fault, and that is the one a caller needs: the gate answers for the debt, not over it.
+        return store != null && store.halted() ? "" : "pending-dispositions";
+    }
+
+    /** Whether this controller would take a request for a new line right now. */
+    public boolean acceptingNewWork() {
+        return dispositionGateReason().isEmpty();
+    }
+
+
+    public long dispositionGateRefusals() {
+        return dispositionGateRefusals;
     }
 }

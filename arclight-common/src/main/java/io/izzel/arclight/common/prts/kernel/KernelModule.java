@@ -15,6 +15,7 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitController;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
+import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.exits.DualExits;
 import io.izzel.arclight.common.prts.kernel.safety.SafetyNet;
@@ -77,7 +78,9 @@ import io.izzel.arclight.common.prts.support.PrtsWorldWriteTaps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
@@ -101,13 +104,11 @@ public final class KernelModule {
     }
 
     /** The one seam a planning-period component may take a wall clock through, and the counter that
-     * answers how often it did. Nothing in this build calls it: the planning period is a function of
-     * the tick index, the plan sequence and the control frame the tick before published, and the
-     * compiled classes of the planning period are scanned for any clock reference at build time.
-     *
-     * <p>The seam exists so the published count is a measurement and not a constant: a component that
-     * obtained a clock through it would move the count, and the count is published next to the plan it
-     * was taken for. */
+     * answers how often it did. Nothing in this build calls it: the planning period is a function of the
+     * tick index, the plan sequence and the control frame the tick before published, and the compiled
+     * classes of the planning period are scanned for any clock reference at build time. It exists so the
+     * published count is a measurement and not a constant: a component that took a clock through it would
+     * move the count, and the count is published next to the plan it was taken for. */
     public static final class PlanClockSeam {
 
         private final java.util.concurrent.atomic.AtomicLong reads =
@@ -131,6 +132,10 @@ public final class KernelModule {
     private static final KernelModule INSTANCE = new KernelModule();
     private static final String RUNTIME_WORLD = "";
     private static final String SERVER_SITE = "host:server-thread";
+
+    /** How many requests from other threads may wait for the owner at once. A queue that grew without a
+     * bound would turn a repeated request into a memory leak: the one that finds it full is refused. */
+    private static final int RESET_QUEUE_CAPACITY = 8;
 
     /** The domain one applied intent is logged under: the intent channel, which is not a world domain
      * and is ordered by its own frozen sequence. */
@@ -228,6 +233,13 @@ public final class KernelModule {
     private String commitResetSource = "";
     private long commitResetRequests;
     private long commitResetHandOffs;
+    private long commitResetQueueRefusals;
+    private final Deque<String> resetQueue = new ArrayDeque<>();
+    private boolean commitSealed;
+    private long commitSealedTurn;
+    private int commitSealedCount;
+    private final List<Disposition> commitSealedIdentities = new ArrayList<>();
+    private long commitSealDiscards;
     private long commitCloseCalls;
     private int commitCloseGivenBack;
     private int commitCloseUnrecorded;
@@ -495,10 +507,9 @@ public final class KernelModule {
         }
     }
 
-    /** A tool that borrows the seam - the self check is one - hands it back here instead of
-     * leaving the process with whatever it installed last: the module forgets what it believed was
-     * installed and installs the configured watcher again, so a borrowed seam cannot silently end
-     * the observation of the twenty real call sites. */
+    /** A tool that borrows the seam - the self check is one - hands it back here instead of leaving the
+     * process with whatever it installed last: the module forgets what it believed was installed and
+     * installs the configured watcher again, so a borrowed seam cannot silently end the observation. */
     public synchronized void resyncWaitSiteTap() {
         // What is installed now is read first: a tool that handed the seam back leaves the module
         // agreeing with it instead of installing its own watcher over a seam somebody else owns.
@@ -1197,33 +1208,69 @@ public final class KernelModule {
     /** Carries out one whole reset, once, at the owner safe point: the controller is asked first and
      * nothing is cleared while it refuses, the counters of this module are cleared next, and the
      * lifecycle of the commit log is ended inside that clear and nowhere else. A build with no
-     * controller bound has no lifecycle to isolate and keeps the path it always had. */
+     * controller bound keeps the path it always had. */
     private boolean carryOutOwningReset() {
         CommitController controller = this.commitController;
         if (controller != null && !controller.enterReset().granted()) {
-            // The controller counts why it refused. A reset it refused because an action or a line is
-            // in flight, or because an item still waits for its line, is held here and carried out by
-            // the next request that reaches this safe point. A closed lifecycle is the exception: it
-            // starts no generation after it, so nothing is left owed for a call that could not carry
-            // the reset out either.
+            // The controller counts why it refused. A closed lifecycle is the one refusal nothing waits for:
+            // it starts no generation after it, so a call that could not carry the reset out owes nothing.
+            // Every other refusal leaves a request the safe point keeps asking for.
             resetPending = !controller.reservations().closed();
             return false;
         }
-        resetPending = false;
         clearReadings();
+        // A whole reset ran, so what this module owed is answered; what is left in the queue belongs to
+        // another safe point, which is what counts it.
+        if (resetQueue.isEmpty()) {
+            resetPending = false;
+        }
         return true;
     }
 
-    /** What one request for a whole reset did: whether the safe point carried it out, where the
-     * request came from, and whether it had to be handed to the owner thread first. */
+    /** What one request for a whole reset did: whether the safe point carried it out, where it came from,
+     * and whether it entered the bounded queue of requests the owner has not answered. Entering that
+     * queue is not a completed hand-off: the owner answers it at a safe point. */
     public record ResetRequest(boolean carriedOut, String source, boolean handedOff, String reason) {
     }
 
-    /** The one request entry for a whole reset. It names where the request came from and is answered
-     * at the owner safe point of this module: a request that arrives on the thread the host named is
-     * carried out there and then (or held, with its reason, while the controller refuses), and one
-     * that arrives on any other thread is handed to that safe point instead of clearing from a thread
-     * the chain does not own. Carrying it out is the same single path every other request takes. */
+    /** What the owner safe point did with the requests that were waiting for it: how many it carried out,
+     * how many are still owed because the controller refused again, the depth left behind, and whether
+     * the last one waited on a disposition instead. */
+    public record SafePoint(int carried, int owed, int queued, boolean waitsForDisposition) {
+    }
+
+    /** When the host stops the server it asks the chain to close at a point it names. Until an entry
+     * makes that call nothing in this tree closes a chain. */
+    public static final String HOST_CLOSE_ENTRY = "host:server-stopping";
+
+    /** One thing the host does at the tick boundary: it drains the resets other threads asked for. Until
+     * an entry makes that call nothing drains the queue, and the readout says NOT_WIRED for it. */
+    public static final String HOST_SAFE_POINT_ENTRY = "host:tick-boundary";
+
+
+    public long commitSealedTurn() {
+        return commitSealedTurn;
+    }
+
+    /** How many requests the bounded queue of the owner holds right now. */
+    public int resetQueueDepth() {
+        return resetQueue.size();
+    }
+
+
+    public List<String> resetQueueSources() {
+        return List.copyOf(resetQueue);
+    }
+
+
+    public static int resetQueueCapacity() {
+        return RESET_QUEUE_CAPACITY;
+    }
+
+    /** The one request entry for a whole reset, named after where it came from. A request on the thread
+     * the host named is answered there; one on any other thread enters a bounded queue, refused outright
+     * when that queue is full, and the caller is told to ask on the owner thread. What waits is answered
+     * by {@link #markSafePoint()}. */
     public ResetRequest requestReadingsReset(String source) {
         String named = source == null || source.isEmpty() ? "unnamed" : source;
         commitResetSource = named;
@@ -1232,18 +1279,128 @@ public final class KernelModule {
             return new ResetRequest(false, named, false, "owner-thread-unbound");
         }
         if (!guard.onServerThread()) {
-            resetPending = true;
-            commitResetHandOffs++;
-            return new ResetRequest(false, named, true, "off-owner-thread");
+            if (!queueResetRequest(named)) {
+                return new ResetRequest(false, named, false, "owner-thread-queue-full");
+            }
+            return new ResetRequest(false, named, true, "queued-for-owner-safe-point");
         }
         boolean carriedOut = carryOutOwningReset();
         if (carriedOut) {
+            resetPending = !resetQueue.isEmpty();
             return new ResetRequest(true, named, false, "reset-at-safe-point");
         }
         CommitController controller = this.commitController;
         String reason = controller != null && controller.reservations().closed()
             ? "lifecycle-closed" : "deferred";
         return new ResetRequest(false, named, false, reason);
+    }
+
+    /** Takes one request into the queue of the owner, or refuses it when the queue is full. A request
+     * from a source already waiting is the same request twice and leaves the queue the length it was. */
+    private boolean queueResetRequest(String source) {
+        commitResetHandOffs++;
+        if (resetQueue.contains(source)) {
+            resetPending = true;
+            return true;
+        }
+        if (resetQueue.size() >= RESET_QUEUE_CAPACITY) {
+            commitResetQueueRefusals++;
+            return false;
+        }
+        resetQueue.addLast(source);
+        resetPending = true;
+        return true;
+    }
+
+    /** Answers what the queue of the owner holds, at a safe point and nowhere else. One call carries out
+     * each waiting request once; one the controller refuses stays where it is and is counted as owed;
+     * one asked for under a closed lifecycle is refused and discarded. */
+    public SafePoint markSafePoint() {
+        if (!guard.serverThreadBound() || !guard.onServerThread()) {
+            return new SafePoint(0, resetQueue.size(), resetQueue.size(), false);
+        }
+        return drainQueuedResets();
+    }
+
+    private SafePoint drainQueuedResets() {
+        int carried = 0;
+        int owed = 0;
+        boolean disposition = false;
+        boolean served = false;
+        boolean debtPending = false;
+        // The request a caller made on the owner thread and could not have answered is served first: the
+        // safe point answers it, not the caller that was refused, and one the controller refuses again
+        // stays owed, so the flag is cleared only once one whole reset has run.
+        if (resetPending) {
+            resetPending = false;
+            if (carryOutOwningReset()) {
+                carried++;
+                served = true;
+                if (!resetQueue.isEmpty()) {
+                    // One request, one generation: the entry that stands for the request refusd where it
+                    // arrived goes with the generation that request was owed, instead of a second one.
+                    resetQueue.removeFirst();
+                }
+            } else {
+                resetPending = true;
+                debtPending = true;
+                owed += 1;
+                CommitController refused = this.commitController;
+                disposition |= refused != null && refused.reservations().pendingCount() > 0;
+            }
+        }
+        while (!resetQueue.isEmpty()) {
+            resetQueue.removeFirst();
+            resetPending = true;
+            if (carryOutOwningReset()) {
+                carried++;
+                served = true;
+                continue;
+            }
+            CommitController refused = this.commitController;
+            if (refused != null && refused.reservations().closed()) {
+                // A closed lifecycle starts no generation after it, so no safe point could ever carry
+                // this request out. It is refused and dropped; the closed-lifecycle refusal count says
+                // what happened to it, and the request never reads as owed to a chain that cannot owe.
+                continue;
+            }
+            debtPending = true;
+            owed += 1;
+            disposition |= refused != null && refused.reservations().pendingCount() > 0;
+        }
+        // A whole reset that ran answers the request it was owed for; anything that came back owed is
+        // still owed, and the next safe point is where it is asked for again.
+        resetPending = debtPending || !resetQueue.isEmpty();
+        if (served && !debtPending) {
+            resetPending = false;
+        }
+        return new SafePoint(carried, owed, resetQueue.size(), disposition);
+    }
+
+    /** What one reset does inside a chain that has already been closed, read as one line per state. */
+    public record ResetComposition(boolean chainClosed, boolean acceptsWork, int dispositionOwed,
+                                   boolean clearAllowed, String blockedBy, boolean owedAtSafePoint) {
+    }
+
+    /** The composition of a reset with the close of the chain, read instead of assumed. An open chain
+     * accepts work and a clean safe point clears. A closed one refuses every generation for good, and the
+     * two cases are told apart by what it holds: an item waiting for its line blocks the reset and stays
+     * readable with its room, and nothing owed blocks it because a closed lifecycle starts no generation. */
+    public ResetComposition describeResetComposition() {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return new ResetComposition(false, true, 0, false, "not-wired", false);
+        }
+        CommitReservation reservations = controller.reservations();
+        int dispositions = reservations.pendingCount();
+        boolean closed = reservations.closed();
+        String blockedBy = closed
+            ? (dispositions > 0 ? "closed-with-pending-dispositions" : "lifecycle-closed")
+            : "open";
+        return new ResetComposition(closed, !closed && dispositions == 0, dispositions,
+            !closed && dispositions == 0
+                && reservations.publishing() == 0 && controller.dispositionGateReason().isEmpty(),
+            blockedBy, !resetQueue.isEmpty());
     }
 
     /** What one close of the commit chain did: the room it gave back, the items that keep theirs,
@@ -1254,8 +1411,9 @@ public final class KernelModule {
 
     /** Ends the commit chain this module holds, and only that one: it is asked through the bound
      * controller, so the module clears no lifecycle of its own while a chain is adopted. A close is
-     * idempotent, it gives back only the reservations that never started, it keeps every item whose
-     * side effect may have run readable with its room, and it writes no line of its own. */
+     * idempotent, it gives back only the reservations that never started, it keeps every item whose side
+     * effect may have run readable with its room, and it writes no line of its own. An item whose line is
+     * not written is sealed instead, with the identity a diagnostic reads back. */
     public CommitClose closeCommitChain() {
         CommitController controller = this.commitController;
         if (controller == null) {
@@ -1267,8 +1425,107 @@ public final class KernelModule {
         commitCloseUnrecorded = close.unrecorded();
         commitClosePublishing = close.publishing();
         boolean closed = controller.reservations().closed();
+        if (closed) {
+            sealUnrecordedItems(controller.reservations());
+        }
         return new CommitClose(closed, closed ? "" : "off-owner-thread", close.givenBack(),
             close.unrecorded(), close.publishing());
+    }
+
+    /** What one disposition of a sealed item did: whether the owner's line was written and what is
+     * still owed under the seal. */
+    public record Disposition(long ticketId, String step, boolean finalized, boolean sealed,
+                              int stillOwed, RejectCode code, String diagnostic) {
+    }
+
+    /** One item the close sealed: the ticket a diagnostic reads back, the place it holds, why its
+     * line is not written and how often it was asked for. The identity is carried, not reconstructed:
+     * the ticket is the same instance the owner must hand its line to. */
+    private void sealUnrecordedItems(CommitReservation reservations) {
+        commitSealedCount = reservations.pendingCount();
+        if (commitSealedCount == 0) {
+            return;
+        }
+        commitSealed = true;
+        commitSealedTurn = tickIndex;
+        commitSealedIdentities.clear();
+        for (CommitReservation.Pending pending : reservations.pendingDispositions()) {
+            commitSealedIdentities.add(new Disposition(pending.ticketId(), "sealed-at-close", false,
+                true, commitSealedCount, pending.code(), pending.diagnostic()));
+        }
+    }
+
+    /** The disposition the owner handed one sealed item, or a refusal that changes nothing. This is
+     * the only step that ends a sealed item, it is taken by the owner thread, and it is never retried
+     * on its own: the host asks for it, or the item stays sealed with its room. */
+    public Disposition disposeCommitDisposition(long ticketId, CommitTicket.Outcome outcome) {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return new Disposition(ticketId, "not-wired", false, true, 0, null, "not-wired");
+        }
+        CommitReservation reservations = controller.reservations();
+        for (CommitReservation.Pending pending : reservations.pendingDispositions()) {
+            if (pending.ticketId() != ticketId) {
+                continue;
+            }
+            CommitTicket ticket = reservations.ticket(pending.ticketId());
+            if (ticket == null) {
+                commitSealDiscards++;
+                return new Disposition(ticketId, "sealed-without-ticket", false, true,
+                    reservations.pendingCount(), null, "sealed-without-ticket");
+            }
+            CommitReservation.FinalizeResult done = reservations.finalize(ticket, outcome);
+            if (done.finalized()) {
+                commitSealed = reservations.pendingCount() > 0;
+                commitSealedCount = reservations.pendingCount();
+                commitSealedIdentities.removeIf(entry -> entry.ticketId() == ticketId);
+                return new Disposition(ticketId, "disposed-by-owner", true, commitSealed,
+                    commitSealedCount, null, "recorded");
+            }
+            return new Disposition(ticketId, "refused", false, true, reservations.pendingCount(),
+                done.code(), done.diagnostic());
+        }
+        return new Disposition(ticketId, "not-pending", false, commitSealed,
+            reservations.pendingCount(), null, "not-pending");
+    }
+
+    /** Whether a close sealed an item whose line is not written and that no one has disposed of. */
+    public boolean commitChainSealed() {
+        return commitSealed;
+    }
+
+    /** How many sealed items the newest close left. */
+    public int commitSealedCount() {
+        return commitSealedCount;
+    }
+
+    /** The identities of the sealed items, oldest first. */
+    public List<Disposition> commitSealedIdentities() {
+        return List.copyOf(commitSealedIdentities);
+    }
+
+    /** The items the chain holds right now for a disposition, whether or not a close sealed them. */
+    public List<Disposition> commitChainDispositions() {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return List.of();
+        }
+        List<Disposition> items = new ArrayList<>();
+        for (CommitReservation.Pending pending : controller.reservations().pendingDispositions()) {
+            items.add(new Disposition(pending.ticketId(), "pending", false, commitSealed,
+                controller.reservations().pendingCount(), pending.code(), pending.diagnostic()));
+        }
+        return List.copyOf(items);
+    }
+
+    /** How often the bounded queue refused a request because it was full. */
+    public long commitResetQueueRefusals() {
+        return commitResetQueueRefusals;
+    }
+
+    /** How often an item was sealed with no ticket left to hand it a line. */
+    public long commitSealDiscards() {
+        return commitSealDiscards;
     }
 
     /** What one install of a whole chain did: the columns of the binding, or the piece that refused
@@ -1434,15 +1691,15 @@ public final class KernelModule {
         return resetPending;
     }
 
-    /** Carries out the reset this module owes, in full and once, at an owner safe point. Nothing is
-     * done when it owes none, and a request that was carried out leaves no debt behind: a second call
-     * over it moves neither the generation nor a count. A request refused again leaves the debt where
-     * it is for the call after it. */
+    /** Carries out the reset this module owes, in full and once, at an owner safe point, and answers
+     * whether one whole reset ran. A request that was carried out leaves no debt, so a second call moves
+     * neither the generation nor a count; one refused again leaves the debt for the call after it. It is
+     * the boolean view of {@link #markSafePoint()}, which is what the host calls. */
     public boolean drainCommitReset() {
         if (!resetPending) {
             return false;
         }
-        return carryOutOwningReset();
+        return markSafePoint().carried() > 0;
     }
 
     /** Whether a controller is bound to this module: the readout says so of itself. */
