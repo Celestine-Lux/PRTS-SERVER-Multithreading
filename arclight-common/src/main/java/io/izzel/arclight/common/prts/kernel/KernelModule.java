@@ -225,6 +225,13 @@ public final class KernelModule {
     private String commitBindingRefusal = "";
     private long commitBindingLogLifetime;
     private long commitBindingStoreId;
+    private String commitResetSource = "";
+    private long commitResetRequests;
+    private long commitResetHandOffs;
+    private long commitCloseCalls;
+    private int commitCloseGivenBack;
+    private int commitCloseUnrecorded;
+    private int commitClosePublishing;
     private long planSequence;
     private long worldGeneration;
     private List<String> plannedWorlds = List.of();
@@ -1194,14 +1201,74 @@ public final class KernelModule {
     private boolean carryOutOwningReset() {
         CommitController controller = this.commitController;
         if (controller != null && !controller.enterReset().granted()) {
-            // The controller counts why it refused; the whole reset this module owes is held here and
-            // is carried out by the next request that reaches this safe point, not by the refusal.
-            resetPending = true;
+            // The controller counts why it refused. A reset it refused because an action or a line is
+            // in flight, or because an item still waits for its line, is held here and carried out by
+            // the next request that reaches this safe point. A closed lifecycle is the exception: it
+            // starts no generation after it, so nothing is left owed for a call that could not carry
+            // the reset out either.
+            resetPending = !controller.reservations().closed();
             return false;
         }
         resetPending = false;
         clearReadings();
         return true;
+    }
+
+    /** What one request for a whole reset did: whether the safe point carried it out, where the
+     * request came from, and whether it had to be handed to the owner thread first. */
+    public record ResetRequest(boolean carriedOut, String source, boolean handedOff, String reason) {
+    }
+
+    /** The one request entry for a whole reset. It names where the request came from and is answered
+     * at the owner safe point of this module: a request that arrives on the thread the host named is
+     * carried out there and then (or held, with its reason, while the controller refuses), and one
+     * that arrives on any other thread is handed to that safe point instead of clearing from a thread
+     * the chain does not own. Carrying it out is the same single path every other request takes. */
+    public ResetRequest requestReadingsReset(String source) {
+        String named = source == null || source.isEmpty() ? "unnamed" : source;
+        commitResetSource = named;
+        commitResetRequests++;
+        if (!guard.serverThreadBound()) {
+            return new ResetRequest(false, named, false, "owner-thread-unbound");
+        }
+        if (!guard.onServerThread()) {
+            resetPending = true;
+            commitResetHandOffs++;
+            return new ResetRequest(false, named, true, "off-owner-thread");
+        }
+        boolean carriedOut = carryOutOwningReset();
+        if (carriedOut) {
+            return new ResetRequest(true, named, false, "reset-at-safe-point");
+        }
+        CommitController controller = this.commitController;
+        String reason = controller != null && controller.reservations().closed()
+            ? "lifecycle-closed" : "deferred";
+        return new ResetRequest(false, named, false, reason);
+    }
+
+    /** What one close of the commit chain did: the room it gave back, the items that keep theirs,
+     * and whether the chain is closed after the call. */
+    public record CommitClose(boolean closed, String refusal, int givenBack, int unrecorded,
+                              int publishing) {
+    }
+
+    /** Ends the commit chain this module holds, and only that one: it is asked through the bound
+     * controller, so the module clears no lifecycle of its own while a chain is adopted. A close is
+     * idempotent, it gives back only the reservations that never started, it keeps every item whose
+     * side effect may have run readable with its room, and it writes no line of its own. */
+    public CommitClose closeCommitChain() {
+        CommitController controller = this.commitController;
+        if (controller == null) {
+            return new CommitClose(false, "not-wired", 0, 0, 0);
+        }
+        commitCloseCalls++;
+        CommitReservation.CloseResult close = controller.close();
+        commitCloseGivenBack = close.givenBack();
+        commitCloseUnrecorded = close.unrecorded();
+        commitClosePublishing = close.publishing();
+        boolean closed = controller.reservations().closed();
+        return new CommitClose(closed, closed ? "" : "off-owner-thread", close.givenBack(),
+            close.unrecorded(), close.publishing());
     }
 
     /** What one install of a whole chain did: the columns of the binding, or the piece that refused
@@ -1236,6 +1303,11 @@ public final class KernelModule {
         }
         if (candidate == null) {
             return "chain-log-missing";
+        }
+        if (reservations.closed()) {
+            // A closed lifecycle is terminal: it takes nothing new and starts no generation after it,
+            // so a chain that has been closed is never adopted again and never becomes live again.
+            return "chain-closed";
         }
         if (reservations.log() != candidate) {
             // Two chains of the same shape are the normal case and not the exception: both mint a
@@ -1376,6 +1448,57 @@ public final class KernelModule {
     /** Whether a controller is bound to this module: the readout says so of itself. */
     public String commitControllerWiring() {
         return commitController == null ? "NOT_WIRED" : "BOUND";
+    }
+
+    /** How often a whole reset was asked for through the one request entry of this module. */
+    public long commitResetRequests() {
+        return commitResetRequests;
+    }
+
+    /** How often such a request was handed to the owner safe point instead of being answered where
+     * it arrived, because it arrived on a thread the chain does not own. */
+    public long commitResetHandOffs() {
+        return commitResetHandOffs;
+    }
+
+    /** Where the newest reset request came from, or an empty string while none was made. */
+    public String commitResetSource() {
+        return commitResetSource;
+    }
+
+    /** How often the adopted chain was asked to close through {@link #closeCommitChain()}. */
+    public long commitCloseCalls() {
+        return commitCloseCalls;
+    }
+
+    /** The room the newest close gave back: only reservations that never started go back. */
+    public int commitCloseGivenBack() {
+        return commitCloseGivenBack;
+    }
+
+    /** The items the newest close keeps readable: their side effect may have run. */
+    public int commitCloseUnrecorded() {
+        return commitCloseUnrecorded;
+    }
+
+    /** The lines the newest close left publishing: they still owe their terminal line. */
+    public int commitClosePublishing() {
+        return commitClosePublishing;
+    }
+
+    /** Where this build drives the two host-side requests of the commit chain from: asking for a
+     * whole reset at the tick boundary, and closing the chain when the server stops. The platform
+     * entry that would make those calls exists in no build of this tree, so the column reads
+     * NOT_WIRED instead of reading as if the host drove them; the evidence names the two hook points
+     * and counts their call sites. */
+    public String commitHostDriveWiring() {
+        return "NOT_WIRED";
+    }
+
+    /** Whether the adopted chain has been closed: it takes nothing new and no reset follows it. */
+    public boolean commitChainClosed() {
+        CommitController controller = this.commitController;
+        return controller != null && controller.reservations().closed();
     }
 
     /** Clears the live counters. Where a commit controller is bound, its owner safe point decides

@@ -49,6 +49,8 @@ public final class CommitController {
     private long resetHandOffs;
     private long resets;
     private long deferredResets;
+    private long resetClosedRefusals;
+    private long closeCalls;
 
     /** The owner is asked of the reservations on every call: a holder that re-bound would otherwise
      * be judged by a thread the controller remembered. */
@@ -155,6 +157,11 @@ public final class CommitController {
             deferredResets++;
             return new ResetDecision(false, "off-owner-thread", 0, reservations.publishing(), epoch);
         }
+        if (reservations.closed()) {
+            // A close is terminal: no generation starts after it, so no safe point could carry it.
+            resetClosedRefusals++;
+            return new ResetDecision(false, "lifecycle-closed", 0, reservations.publishing(), epoch);
+        }
         if (publishDepth > 0) {
             resetReentrantRefusals++;
             deferredResets++;
@@ -175,10 +182,16 @@ public final class CommitController {
         return null;
     }
 
-    /** Ends this controller: nothing new is taken, every reservation that never published is given
-     * back, and the items whose side effect has run keep their room and stay readable. */
+    /** Ends this controller: nothing new is taken, what never published is given back, and what may
+     * have run keeps its room and stays readable. A second close gives back nothing. */
     public CommitReservation.CloseResult close() {
+        closeCalls++;
         return reservations.close();
+    }
+
+    /** How often this controller was asked to close, next to the room the newest call gave back. */
+    public long closeCalls() {
+        return closeCalls;
     }
 
     public long epoch() {
@@ -232,6 +245,11 @@ public final class CommitController {
     /** How often a reset was refused for an item that still waits for its terminal line. */
     public long resetPendingDispositions() {
         return resetPendingDispositions;
+    }
+
+    /** How often a reset was refused because the lifecycle of this controller was already closed. */
+    public long resetClosedRefusals() {
+        return resetClosedRefusals;
     }
 
     public long resetOffThread() {

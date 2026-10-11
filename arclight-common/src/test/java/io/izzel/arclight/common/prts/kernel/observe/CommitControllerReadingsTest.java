@@ -45,6 +45,17 @@ class CommitControllerReadingsTest {
         "product.commit.effect_capacity_reserved_records", "product.commit.effect_capacity_slots",
         "product.commit.effect_foreign_handles", "product.commit.effect_integrity_faults",
         "product.commit.effect_state", "product.commit.effect_unresolved_terminals",
+        "product.commit.chain_reserved", "product.commit.chain_finalized",
+        "product.commit.chain_released", "product.commit.chain_in_flight",
+        "product.commit.chain_capacity_reserved", "product.commit.chain_capacity_finalized",
+        "product.commit.chain_capacity_released", "product.commit.chain_log_taken",
+        "product.commit.chain_log_consumed", "product.commit.chain_log_released",
+        "product.commit.chain_conservation", "product.commit.ledger_evicted",
+        "product.commit.close_calls", "product.commit.close_given_back",
+        "product.commit.close_unrecorded", "product.commit.close_publishing",
+        "product.commit.reset_requests", "product.commit.reset_hand_offs",
+        "product.commit.reset_source", "product.commit.reset_closed_refusals",
+        "product.commit.host_drive_wiring",
         "commit.ticket_stored", "commit.ticket_refused", "commit.hybrid_order_refusals",
         "commit.cross_log_refusals", "commit.stale_ticket_refusals", "commit.integrity_faults",
         "commit.held_plans");
@@ -94,6 +105,15 @@ class CommitControllerReadingsTest {
         assertEquals("product.commit.conservation=1", line(export, "product.commit.conservation"));
         assertEquals("product.commit.terminal_ledger=-", line(export, "product.commit.terminal_ledger"));
         assertEquals("product.commit.effect_state=NOT_WIRED", line(export, "product.commit.effect_state"));
+        assertEquals("product.commit.chain_conservation=-",
+            line(export, "product.commit.chain_conservation"),
+            "with no chain adopted there is no balance whose columns could hold");
+        // The counters of the chain outlive a clear on purpose, the way the counters of the
+        // controller do, so what a leg moved is read as a delta and the key itself is asserted
+        // once here: with nothing bound every column of it is present and reads zero or a dash.
+        assertEquals("product.commit.host_drive_wiring=NOT_WIRED",
+            line(export, "product.commit.host_drive_wiring"),
+            "no build of this tree drives the two host requests yet");
         assertEquals("commit.ticket_stored=0", line(export, "commit.ticket_stored"));
         assertEquals("commit.hybrid_order_refusals=0", line(export, "commit.hybrid_order_refusals"));
         assertEquals("commit.held_plans=0", line(export, "commit.held_plans"));

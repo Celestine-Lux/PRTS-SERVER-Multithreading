@@ -809,7 +809,7 @@ public final class KernelReadings {
             add(lines, prefix + "permission_refusals", ring.permissionRefusals());
         }
         versionedFace(lines, commits);
-        controllerFace(lines, module, commits.effects());
+        controllerFace(lines, module, commits, commits.effects());
     }
 
     /** The declared versioned face of the commit log. Every key of it is new and only added: with
@@ -852,7 +852,8 @@ public final class KernelReadings {
     /** The face of the commit controller. With none bound every key of it reads zero, a dash or
      * NOT_WIRED, and the publish action column says what the controller would run. Being bound and
      * being able to run are two columns: a bound controller with no action reads executable zero. */
-    private static void controllerFace(List<String> lines, KernelModule module, EffectStore effects) {
+    private static void controllerFace(List<String> lines, KernelModule module, CommitLog commits,
+                                       EffectStore effects) {
         CommitController controller = module.commitController();
         CommitReservation reservations = controller == null ? null : controller.reservations();
         add(lines, "product.commit.controller_wiring", module.commitControllerWiring());
@@ -893,10 +894,42 @@ public final class KernelReadings {
         add(lines, "product.commit.pending", reservations == null ? 0 : reservations.pendingCount());
         add(lines, "product.commit.attention",
             reservations != null && reservations.pendingCount() > 0 ? 1 : 0);
+        // What the adopted chain holds, column by column: the reservations it took, the lines it
+        // ended, the ones it gave back and the ones still in flight, next to the room and the ring
+        // slots of the same chain. The boolean at the end is derived from those columns and is never
+        // read instead of them, and it reads a dash while no chain is adopted: there is nothing whose
+        // balance could hold.
+        add(lines, "product.commit.chain_reserved",
+            reservations == null ? 0L : reservations.reserveSuccess());
+        add(lines, "product.commit.chain_finalized",
+            reservations == null ? 0L : reservations.finalized());
+        add(lines, "product.commit.chain_released",
+            reservations == null ? 0L : reservations.releasedCount());
+        add(lines, "product.commit.chain_in_flight",
+            reservations == null ? 0 : reservations.outstanding());
+        add(lines, "product.commit.chain_capacity_reserved",
+            effects == null ? 0L : effects.capacityReserved());
+        add(lines, "product.commit.chain_capacity_finalized",
+            effects == null ? 0L : effects.capacityFinalized());
+        add(lines, "product.commit.chain_capacity_released",
+            effects == null ? 0L : effects.capacityReleased());
+        add(lines, "product.commit.chain_log_taken", commits.reservationsTaken());
+        add(lines, "product.commit.chain_log_consumed", commits.reservationsConsumed());
+        add(lines, "product.commit.chain_log_released", commits.reservationsReleased());
+        add(lines, "product.commit.chain_conservation",
+            chainConservation(commits, reservations, effects));
+        add(lines, "product.commit.ledger_evicted",
+            reservations == null ? 0L : reservations.ledgerEvicted());
         add(lines, "product.commit.state_entries", reservations == null ? 0 : reservations.stateEntries());
         add(lines, "product.commit.finished_entries",
             reservations == null ? 0 : reservations.finishedEntries());
         add(lines, "product.commit.closed", reservations == null || !reservations.closed() ? 0 : 1);
+        // What the newest close of the chain did. A second close gives back nothing and leaves the
+        // items that may have run, with their room, exactly where they were.
+        add(lines, "product.commit.close_calls", module.commitCloseCalls());
+        add(lines, "product.commit.close_given_back", module.commitCloseGivenBack());
+        add(lines, "product.commit.close_unrecorded", module.commitCloseUnrecorded());
+        add(lines, "product.commit.close_publishing", module.commitClosePublishing());
         add(lines, "product.commit.publish_refusals",
             reservations == null ? 0L : reservations.publishRefusals());
         add(lines, "product.commit.refused_starts", controller == null ? 0L : controller.refusedStarts());
@@ -931,6 +964,16 @@ public final class KernelReadings {
         add(lines, "product.commit.reset_pending_dispositions",
             controller == null ? 0L : controller.resetPendingDispositions());
         add(lines, "product.commit.reset_handoffs", controller == null ? 0L : controller.resetHandOffs());
+        // The requests that came in through the one request entry of the module, where the newest one
+        // came from, and how many of them had to be handed to the owner safe point first. Whether the
+        // host drives them at all is its own column, and in this build it says NOT_WIRED.
+        add(lines, "product.commit.reset_requests", module.commitResetRequests());
+        add(lines, "product.commit.reset_hand_offs", module.commitResetHandOffs());
+        add(lines, "product.commit.reset_source",
+            module.commitResetSource().isEmpty() ? "-" : module.commitResetSource());
+        add(lines, "product.commit.reset_closed_refusals",
+            controller == null ? 0L : controller.resetClosedRefusals());
+        add(lines, "product.commit.host_drive_wiring", module.commitHostDriveWiring());
         add(lines, "product.commit.resets", controller == null ? 0L : controller.resets());
         add(lines, "product.commit.resets_deferred",
             controller == null ? 0L : controller.deferredResets());
@@ -939,6 +982,25 @@ public final class KernelReadings {
         add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
         add(lines, "product.commit.effect_unresolved_terminals",
             effects == null ? 0 : effects.unresolvedTerminals().size());
+    }
+
+    /** Whether the three balances of one adopted chain hold at once: every reservation taken is
+     * finalized, given back or still in flight; every room slot handed out is finalized, given back
+     * or still held; and every ring slot taken is consumed, released or still reserved. A dash means
+     * no chain is adopted, so there is no balance to read. */
+    private static String chainConservation(CommitLog commits, CommitReservation reservations,
+                                            EffectStore effects) {
+        if (reservations == null) {
+            return "-";
+        }
+        boolean linesHold = reservations.reserveSuccess()
+            == reservations.finalized() + reservations.releasedCount() + reservations.outstanding();
+        boolean roomHolds = effects == null || (long) effects.capacitySlots()
+            == effects.capacityReserved() - effects.capacityFinalized() - effects.capacityReleased();
+        boolean slotsHold = commits.reservedSlots()
+            == commits.reservationsTaken() - commits.reservationsConsumed()
+            - commits.reservationsReleased();
+        return linesHold && roomHolds && slotsHold ? "1" : "0";
     }
 
     /** The items whose side effect has run and whose terminal line is not written: the ticket, the
