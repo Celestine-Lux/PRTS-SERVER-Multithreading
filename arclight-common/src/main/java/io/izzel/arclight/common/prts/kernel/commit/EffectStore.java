@@ -14,10 +14,10 @@ import java.util.TreeSet;
  * declares one, bounded by the bytes and by the record count the store was built with, and never
  * evicted while a line still holds it.
  *
- * <p>Room is taken before anything is stored: a reservation charges the record it will hold, so a
- * second record cannot be admitted into room the first one already owns, and a reservation that is
- * not used is given back. A store built with no room at all is refused rather than accepted as an
- * empty and always-failing table.
+ * <p>Room is taken before anything is stored: a reservation charges the record it will hold and
+ * freezes what it charged for, so a second record cannot be admitted into room the first one already
+ * owns and a reservation cannot be filled with another record of the same length. A store built with
+ * no room at all is refused rather than accepted as an empty and always-failing table.
  *
  * <p>The store is in memory only: nothing here writes a file, so nothing here survives a restart.
  * A reference that cannot be resolved is answered as missing and never as an empty record. */
@@ -45,8 +45,15 @@ public final class EffectStore {
         }
     }
 
-    /** The room one effect was charged for, before anything was stored. */
-    public record Slot(long ticket, long effectRef, int bytes) {
+    /** The room one effect was charged for, and the record that room was charged for: the normalized
+     * content, the operation and the outcome are frozen here, so the reservation is a statement of
+     * what will be stored and not only of how much room it takes. */
+    public record Slot(long ticket, long effectRef, int bytes, String operationKind, String outcome,
+                       String contentDigest, List<String> content) {
+
+        public Slot {
+            content = List.copyOf(content == null ? List.of() : content);
+        }
     }
 
     /** What one reservation or one store did. */
@@ -55,6 +62,8 @@ public final class EffectStore {
 
     private static final int HEADER_BYTES = 48;
     private static final int ROW_BYTES = 4;
+    private static final int FIELD_BYTES = 4;
+    private static final int NAME_BYTES = 4;
     private static final long OFFSET_BASIS = 0xcbf29ce484222325L;
     private static final long PRIME = 0x100000001b3L;
 
@@ -86,29 +95,31 @@ public final class EffectStore {
         this.capacityRecords = capacityRecords;
     }
 
-    /** Charges the room one effect will take. Nothing is stored yet; the slot is handed back by
-     * {@link #commit} or by {@link #release}. */
+    /** Charges the room one effect will take and freezes the record it charged for. Nothing is
+     * stored yet; the slot is filled by {@link #commit} or given back by {@link #release}. */
     public Result reserve(Effect effect) {
         if (effect == null || effect.effectRef() <= 0L) {
             refused++;
             return new Result(false, RejectCode.COUNTER_MISSING, null, null);
         }
         List<String> content = normalize(effect.rows());
-        int bytes = bytesOf(content);
+        long charge = chargedBytes(effect.operationKind(), effect.outcome(), content);
         if (records.containsKey(effect.effectRef()) || holdsTicketFor(effect.effectRef())
-            || records.size() + slots.size() + 1 > capacityRecords
-            || usedBytes + reservedBytes + bytes > capacityBytes) {
+            || !fitsRecords(records.size(), slots.size() + 1L, capacityRecords)
+            || !fitsBytes(usedBytes, reservedBytes, charge, capacityBytes)) {
             refused++;
             return new Result(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
         }
-        Slot slot = new Slot(++tickets, effect.effectRef(), bytes);
+        Slot slot = new Slot(++tickets, effect.effectRef(), (int) charge, effect.operationKind(),
+            effect.outcome(), digestOf(content), content);
         slots.put(slot.ticket(), slot);
-        reservedBytes += bytes;
+        reservedBytes += slot.bytes();
         return new Result(true, null, slot, null);
     }
 
-    /** Stores the record one reservation was charged for. The content is normalized again: a
-     * reservation whose record changed in between is refused and its room is given back. */
+    /** Stores the record one reservation was charged for. The frozen record and the one that arrives
+     * are compared field by field, so a record that changed in between is refused and its room is
+     * given back even when the two are the same length. */
     public Result commit(Slot slot, Effect effect) {
         Slot held = slot == null ? null : slots.get(slot.ticket());
         if (held == null || effect == null || held.effectRef() != effect.effectRef()) {
@@ -116,8 +127,7 @@ public final class EffectStore {
             return new Result(false, RejectCode.COUNTER_MISSING, null, null);
         }
         List<String> content = normalize(effect.rows());
-        int bytes = bytesOf(content);
-        if (bytes != held.bytes()) {
+        if (!isTheReservedRecord(held, effect, content)) {
             release(held);
             refused++;
             return new Result(false, RejectCode.VERSION_MISMATCH, null, null);
@@ -125,13 +135,21 @@ public final class EffectStore {
         slots.remove(held.ticket());
         reservedBytes -= held.bytes();
         Recorded record = new Recorded(effect.effectRef(), effect.operationKind(), effect.outcome(),
-            declaredOf(content), content, digestOf(content), bytes, ++sequence);
+            declaredOf(content), content, held.contentDigest(), held.bytes(), ++sequence);
         records.put(record.effectRef(), record);
         pins.put(record.effectRef(), 1);
-        usedBytes += bytes;
+        usedBytes += held.bytes();
         stored++;
         committed++;
         return new Result(true, null, null, record);
+    }
+
+    private static boolean isTheReservedRecord(Slot held, Effect arriving, List<String> content) {
+        return held.bytes() == chargedBytes(arriving.operationKind(), arriving.outcome(), content)
+            && held.operationKind().equals(arriving.operationKind())
+            && held.outcome().equals(arriving.outcome())
+            && held.content().equals(content)
+            && held.contentDigest().equals(digestOf(content));
     }
 
     /** Gives back a reservation that was not used. A ticket that is not held is a no-op. */
@@ -230,12 +248,44 @@ public final class EffectStore {
         return List.copyOf(names);
     }
 
-    private static int bytesOf(List<String> content) {
-        int bytes = HEADER_BYTES;
+    /** The room one record is charged for: the fixed header, every content row, the two variable
+     * fields and the field names the record declares. A record is charged for what it carries, so an
+     * operation or an outcome of any length is paid for like a row is. */
+    private static long chargedBytes(String operationKind, String outcome, List<String> content) {
+        long bytes = HEADER_BYTES;
         for (String row : content) {
-            bytes += row.getBytes(StandardCharsets.UTF_8).length + ROW_BYTES;
+            bytes += utf8(row) + ROW_BYTES;
+        }
+        bytes += utf8(operationKind) + FIELD_BYTES;
+        bytes += utf8(outcome) + FIELD_BYTES;
+        for (String name : declaredOf(content)) {
+            bytes += utf8(name) + NAME_BYTES;
         }
         return bytes;
+    }
+
+    private static int utf8(String text) {
+        return text.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    /** Whether a charge fits the room that is left. The three numbers are compared step by step as
+     * longs, so a charge larger than any capacity is answered "no room" instead of wrapping around
+     * an int and looking small. */
+    static boolean fitsBytes(long usedBytes, long reservedBytes, long charge, int capacityBytes) {
+        if (usedBytes < 0L || reservedBytes < 0L || charge < 0L || usedBytes > capacityBytes) {
+            return false;
+        }
+        long left = capacityBytes - usedBytes;
+        return reservedBytes <= left && charge <= left - reservedBytes;
+    }
+
+    /** The same for the record bound: the records already stored and the reservations already handed
+     * out are compared against the capacity without adding the three of them up first. */
+    static boolean fitsRecords(long records, long reserved, int capacityRecords) {
+        if (records < 0L || reserved < 0L || records > capacityRecords) {
+            return false;
+        }
+        return reserved <= capacityRecords - records;
     }
 
     private static String digestOf(List<String> content) {

@@ -5,9 +5,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** The runtime namespace a producer or a controller runs under: written so a record of an earlier
  * lifecycle is refused, and never read by a comparison between two runs, which decides staleness by
- * the lifetime and the reset generation while the thread is a diagnostic column. The reset
- * generation has an owner here and no production caller: the readings reset of the kernel is the
- * point that will advance it, and it is not wired in this change. */
+ * the lifetime and the reset generation while the thread is a diagnostic column. A collision is
+ * decided on {@link Namespace#lifecycleKey()}, which leaves that column out. The reset generation
+ * has an owner here and no production caller, and is not wired in this change. */
 public final class CommitNamespaces {
 
     public static final long NO_LIFETIME = 0L;
@@ -26,13 +26,18 @@ public final class CommitNamespaces {
             return !ownerId.isEmpty() && lifetime != NO_LIFETIME;
         }
 
-        /** Whether this namespace belongs to an earlier lifecycle: another module lifetime, or
-         * another reset generation. The thread column is not read. */
+        /** Whether this namespace belongs to an earlier lifecycle: another lifetime or reset. */
         public boolean staleAgainst(Namespace current) {
             if (current == null) {
                 return true;
             }
             return lifetime != current.lifetime || resetEpoch != current.resetEpoch;
+        }
+
+        /** The lifecycle this namespace belongs to: owner, lifetime and reset generation. Two
+         * namespaces with one key are one lifecycle even on two threads. */
+        public String lifecycleKey() {
+            return ownerId + "/" + lifetime + "/" + resetEpoch;
         }
 
         public String text() {

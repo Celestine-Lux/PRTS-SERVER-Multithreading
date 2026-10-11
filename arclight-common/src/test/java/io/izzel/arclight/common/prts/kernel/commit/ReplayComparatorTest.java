@@ -8,6 +8,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The versioned comparison: what it refuses instead of answering, and the logical columns it reads
@@ -40,8 +41,18 @@ class ReplayComparatorTest {
             new CommitNamespaces.Namespace("producer", lifetime, 0L, 11L),
             new CommitNamespaces.Namespace("controller", lifetime, 0L, 11L));
         return new CommitLog.TypedBatch(new CommitLog.Batch(WORLD, DOMAIN, key, CommitLog.Batch.Kind.APPLY,
-            authorization, 11L, 2), identity,
+            authorization, 11L, rows.length), identity,
             new EffectStore.Effect(effectRef, "chunk-materialize", "full", List.of(rows)));
+    }
+
+    /** One step of a run that really happened with one column of the projection replaced, so a
+     * counterexample can be built on the record the storage chain itself produced. */
+    private static CommitLog.TypedStep replaced(CommitLog.TypedStep step, String nodeKey, int rows,
+                                                 long expectedVersion, CommitLog.Identity identity,
+                                                 EffectStore.Recorded effect) {
+        return new CommitLog.TypedStep(step.planSequence(), step.position(), step.writeSetDigest(),
+            step.worldId(), step.domainId(), nodeKey, expectedVersion, rows, identity,
+            step.disposition(), effect);
     }
 
     /** One run: the reports of one tick, driven through the log and read back as its versioned
@@ -92,10 +103,14 @@ class ReplayComparatorTest {
 
     @Test
     void theComparedColumnsLeaveTheRuntimeNamespaceOut() {
-        assertTrue(ReplayComparator.CANONICAL_FIELDS.containsAll(List.of("plan", "instance",
-            "authorization", "epoch", "effect", "chunk", "status", "declared", "content",
-            "contentDigest", "writeSet", "disposition")));
-        for (String column : List.of("thread", "lifetime", "owner", "namespace", "resetEpoch")) {
+        assertTrue(ReplayComparator.CANONICAL_FIELDS.containsAll(List.of("world", "domain", "node",
+            "plan", "position", "writeSet", "rows", "epoch", "chunk", "status", "instance",
+            "authorization", "effect", "operation", "outcome", "declared", "content", "contentDigest",
+            "disposition")));
+        assertEquals(19, ReplayComparator.CANONICAL_FIELDS.size(),
+            "the compared columns are named in full and nothing else is read");
+        for (String column : List.of("thread", "lifetime", "owner", "namespace", "resetEpoch",
+            "expectedVersion", "sequence", "tick", "handle")) {
             assertFalse(ReplayComparator.CANONICAL_FIELDS.contains(column), column);
         }
     }
@@ -176,13 +191,13 @@ class ReplayComparatorTest {
             "chunk=64"));
         CommitLog.TypedStep step = known.typedSteps().get(0);
         CommitLog.SchemaReplay dropped = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
-            List.of(new CommitLog.TypedStep(step.planSequence(), step.position(), step.writeSetDigest(),
-                step.worldId(), step.domainId(), step.identity(), step.disposition(), null)), 1);
+            List.of(replaced(step, step.nodeKey(), step.rows(), step.expectedVersion(), step.identity(),
+                null)), 1);
         CommitLog.Identity orphanIdentity = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L,
             "full", 3L, CommitLog.NO_EFFECT, step.identity().producer(), step.identity().controller());
         CommitLog.SchemaReplay orphan = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
-            List.of(new CommitLog.TypedStep(step.planSequence(), step.position(), step.writeSetDigest(),
-                step.worldId(), step.domainId(), orphanIdentity, step.disposition(), step.effect())), 0);
+            List.of(replaced(step, step.nodeKey(), step.rows(), step.expectedVersion(), orphanIdentity,
+                step.effect())), 0);
         ReplayComparator comparator = new ReplayComparator();
 
         ReplayComparator.Verdict missing = comparator.compare(known, dropped);
@@ -202,8 +217,7 @@ class ReplayComparatorTest {
         CommitLog.Identity other = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L, "full", 3L,
             100L, new CommitNamespaces.Namespace("producer", 999L, 1L, 12L), step.identity().controller());
         CommitLog.SchemaReplay collided = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
-            List.of(step, new CommitLog.TypedStep(step.planSequence(), step.position(),
-                step.writeSetDigest(), step.worldId(), step.domainId(), other, step.disposition(),
+            List.of(step, replaced(step, step.nodeKey(), step.rows(), step.expectedVersion(), other,
                 step.effect())), 0);
 
         ReplayComparator.Verdict verdict = new ReplayComparator().compare(known, collided);
@@ -303,5 +317,227 @@ class ReplayComparatorTest {
         assertEquals(1L, comparator.different());
         assertEquals(1, comparator.refusalReasons().size());
         assertNotNull(comparator.refusalReasons().get(ReplayComparator.REFUSED_SIDE_MISSING));
+    }
+
+    @Test
+    void aMissingReplayIsNotRebuiltAsAnEmptyLegacySample() {
+        ReplayComparator comparator = new ReplayComparator();
+
+        assertNull(comparator.legacyDeclared(null), "a replay that is not there stays missing");
+        ReplayComparator.Verdict verdict = comparator.compare(comparator.legacyDeclared(plain(5L).last()),
+            comparator.legacyDeclared(null));
+
+        assertTrue(verdict.refused());
+        assertEquals(ReplayComparator.REFUSED_SIDE_MISSING, verdict.reason());
+    }
+
+    @Test
+    void twoEmptyVersionedSamplesAreRefusedInsteadOfAnsweredEqual() {
+        CommitLog.SchemaReplay empty = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
+            List.of(), 0);
+        ReplayComparator comparator = new ReplayComparator();
+
+        ReplayComparator.Verdict verdict = comparator.compare(empty, empty);
+
+        assertTrue(verdict.refused(), "two runs that wrote nothing are not one run");
+        assertEquals(ReplayComparator.REFUSED_EMPTY_SAMPLE, verdict.reason());
+        assertEquals(0L, comparator.equal());
+        assertEquals(0L, comparator.compared(), "an empty sample is not a compared pair");
+        assertEquals(1L, comparator.refusals(ReplayComparator.REFUSED_EMPTY_SAMPLE));
+    }
+
+    @Test
+    void anIdleTickIsRefusedInBothProtocolsWithoutAddingADifference() {
+        CommitLog idle = new CommitLog(() -> 4, order(1L), new EffectStore(1 << 12, 4));
+        idle.beginTick(1L);
+        idle.closeTick();
+        ReplayComparator comparator = new ReplayComparator();
+
+        ReplayComparator.Verdict undeclared = comparator.compare(idle.lastTyped(), idle.lastTyped());
+        ReplayComparator.Verdict legacy = comparator.compare(comparator.legacyDeclared(idle.last()),
+            comparator.legacyDeclared(idle.last()));
+
+        assertEquals(ReplayComparator.REFUSED_UNDECLARED_SCHEMA, undeclared.reason());
+        assertEquals(ReplayComparator.REFUSED_EMPTY_SAMPLE, legacy.reason());
+        assertEquals(0L, comparator.different(), "an idle tick carries no difference to report");
+        assertEquals(0L, comparator.equal());
+        assertEquals(1L, comparator.compared(),
+            "the sample that declared a protocol and carried no step is not a compared pair");
+    }
+
+    @Test
+    void aVersionedSideThatCarriesPlainStepsIsRefusedWhateverThePlainDataSays() {
+        CommitLog.SchemaReplay first = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.SchemaReplay second = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.Entry.Step one = new CommitLog.Entry.Step(1L, 0, 11L);
+        CommitLog.Entry.Step other = new CommitLog.Entry.Step(1L, 0, 99L);
+        CommitLog.SchemaReplay mixed = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(one),
+            first.typedSteps(), 0);
+        CommitLog.SchemaReplay mixedOther = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED,
+            List.of(other), second.typedSteps(), 0);
+
+        ReplayComparator.Verdict verdict = new ReplayComparator().compare(mixed, mixedOther);
+
+        assertTrue(verdict.refused(), "a tick that carries two protocols is not read as one of them");
+        assertEquals(ReplayComparator.REFUSED_MIXED_WITHIN_SIDE, verdict.reason());
+    }
+
+    @Test
+    void aLineThatDeclaresNoUsableIdentityInsideAVersionedSideIsRefused() {
+        CommitLog.SchemaReplay known = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.TypedStep step = known.typedSteps().get(0);
+        CommitNamespaces.Namespace producer = step.identity().producer();
+        CommitNamespaces.Namespace controller = step.identity().controller();
+        List<CommitLog.Identity> illegal = List.of(
+            new CommitLog.Identity(CommitLog.SCHEMA_UNDECLARED, 1L, 5L, 64L, "full", 3L, 100L,
+                producer, controller),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, -1L, 64L, "full", 3L, 100L, producer,
+                controller),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, CommitLog.NO_INSTANCE, 5L, 64L, "full", 3L,
+                100L, producer, controller),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L, "", 3L, 100L, producer,
+                controller),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L, "full",
+                CommitLog.NO_AUTHORIZATION_GENERATION, 100L, producer, controller),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L, "full", 3L, 100L,
+                CommitNamespaces.Namespace.NONE, CommitNamespaces.Namespace.NONE));
+        ReplayComparator comparator = new ReplayComparator();
+
+        for (CommitLog.Identity identity : illegal) {
+            CommitLog.SchemaReplay side = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
+                List.of(replaced(step, step.nodeKey(), step.rows(), step.expectedVersion(), identity,
+                    step.effect())), 0);
+
+            ReplayComparator.Verdict verdict = comparator.compare(known, side);
+
+            assertTrue(verdict.refused(), "a line that declares nothing usable is not mapped");
+            assertTrue(List.of(ReplayComparator.REFUSED_ILLEGAL_IDENTITY,
+                ReplayComparator.REFUSED_MIXED_WITHIN_SIDE).contains(verdict.reason()), verdict.reason());
+        }
+        assertEquals(0L, comparator.different());
+    }
+
+    @Test
+    void theBatchAndTheIdentityOfALineHaveToAgree() {
+        CommitLog.SchemaReplay known = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.TypedStep step = known.typedSteps().get(0);
+        List<CommitLog.TypedStep> inconsistent = List.of(
+            replaced(step, step.nodeKey(), step.rows(), 9L, step.identity(), step.effect()),
+            replaced(step, "", step.rows(), step.expectedVersion(), step.identity(), step.effect()),
+            replaced(step, step.nodeKey(), step.rows() + 1, step.expectedVersion(), step.identity(),
+                step.effect()));
+        ReplayComparator comparator = new ReplayComparator();
+
+        for (CommitLog.TypedStep candidate : inconsistent) {
+            CommitLog.SchemaReplay side = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
+                List.of(candidate), 0);
+
+            ReplayComparator.Verdict verdict = comparator.compare(known, side);
+
+            assertTrue(verdict.refused());
+            assertEquals(ReplayComparator.REFUSED_ILLEGAL_IDENTITY, verdict.reason());
+        }
+    }
+
+    @Test
+    void anotherNodeOfThePlanIsNotTheSameStep() {
+        CommitLog.SchemaReplay first = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.TypedStep step = first.typedSteps().get(0);
+        CommitLog.SchemaReplay other = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED, List.of(),
+            List.of(replaced(step, "a/1", step.rows(), step.expectedVersion(), step.identity(),
+                step.effect())), 0);
+
+        ReplayComparator.Verdict verdict = new ReplayComparator().compare(first, other);
+
+        assertFalse(verdict.equal(), "another node of the frozen plan is another instance");
+        assertTrue(verdict.fields().contains("node"));
+    }
+
+    @Test
+    void anotherThreadOfTheSameLifecycleIsNotACollision() {
+        CommitLog.SchemaReplay known = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.TypedStep step = known.typedSteps().get(0);
+        CommitLog.Identity otherThread = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L,
+            "full", 3L, 100L, new CommitNamespaces.Namespace("producer", 4242L, 0L, 99L),
+            new CommitNamespaces.Namespace("controller", 4242L, 0L, 99L));
+        CommitLog.SchemaReplay sameLifecycle = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED,
+            List.of(), List.of(replaced(step, step.nodeKey(), step.rows(), step.expectedVersion(),
+                otherThread, step.effect())), 0);
+
+        ReplayComparator.Verdict verdict = new ReplayComparator().compare(known, sameLifecycle);
+
+        assertTrue(verdict.equal(), "the thread column is a diagnostic and decides nothing");
+    }
+
+    @Test
+    void oneReferenceThatCarriesTwoContentsIsRefused() {
+        CommitLog.SchemaReplay known = run(order(1L), report("a/0", 1L, 5L, 64L, "full", 3L, 100L,
+            4242L, "chunk=64", "state=full"));
+        CommitLog.TypedStep step = known.typedSteps().get(0);
+        EffectStore.Recorded record = step.effect();
+        EffectStore.Recorded other = new EffectStore.Recorded(record.effectRef(),
+            record.operationKind(), record.outcome(), List.of("chunk"), List.of("chunk=65"), "0",
+            record.bytes(), record.sequence());
+        CommitLog.SchemaReplay contradicting = new CommitLog.SchemaReplay(CommitLog.SCHEMA_TYPED,
+            List.of(), List.of(step, replaced(step, step.nodeKey(), 1, step.expectedVersion(),
+                step.identity(), other)), 0);
+
+        ReplayComparator.Verdict verdict = new ReplayComparator().compare(contradicting, contradicting);
+
+        assertTrue(verdict.refused(), "one reference carries one content in one run");
+        assertEquals(ReplayComparator.REFUSED_ORPHAN_EFFECT, verdict.reason());
+    }
+
+    @Test
+    void aTickThatCarriesBothProtocolsIsRefusedOnTheRealChain() {
+        CommitLog log = new CommitLog(() -> 8, order(1L), new EffectStore(1 << 12, 8));
+        log.beginTick(1L);
+        assertTrue(log.reachTyped(report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, "chunk=64"))
+            .logged());
+        assertTrue(log.reach(new CommitLog.Batch(WORLD, DOMAIN, "a/1", CommitLog.Batch.Kind.APPLY,
+            3L, 12L, 1)).logged());
+        log.closeTick();
+        CommitLog.SchemaReplay mixed = log.lastTyped();
+
+        assertEquals(CommitLog.SCHEMA_TYPED, mixed.schemaVersion());
+        assertEquals(1, mixed.plainSteps().size());
+        assertEquals(1, mixed.typedSteps().size());
+        ReplayComparator.Verdict verdict = new ReplayComparator().compare(mixed, mixed);
+
+        assertTrue(verdict.refused(), "one tick that wrote both protocols is not read as either");
+        assertEquals(ReplayComparator.REFUSED_MIXED_WITHIN_SIDE, verdict.reason());
+    }
+
+    @Test
+    void theEvidenceAResetKeepsIsStillComparable() {
+        CommitLog first = runThenReset("chunk=64", "state=full");
+        CommitLog second = runThenReset("chunk=64", "state=full");
+        CommitLog changed = runThenReset("chunk=64", "state=partial");
+        ReplayComparator comparator = new ReplayComparator();
+
+        ReplayComparator.Verdict same = comparator.compare(first.lastResetTyped(),
+            second.lastResetTyped());
+        ReplayComparator.Verdict other = comparator.compare(first.lastResetTyped(),
+            changed.lastResetTyped());
+
+        assertTrue(same.equal(), "what a reset keeps is evidence a comparison can still read");
+        assertFalse(other.equal());
+        assertEquals(1, other.differences());
+        assertTrue(other.fields().contains("content"));
+    }
+
+    /** One run read back only through the evidence its reset kept. */
+    private static CommitLog runThenReset(String... rows) {
+        CommitLog log = new CommitLog(() -> 4, order(1L), new EffectStore(1 << 12, 4));
+        log.beginTick(1L);
+        assertTrue(log.reachTyped(report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, rows)).logged());
+        log.reset();
+        return log;
     }
 }

@@ -8,6 +8,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -40,6 +41,12 @@ class CommitLogTypedSchemaTest {
         return new CommitLog.Batch(WORLD, DOMAIN, key, CommitLog.Batch.Kind.APPLY, 7L, digest, 3);
     }
 
+    /** The batch of a versioned report: the authorization generation the identity carries, and the
+     * row count its record carries, which is what a versioned line has to agree with itself on. */
+    private static CommitLog.Batch versionedBatch(String key, long digest, int rows) {
+        return new CommitLog.Batch(WORLD, DOMAIN, key, CommitLog.Batch.Kind.APPLY, 3L, digest, rows);
+    }
+
     private static CommitNamespaces.Namespace namespace(String owner, long lifetime, long reset) {
         return new CommitNamespaces.Namespace(owner, lifetime, reset, 77L);
     }
@@ -53,7 +60,7 @@ class CommitLogTypedSchemaTest {
 
     private static CommitLog.TypedBatch typed(String key, long effectRef, long lifetime,
                                               String... rows) {
-        return new CommitLog.TypedBatch(batch(key, 11L),
+        return new CommitLog.TypedBatch(versionedBatch(key, 11L, rows.length),
             identity(1L, 64L, "full", 3L, effectRef, lifetime),
             new EffectStore.Effect(effectRef, "chunk-materialize", "full", List.of(rows)));
     }
@@ -231,8 +238,8 @@ class CommitLogTypedSchemaTest {
         assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
         long afterFirst = log.sequence();
 
-        CommitLog.Verdict full = log.reachTyped(new CommitLog.TypedBatch(batch("a/1", 12L),
-            identity(2L, 65L, "full", 3L, 101L, LIFETIME),
+        CommitLog.Verdict full = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/1", 12L, 1), identity(2L, 65L, "full", 3L, 101L, LIFETIME),
             new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=65"))));
 
         assertFalse(full.logged(), "the record room is short");
@@ -316,5 +323,215 @@ class CommitLogTypedSchemaTest {
         assertTrue(first.lastTyped().typedSteps().isEmpty());
         assertEquals(2, first.lastTyped().plainSteps().size());
         assertEquals(0, first.lastTyped().effectMissing());
+    }
+
+    @Test
+    void aHandleOfAnEarlierLifecycleDoesNotReleaseTheSlotOfALaterOne() {
+        CommitLog log = log(store());
+        log.beginTick(10L);
+        CommitLog.RingSlot before = log.reserveSlot(WORLD, DOMAIN);
+        assertNotNull(before);
+
+        log.reset();
+        CommitLog.RingSlot after = log.reserveSlot(WORLD, DOMAIN);
+
+        assertNotNull(after);
+        assertNotEquals(before.ticket(), after.ticket(), "a ticket is never handed out twice");
+        assertTrue(before.resetEpoch() < after.resetEpoch());
+        assertFalse(log.releaseSlot(before), "the handle of the ended lifecycle names no slot");
+        assertEquals(1, log.reservedSlots(), "the later reservation is still held");
+        assertEquals(0L, log.reservationsReleased());
+        assertTrue(log.releaseSlot(after));
+        assertEquals(0, log.reservedSlots());
+    }
+
+    @Test
+    void aHandleOfAnotherLogOrOfAnotherPairIsNotASlotOfThisLog() {
+        CommitLog first = log(store());
+        CommitLog second = log(store());
+        CommitLog.RingSlot held = first.reserveSlot(WORLD, DOMAIN);
+        CommitLog.RingSlot other = second.reserveSlot(WORLD, DOMAIN);
+        assertNotNull(held);
+        assertNotNull(other);
+
+        assertFalse(second.releaseSlot(held), "a handle of another log names no slot of this one");
+        assertEquals(1, second.reservedSlots());
+        CommitLog.RingSlot forged = new CommitLog.RingSlot("world-b", DOMAIN, other.ticket(),
+            other.lifetime(), other.resetEpoch());
+        assertFalse(second.releaseSlot(forged), "the ticket alone does not name the pair");
+        assertEquals(1, second.reservedSlots());
+        assertTrue(second.releaseSlot(other));
+        assertEquals(1, first.reservedSlots());
+    }
+
+    @Test
+    void aResetGivesBackTheReferenceOfEveryLineItEndsAndKeepsTheEvidence() {
+        EffectStore effects = new EffectStore(4096, 4);
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64", "state=full")).logged());
+        assertEquals(1, effects.pins());
+
+        log.reset();
+
+        assertEquals(0, effects.pins(), "the line that held the record was ended by the reset");
+        assertEquals(1, effects.records(), "the record itself is not the log's to drop");
+        CommitLog.SchemaReplay ended = log.lastResetTyped();
+        assertNotNull(ended);
+        assertEquals(CommitLog.SCHEMA_TYPED, ended.schemaVersion());
+        assertEquals(1, ended.typedSteps().size());
+        assertEquals(List.of("chunk=64", "state=full"), ended.typedSteps().get(0).effect().content());
+        assertTrue(effects.evict(100L), "the room can be given back once the reference is gone");
+        assertEquals(0, effects.bytes());
+    }
+
+    @Test
+    void aResetKeepsAReferenceThatSomeoneElseHolds() {
+        EffectStore effects = store();
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
+        assertTrue(effects.pin(100L), "a reader outside the log holds the record as well");
+        assertEquals(2, effects.pins());
+
+        log.reset();
+
+        assertEquals(1, effects.pins(), "only the reference of the ended line is given back");
+        assertFalse(effects.evict(100L), "the reference of the outside reader still holds it");
+        assertTrue(effects.unpin(100L));
+        assertTrue(effects.evict(100L));
+    }
+
+    @Test
+    void cyclicResetsDoNotExhaustTheStore() {
+        EffectStore effects = new EffectStore(4096, 2);
+        CommitLog log = log(effects);
+
+        for (long cycle = 1L; cycle <= 6L; cycle++) {
+            log.beginTick(cycle);
+            CommitLog.Verdict verdict = log.reachTyped(new CommitLog.TypedBatch(
+                versionedBatch("a/0", 11L, 1), identity(cycle, 64L, "full", 3L, 100L + cycle, LIFETIME),
+                new EffectStore.Effect(100L + cycle, "chunk-materialize", "full",
+                    List.of("chunk=" + cycle))));
+
+            assertTrue(verdict.logged(), "cycle " + cycle + " still has room");
+            log.reset();
+            assertEquals(0, effects.pins());
+            assertTrue(effects.evict(100L + cycle), "the room of cycle " + cycle + " is given back");
+        }
+        assertEquals(0, effects.records());
+    }
+
+    @Test
+    void aVersionedReportWhoseHalvesDisagreeIsRefusedAndLeavesNothing() {
+        EffectStore effects = store();
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        CommitLog.TypedBatch good = typed("a/0", 100L, LIFETIME, "chunk=64", "state=full");
+
+        CommitLog.Verdict otherVersion = log.reachTyped(new CommitLog.TypedBatch(
+            new CommitLog.Batch(WORLD, DOMAIN, "a/0", CommitLog.Batch.Kind.APPLY, 9L, 11L, 2),
+            good.identity(), good.effect()));
+        CommitLog.Verdict noNode = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("", 11L, 2), good.identity(), good.effect()));
+        CommitLog.Verdict otherRows = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/0", 11L, 5), good.identity(), good.effect()));
+
+        for (CommitLog.Verdict verdict : List.of(otherVersion, noNode, otherRows)) {
+            assertFalse(verdict.logged());
+            assertEquals(RejectCode.VERSION_MISMATCH, verdict.code());
+        }
+        assertEquals(0L, log.sequence(), "a refused report takes no report number");
+        assertEquals(0, log.ringDepth());
+        assertEquals(0, log.reservedSlots());
+        assertEquals(0, effects.records(), "the record of a refused line is not kept");
+        assertEquals(0, effects.reservedBytes());
+        assertEquals(0, effects.pins());
+    }
+
+    @Test
+    void aVersionedLineWithoutALiveWorldGenerationIsRefused() {
+        EffectStore effects = store();
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        CommitLog.TypedBatch good = typed("a/0", 100L, LIFETIME, "chunk=64");
+
+        CommitLog.Verdict unlive = log.reachTyped(new CommitLog.TypedBatch(good.batch(),
+            new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, -1L, 64L, "full", 3L, 100L,
+                namespace("producer", LIFETIME, 0L), namespace("controller", LIFETIME, 0L)),
+            good.effect()));
+
+        assertFalse(unlive.logged(), "a world that is known to be absent is not a generation");
+        assertEquals(RejectCode.VERSION_MISMATCH, unlive.code());
+        assertFalse(CommitLog.liveWorldEpoch(-1L));
+        assertFalse(CommitLog.liveWorldEpoch(CommitLog.NO_WORLD_EPOCH));
+        assertTrue(CommitLog.liveWorldEpoch(1L));
+        assertEquals(0, effects.records());
+    }
+
+    @Test
+    void oneInstanceNumberUnderAnotherChunkOrStateIsRefused() {
+        EffectStore effects = store();
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
+
+        CommitLog.Verdict otherChunk = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/1", 12L, 1), identity(1L, 65L, "full", 3L, 101L, LIFETIME),
+            new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=65"))));
+        CommitLog.Verdict otherStatus = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/1", 12L, 1), identity(1L, 64L, "empty", 3L, 101L, LIFETIME),
+            new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=65"))));
+
+        for (CommitLog.Verdict verdict : List.of(otherChunk, otherStatus)) {
+            assertFalse(verdict.logged(), "the same number names one instance, not two");
+            assertEquals(RejectCode.VERSION_MISMATCH, verdict.code());
+        }
+        assertEquals(2L, log.identityCollisions());
+        assertEquals(1, effects.records());
+        assertEquals(1, log.ringDepth());
+    }
+
+    @Test
+    void anotherThreadIsNotAnotherLifecycleOfTheSameInstance() {
+        EffectStore effects = store();
+        CommitLog log = log(effects);
+        log.beginTick(10L);
+        CommitLog.Identity otherThread = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, 1L, 5L, 64L,
+            "full", 3L, 101L, new CommitNamespaces.Namespace("producer", LIFETIME, 0L, 12L),
+            new CommitNamespaces.Namespace("controller", LIFETIME, 0L, 12L));
+
+        CommitLog.Verdict first = log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64"));
+        CommitLog.Verdict second = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/1", 12L, 1), otherThread,
+            new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=64"))));
+
+        assertTrue(first.logged());
+        assertTrue(second.logged(), "the thread a line was met on is a diagnostic, not a lifecycle");
+        assertEquals(0L, log.identityCollisions());
+        assertEquals(2L, log.typedStored());
+    }
+
+    @Test
+    void twoVersionedReportsDoNotShareOneHeldSlot() {
+        CommitLog log = new CommitLog(() -> 2, order(1L), store());
+        log.beginTick(10L);
+        CommitLog.RingSlot held = log.reserveSlot(WORLD, DOMAIN);
+        assertNotNull(held);
+
+        assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
+        CommitLog.Verdict blocked = log.reachTyped(new CommitLog.TypedBatch(
+            versionedBatch("a/1", 12L, 1), identity(2L, 65L, "full", 3L, 101L, LIFETIME),
+            new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=65"))));
+
+        assertFalse(blocked.logged(), "the held slot is not room for a second versioned report");
+        assertEquals(RejectCode.QUEUE_CAP_EXCEEDED, blocked.code());
+        assertEquals(2, log.reservedSlots() + log.ringDepth(),
+            "the held slot and the stored line are still there, and the refusal added nothing");
+        assertEquals(1, log.effects().records(), "the refused report stores no record");
+        assertTrue(log.releaseSlot(held));
+        assertTrue(log.reachTyped(new CommitLog.TypedBatch(versionedBatch("a/1", 12L, 1),
+            identity(2L, 65L, "full", 3L, 101L, LIFETIME),
+            new EffectStore.Effect(101L, "chunk-materialize", "full", List.of("chunk=65")))).logged());
     }
 }

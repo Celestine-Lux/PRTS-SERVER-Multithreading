@@ -7,19 +7,30 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Compares two replayed runs under the version the records declare.
+/** Compares two replayed runs under the version they declare.
  *
  * <p>A record that declares no version is refused instead of being read as a legacy one, a version
  * this build does not know is refused instead of being answered "equal", a legacy side and a typed
- * side are refused instead of being compared across two protocols, and a typed line whose effect
- * cannot be resolved is refused instead of being read as an empty one. The reasons are the
- * comparator's own words and are not refusal codes of the write path: the code set is closed and
- * this class adds nothing to it.
+ * side are refused instead of being compared across two protocols, a side that carries lines of both
+ * protocols is refused instead of being read as one of them, a line whose columns are not all
+ * declared is refused instead of being mapped into a number, and an empty sample is refused instead
+ * of being answered "equal": two runs that wrote nothing are not evidence that they wrote the same
+ * thing. The reasons are the comparator's own words and are not refusal codes of the write path: the
+ * code set is closed and this class adds nothing to it.
  *
  * <p>A versioned comparison reads the logical columns of a step, never the numbers a run happened
  * to assign: a runtime counter is read as the place it was met in within its own run, so two runs
- * that assigned other numbers but met the same things in the same order compare equal. No namespace
- * column (owner, lifetime, reset generation, thread) is read at all. */
+ * that assigned other numbers but met the same things in the same order compare equal. The line
+ * itself is read first: every column has to be declared, the world generation has to be one a live
+ * world carries, the authorization generation has to be the expected version of the batch, the
+ * declared rows have to be the units of the record, the node has to be named and one reference has
+ * to keep one content. No namespace column (owner, lifetime, reset generation, thread) is read at
+ * all, and a collision between two lifecycles is decided without the thread.
+ *
+ * <p>The renumbering of the runtime counters is a reading of the place a number was met in and not a
+ * proof that two records are the same instance: nothing is mapped before the line it came from was
+ * found to be well formed, so a column that carries no usable value is refused instead of being
+ * turned into an ordinal that would compare equal to another unusable one. */
 public final class ReplayComparator {
 
     public static final String REFUSED_SIDE_MISSING = "side-missing";
@@ -30,11 +41,17 @@ public final class ReplayComparator {
     public static final String REFUSED_ORPHAN_EFFECT = "orphan-effect";
     public static final String REFUSED_EFFECT_MISSING = "effect-missing";
     public static final String REFUSED_INSTANCE_COLLISION = "instance-collision";
+    public static final String REFUSED_EMPTY_SAMPLE = "empty-sample";
+    public static final String REFUSED_ILLEGAL_IDENTITY = "illegal-identity";
 
-    /** The columns a versioned comparison reads, in the order it reports them. */
-    public static final List<String> CANONICAL_FIELDS = List.of("world", "domain", "plan", "position",
-        "writeSet", "epoch", "chunk", "status", "instance", "authorization", "effect", "operation",
-        "outcome", "declared", "content", "contentDigest", "disposition");
+    /** The columns a versioned comparison reads, in the order it reports them. What it deliberately
+     * does not read: the runtime namespace (owner, lifetime, reset generation, thread), the expected
+     * version of the batch (the integrity check requires it to be the authorization column, which is
+     * read), and the columns of a line that are not part of a step at all (its report number, its
+     * tick and its handle). */
+    public static final List<String> CANONICAL_FIELDS = List.of("world", "domain", "node", "plan",
+        "position", "writeSet", "rows", "epoch", "chunk", "status", "instance", "authorization",
+        "effect", "operation", "outcome", "declared", "content", "contentDigest", "disposition");
 
     /** What a comparison decided. */
     public enum Decision {
@@ -73,15 +90,19 @@ public final class ReplayComparator {
     private long refused;
 
     /** Wraps a plain replay as a side that declares version 0. It is the only way a three-field
-     * comparison is reached, so a record that declares no version is never read as a legacy one. */
+     * comparison is reached, so a record that declares no version is never read as a legacy one. A
+     * replay that is not there stays missing: it is not rebuilt as an empty sample that would answer
+     * "equal" against anything. */
     public CommitLog.SchemaReplay legacyDeclared(CommitLog.Replay replay) {
-        return new CommitLog.SchemaReplay(CommitLog.SCHEMA_LEGACY,
-            replay == null ? List.of() : replay.steps(), List.of(), 0);
+        if (replay == null) {
+            return null;
+        }
+        return new CommitLog.SchemaReplay(CommitLog.SCHEMA_LEGACY, replay.steps(), List.of(), 0);
     }
 
-    /** Compares two sides under the version they declare. */
+    /** Compares two sides under the version they declare. An empty sample is answered with its own
+     * reason and does not count as a compared pair. */
     public Verdict compare(CommitLog.SchemaReplay left, CommitLog.SchemaReplay right) {
-        compared++;
         if (left == null || right == null) {
             return refuse(REFUSED_SIDE_MISSING, "");
         }
@@ -100,13 +121,13 @@ public final class ReplayComparator {
             if (!left.typedSteps().isEmpty() || !right.typedSteps().isEmpty()) {
                 return refuse(REFUSED_MIXED_WITHIN_SIDE, "a version 0 side carries typed steps");
             }
+            if (left.plainSteps().isEmpty() || right.plainSteps().isEmpty()) {
+                return emptySample("a version 0 side carries no plain step");
+            }
             return comparePlain(left.plainSteps(), right.plainSteps());
         }
-        if (mixedWithin(left)) {
-            return refuse(REFUSED_MIXED_WITHIN_SIDE, "left declares version 1 and carries plain steps");
-        }
-        if (mixedWithin(right)) {
-            return refuse(REFUSED_MIXED_WITHIN_SIDE, "right declares version 1 and carries plain steps");
+        if (!left.plainSteps().isEmpty() || !right.plainSteps().isEmpty()) {
+            return refuse(REFUSED_MIXED_WITHIN_SIDE, "a version 1 side carries plain steps");
         }
         String broken = integrity(left);
         if (broken != null) {
@@ -115,6 +136,9 @@ public final class ReplayComparator {
         broken = integrity(right);
         if (broken != null) {
             return refuse(broken, "right");
+        }
+        if (left.typedSteps().isEmpty() || right.typedSteps().isEmpty()) {
+            return emptySample("a version 1 side carries no typed step");
         }
         return compareTyped(left.typedSteps(), right.typedSteps());
     }
@@ -171,35 +195,57 @@ public final class ReplayComparator {
         return decide(differences, fields, "");
     }
 
-    /** A versioned side refuses a line whose effect is not there, a line pointing at a record that
-     * is not the one it names, and a line that reuses the instance number of another lifecycle. */
+    /** A versioned side refuses a line that declares another schema, a line whose columns are not all
+     * declared or do not agree with each other, a line whose effect is not there or is not the one it
+     * names, one reference that carries two contents, and one instance number that is worn by two
+     * lifecycles, two chunks or two states. */
     private static String integrity(CommitLog.SchemaReplay side) {
         if (side.effectMissing() > 0) {
             return REFUSED_EFFECT_MISSING;
         }
-        Map<String, String> namespaces = new LinkedHashMap<>();
+        Map<Long, String> references = new LinkedHashMap<>();
+        Map<String, String> instances = new LinkedHashMap<>();
         for (CommitLog.TypedStep step : side.typedSteps()) {
-            long effectRef = step.identity().effectRef();
-            if (effectRef <= 0L || step.effect() == null || step.effect().effectRef() != effectRef) {
-                return step.effect() == null ? REFUSED_EFFECT_MISSING : REFUSED_ORPHAN_EFFECT;
+            CommitLog.Identity identity = step.identity();
+            EffectStore.Recorded effect = step.effect();
+            long effectRef = identity.effectRef();
+            if (effect == null) {
+                return REFUSED_EFFECT_MISSING;
             }
-            String pair = step.worldId() + "/" + step.domainId() + "/" + step.identity().instanceId();
-            String held = namespaces.putIfAbsent(pair, namespaceOf(step.identity()));
-            if (held != null && !held.equals(namespaceOf(step.identity()))) {
+            if (effectRef <= 0L || effect.effectRef() != effectRef) {
+                return REFUSED_ORPHAN_EFFECT;
+            }
+            if (identity.schemaVersion() != CommitLog.SCHEMA_TYPED) {
+                return REFUSED_MIXED_WITHIN_SIDE;
+            }
+            if (!identity.declaredTyped() || step.nodeKey() == null || step.nodeKey().isEmpty()
+                || step.expectedVersion() != identity.authorizationGeneration()
+                || step.rows() != effect.content().size()) {
+                return REFUSED_ILLEGAL_IDENTITY;
+            }
+            String mapping = effect.contentDigest() + "/" + effect.operationKind() + "/"
+                + effect.outcome();
+            String carried = references.putIfAbsent(effectRef, mapping);
+            if (carried != null && !carried.equals(mapping)) {
+                return REFUSED_ORPHAN_EFFECT;
+            }
+            String instance = lifecycleOf(identity) + "|" + identity.chunkPos() + "|"
+                + identity.targetStatus();
+            String pair = step.worldId() + "/" + step.domainId() + "/" + identity.instanceId();
+            String held = instances.putIfAbsent(pair, instance);
+            if (held != null && !held.equals(instance)) {
                 return REFUSED_INSTANCE_COLLISION;
             }
         }
         return null;
     }
 
-    private static boolean mixedWithin(CommitLog.SchemaReplay side) {
-        return !side.plainSteps().isEmpty() && !side.typedSteps().isEmpty();
-    }
-
-    private static String namespaceOf(CommitLog.Identity identity) {
+    /** The lifecycle of a versioned line: the owner, the lifetime and the reset generation of both
+     * namespaces. The thread column is a diagnostic and never decides a collision. */
+    private static String lifecycleOf(CommitLog.Identity identity) {
         CommitNamespaces.Namespace producer = identity.producer();
         CommitNamespaces.Namespace controller = identity.controller();
-        return producer.text() + "|" + controller.text();
+        return producer.lifecycleKey() + "|" + controller.lifecycleKey();
     }
 
     private static Map<String, String> columns(Canonical ordinals, CommitLog.TypedStep step) {
@@ -209,9 +255,11 @@ public final class ReplayComparator {
         Map<String, String> columns = new LinkedHashMap<>();
         columns.put("world", String.valueOf(step.worldId()));
         columns.put("domain", String.valueOf(step.domainId()));
+        columns.put("node", String.valueOf(step.nodeKey()));
         columns.put("plan", String.valueOf(ordinals.ordinal("plan/" + step.planSequence())));
         columns.put("position", String.valueOf(step.position()));
         columns.put("writeSet", Long.toHexString(step.writeSetDigest()));
+        columns.put("rows", String.valueOf(step.rows()));
         columns.put("epoch", String.valueOf(ordinals.ordinal("epoch/" + step.worldId() + "/"
             + identity.worldEpoch())));
         columns.put("chunk", String.valueOf(identity.chunkPos()));
@@ -231,6 +279,7 @@ public final class ReplayComparator {
     }
 
     private Verdict decide(int differences, List<String> fields, String note) {
+        compared++;
         if (differences == 0) {
             equal++;
             return new Verdict(Decision.EQUAL, 0, "", List.of(), note);
@@ -240,9 +289,18 @@ public final class ReplayComparator {
     }
 
     private Verdict refuse(String reason, String note) {
+        compared++;
         refused++;
         refusals.merge(reason, 1L, Long::sum);
         return new Verdict(Decision.REFUSED, 0, reason, List.of(), note);
+    }
+
+    /** An empty sample is a state of its own: it is refused, and it is not counted as a pair the
+     * comparison passed judgement on. */
+    private Verdict emptySample(String note) {
+        refused++;
+        refusals.merge(REFUSED_EMPTY_SAMPLE, 1L, Long::sum);
+        return new Verdict(Decision.REFUSED, 0, REFUSED_EMPTY_SAMPLE, List.of(), note);
     }
 
     private static void add(List<String> fields, String field) {

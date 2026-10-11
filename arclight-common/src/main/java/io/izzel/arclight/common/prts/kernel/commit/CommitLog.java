@@ -76,6 +76,13 @@ public final class CommitLog {
         return version == SCHEMA_LEGACY || version == SCHEMA_TYPED;
     }
 
+    /** Whether a world generation column names a world that is live. The tracked world set gives an
+     * absent world a negative generation and an untracked one zero, so a generation that names a
+     * world is positive, and the column is read for more than "not the default". */
+    public static boolean liveWorldEpoch(long worldEpoch) {
+        return worldEpoch > NO_WORLD_EPOCH;
+    }
+
     /** The typed columns of one line. A line of the plain path carries {@link Identity#NONE}, which
      * declares nothing: no schema, no instance, no effect. */
     public record Identity(int schemaVersion, long instanceId, long worldEpoch, long chunkPos,
@@ -97,7 +104,7 @@ public final class CommitLog {
          * refusal, not a default that reads as a value. */
         public boolean declaredTyped() {
             return schemaVersion == SCHEMA_TYPED && instanceId != NO_INSTANCE
-                && worldEpoch != NO_WORLD_EPOCH && !targetStatus.isEmpty()
+                && liveWorldEpoch(worldEpoch) && !targetStatus.isEmpty()
                 && authorizationGeneration != NO_AUTHORIZATION_GENERATION && effectRef != NO_EFFECT
                 && producer.declared();
         }
@@ -107,10 +114,15 @@ public final class CommitLog {
     public record TypedBatch(Batch batch, Identity identity, EffectStore.Effect effect) {
     }
 
-    /** One step of the versioned projection: the plain step, the typed columns of the line and the
-     * effect record copied while the ring was read. A null effect could not be resolved. */
+    /** One step of the versioned projection: the plain step, the typed columns of the line, the
+     * columns of the batch it came from and the effect record copied while the ring was read. The
+     * batch columns are carried so a comparison can read the relation between the two halves of the
+     * line: the authorization generation is the expected version, the rows are the units of the
+     * record, and the node is the logical instance of the frozen plan. A null effect could not be
+     * resolved. */
     public record TypedStep(long planSequence, int position, long writeSetDigest, String worldId,
-                            String domainId, Identity identity, Entry.Disposition disposition,
+                            String domainId, String nodeKey, long expectedVersion, int rows,
+                            Identity identity, Entry.Disposition disposition,
                             EffectStore.Recorded effect) {
 
         public boolean effectResolved() {
@@ -131,8 +143,11 @@ public final class CommitLog {
         }
     }
 
-    /** One ring slot handed out before anything is stored in it. */
-    public record RingSlot(String worldId, String domainId, long ticket) {
+    /** One ring slot handed out before anything is stored in it. The handle carries the log
+     * lifetime and the reset generation it was handed out under, so a handle of an earlier lifecycle,
+     * of another log or of another pair is answered as unknown instead of releasing a later slot. */
+    public record RingSlot(String worldId, String domainId, long ticket, long lifetime,
+                           long resetEpoch) {
     }
 
     /** The one entry a producer reaches. A producer with no sink bound keeps its own path unchanged;
@@ -246,11 +261,14 @@ public final class CommitLog {
     private Replay last;
     private long firstDivergencePosition = -1L;
     private final EffectStore effects;
+    private final long lifetime = CommitNamespaces.Lifetimes.mint();
     private final Map<Long, RingSlot> heldSlots = new LinkedHashMap<>();
     private final Map<String, Integer> slotsByKey = new LinkedHashMap<>();
     private final Map<String, String> instanceNamespaces = new LinkedHashMap<>();
     private SchemaReplay lastSchema;
+    private SchemaReplay lastReset;
     private long slotTickets;
+    private long resetEpoch;
     private long reservationsTaken;
     private long reservationsReleased;
     private long reservationsConsumed;
@@ -428,8 +446,13 @@ public final class CommitLog {
         }
         Batch batch = typed.batch();
         Identity identity = typed.identity();
+        // A versioned line declares every column and its two halves agree: the authorization
+        // generation is the expected version of the batch, the line names the record it carries, and
+        // it names a node of the frozen plan it was ordered from.
         if (identity.schemaVersion() != SCHEMA_TYPED || !identity.declaredTyped()
-            || identity.effectRef() != typed.effect().effectRef()) {
+            || identity.effectRef() != typed.effect().effectRef()
+            || identity.authorizationGeneration() != batch.expectedVersion()
+            || batch.nodeKey() == null || batch.nodeKey().isEmpty()) {
             return typedRefusal(RejectCode.VERSION_MISMATCH, -1);
         }
         Resolved resolved = source == null ? null
@@ -441,12 +464,13 @@ public final class CommitLog {
         if (!ascending(batch.worldId(), batch.domainId(), resolved.planSequence(), position)) {
             return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, position);
         }
-        String namespace = namespaceOf(identity);
+        String instance = instanceOf(identity);
         String instanceKey = key(batch.worldId(), batch.domainId()) + "/" + identity.instanceId();
         String held = instanceNamespaces.get(instanceKey);
-        if (held != null && !held.equals(namespace)) {
-            // The same instance number under another lifecycle is two instances wearing one name:
-            // the number alone is not an assertion that they are the same one.
+        if (held != null && !held.equals(instance)) {
+            // One instance number names one instance: the lifecycle, the chunk and the published
+            // state it carries. Another lifecycle, another chunk or another state under that number
+            // is a second instance wearing the name of the first, and the number alone says nothing.
             identityCollisions++;
             return typedRefusal(RejectCode.VERSION_MISMATCH, position);
         }
@@ -465,6 +489,12 @@ public final class CommitLog {
             releaseSlot(slot);
             return typedRefusal(stored.code(), position);
         }
+        if (stored.record().content().size() != batch.rows()) {
+            // The batch declares how many rows its write set has and the record carries exactly
+            // those: a line whose halves count different things is not stored at all.
+            giveBack(identity.effectRef(), slot);
+            return typedRefusal(RejectCode.VERSION_MISMATCH, position);
+        }
         Entry.Disposition disposition = dispositionOf(batch.kind());
         Entry entry = new Entry(++sequence, tickIndex, resolved.planSequence(), position,
             batch.worldId(), batch.domainId(), batch.nodeKey() == null ? "" : batch.nodeKey(), 0L,
@@ -474,15 +504,13 @@ public final class CommitLog {
         if (!push.stored()) {
             // A slot was held for this line, so a ring that still refuses it is a defect and not a
             // shortage: the record and the reservation go with it and no half line stays behind.
-            effects.unpin(identity.effectRef());
-            effects.evict(identity.effectRef());
-            releaseSlot(slot);
+            giveBack(identity.effectRef(), slot);
             return typedRefusal(push.code(), position);
         }
         consumeSlot(slot);
         lastPlanOfRing.put(key(batch.worldId(), batch.domainId()), resolved.planSequence());
         lastPositionOfRing.put(key(batch.worldId(), batch.domainId()), position);
-        instanceNamespaces.put(instanceKey, namespace);
+        instanceNamespaces.put(instanceKey, instance);
         switch (disposition) {
             case ACCEPTED -> accepted++;
             case MERGED -> merged++;
@@ -504,44 +532,58 @@ public final class CommitLog {
             reservationRefusals++;
             return null;
         }
-        RingSlot slot = new RingSlot(worldId, domainId, ++slotTickets);
+        RingSlot slot = new RingSlot(worldId, domainId, ++slotTickets, lifetime, resetEpoch);
         heldSlots.put(slot.ticket(), slot);
         slotsByKey.merge(key(worldId, domainId), 1, Integer::sum);
         reservationsTaken++;
         return slot;
     }
 
-    /** Gives back a slot that was not filled. */
+    /** Gives back a slot that was not filled. The handle is answered against the slot this log saved
+     * under its ticket, whole: a handle of another log, of another pair or of a lifecycle this log
+     * has left is not a slot of this one, and giving it back would release a later reservation. */
     public boolean releaseSlot(RingSlot slot) {
         if (slot == null) {
             return false;
         }
-        String key = key(slot.worldId(), slot.domainId());
-        Integer held = slotsByKey.get(key);
-        if (held == null || held <= 0 || heldSlots.get(slot.ticket()) == null) {
+        RingSlot held = heldSlots.get(slot.ticket());
+        if (held == null || !held.equals(slot) || held.lifetime() != lifetime
+            || held.resetEpoch() != resetEpoch) {
             return false;
         }
-        heldSlots.remove(slot.ticket());
-        if (held == 1) {
-            slotsByKey.remove(key);
-        } else {
-            slotsByKey.put(key, held - 1);
-        }
+        heldSlots.remove(held.ticket());
+        dropHeld(held);
         reservationsReleased++;
         return true;
     }
 
     /** Fills a held slot with the line that was reserved for it. */
     private void consumeSlot(RingSlot slot) {
-        String key = key(slot.worldId(), slot.domainId());
-        Integer held = slotsByKey.get(key);
-        heldSlots.remove(slot.ticket());
-        if (held != null && held > 1) {
-            slotsByKey.put(key, held - 1);
-        } else {
-            slotsByKey.remove(key);
+        RingSlot held = heldSlots.get(slot.ticket());
+        if (held == null || !held.equals(slot)) {
+            return;
         }
+        heldSlots.remove(held.ticket());
+        dropHeld(held);
         reservationsConsumed++;
+    }
+
+    /** Drops the room one saved slot held, by the pair the log saved with it. */
+    private void dropHeld(RingSlot held) {
+        String key = key(held.worldId(), held.domainId());
+        Integer count = slotsByKey.get(key);
+        if (count == null || count <= 1) {
+            slotsByKey.remove(key);
+        } else {
+            slotsByKey.put(key, count - 1);
+        }
+    }
+
+    /** Gives back the record and the ring slot of a line that is not stored after all. */
+    private void giveBack(long effectRef, RingSlot slot) {
+        effects.unpin(effectRef);
+        effects.evict(effectRef);
+        releaseSlot(slot);
     }
 
     private int freeSlots(CommitRing ring) {
@@ -553,8 +595,16 @@ public final class CommitLog {
         return new Verdict(false, Entry.Disposition.DROPPED, code, sequence, position);
     }
 
-    private static String namespaceOf(Identity identity) {
-        return identity.producer().text() + "|" + identity.controller().text();
+    /** The lifecycle of a versioned line: the owner, the lifetime and the reset generation of both
+     * namespaces. The thread column is a diagnostic and is not part of it. */
+    private static String lifecycleKeyOf(Identity identity) {
+        return identity.producer().lifecycleKey() + "|" + identity.controller().lifecycleKey();
+    }
+
+    /** One instance number names one instance in one log: its lifecycle, the chunk it publishes and
+     * the state it publishes there. The same instance met on another thread is the same instance. */
+    private static String instanceOf(Identity identity) {
+        return lifecycleKeyOf(identity) + "|" + identity.chunkPos() + "|" + identity.targetStatus();
     }
 
     private static Entry.Disposition dispositionOf(Batch.Kind kind) {
@@ -578,7 +628,8 @@ public final class CommitLog {
             effects.unpin(effectRef);
         }
         return new TypedStep(entry.planSequence(), entry.position(), entry.writeSetDigest(),
-            entry.worldId(), entry.domainId(), entry.identity(), entry.disposition(), record);
+            entry.worldId(), entry.domainId(), entry.nodeKey(), entry.expectedVersion(), entry.rows(),
+            entry.identity(), entry.disposition(), record);
     }
 
     private boolean ascending(String worldId, String domainId, long planSequence, long position) {
@@ -610,6 +661,31 @@ public final class CommitLog {
             value *= PRIME;
         }
         return value;
+    }
+
+    /** The terminal projection of the lifecycle that ended at the last reset: what the rings still
+     * carried then, with the records copied. A further reset replaces it instead of piling up. */
+    public SchemaReplay lastResetTyped() {
+        return lastReset;
+    }
+
+    private SchemaReplay drain() {
+        List<Entry.Step> plain = new ArrayList<>();
+        List<TypedStep> typed = new ArrayList<>();
+        List<String> keys = new ArrayList<>(rings.keySet());
+        keys.sort(String::compareTo);
+        for (String key : keys) {
+            Entry entry;
+            while ((entry = rings.get(key).pop()) != null) {
+                if (entry.identity().effectRef() != NO_EFFECT) {
+                    typed.add(typedStep(entry));
+                } else {
+                    plain.add(entry.step());
+                }
+            }
+        }
+        return new SchemaReplay(typed.isEmpty() ? SCHEMA_UNDECLARED : SCHEMA_TYPED, plain, typed,
+            unresolvedOf(typed));
     }
 
     public long sequence() {
@@ -734,7 +810,12 @@ public final class CommitLog {
         return effectMissingSteps;
     }
 
+    /** Ends this lifecycle. The lines the rings still carry are folded into the terminal projection
+     * of that lifecycle first, and the record a versioned line points at is copied before the one
+     * reference the line holds is given back: a reset that is repeated cannot leave a reference
+     * behind and cannot exhaust the store, while a reference held by someone else stays theirs. */
     public void reset() {
+        lastReset = drain();
         rings.clear();
         lastPlanOfRing.clear();
         lastPositionOfRing.clear();
@@ -756,7 +837,7 @@ public final class CommitLog {
         heldSlots.clear();
         slotsByKey.clear();
         instanceNamespaces.clear();
-        slotTickets = 0L;
+        resetEpoch++;
         reservationsTaken = 0L;
         reservationsReleased = 0L;
         reservationsConsumed = 0L;

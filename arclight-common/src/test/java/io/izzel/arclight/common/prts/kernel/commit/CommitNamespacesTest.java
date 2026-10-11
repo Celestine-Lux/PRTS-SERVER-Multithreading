@@ -72,4 +72,20 @@ class CommitNamespacesTest {
     void aNamespaceReadsAsOneColumn() {
         assertEquals("producer/7/0/1", new CommitNamespaces.Namespace("producer", 7L, 0L, 1L).text());
     }
+
+    @Test
+    void theLifecycleKeyLeavesTheDiagnosticColumnOut() {
+        CommitNamespaces.Namespace held = new CommitNamespaces.Namespace("producer", 7L, 0L, 1L);
+        CommitNamespaces.Namespace otherThread = new CommitNamespaces.Namespace("producer", 7L, 0L, 2L);
+
+        assertEquals("producer/7/0", held.lifecycleKey());
+        assertEquals(held.lifecycleKey(), otherThread.lifecycleKey(), "the thread is a diagnostic");
+        assertNotEquals(held.lifecycleKey(), new CommitNamespaces.Namespace("producer", 7L, 1L, 1L)
+            .lifecycleKey(), "another reset generation is another lifecycle");
+        assertNotEquals(held.lifecycleKey(), new CommitNamespaces.Namespace("producer", 8L, 0L, 1L)
+            .lifecycleKey(), "another lifetime is another lifecycle");
+        assertNotEquals(held.lifecycleKey(), new CommitNamespaces.Namespace("elsewhere", 7L, 0L, 1L)
+            .lifecycleKey(), "another owner is another lifecycle");
+        assertNotEquals(held.text(), otherThread.text(), "the whole column still carries the thread");
+    }
 }
