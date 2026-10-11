@@ -7,30 +7,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Compares two replayed runs under the version they declare.
- *
- * <p>A record that declares no version is refused instead of being read as a legacy one, a version
- * this build does not know is refused instead of being answered "equal", a legacy side and a typed
- * side are refused instead of being compared across two protocols, a side that carries lines of both
- * protocols is refused instead of being read as one of them, a line whose columns are not all
- * declared is refused instead of being mapped into a number, and an empty sample is refused instead
- * of being answered "equal": two runs that wrote nothing are not evidence that they wrote the same
- * thing. The reasons are the comparator's own words and are not refusal codes of the write path: the
- * code set is closed and this class adds nothing to it.
- *
- * <p>A versioned comparison reads the logical columns of a step, never the numbers a run happened
- * to assign: a runtime counter is read as the place it was met in within its own run, so two runs
- * that assigned other numbers but met the same things in the same order compare equal. The line
- * itself is read first: every column has to be declared, the world generation has to be one a live
- * world carries, the authorization generation has to be the expected version of the batch, the
- * declared rows have to be the units of the record, the node has to be named and one reference has
- * to keep one content. No namespace column (owner, lifetime, reset generation, thread) is read at
- * all, and a collision between two lifecycles is decided without the thread.
- *
- * <p>The renumbering of the runtime counters is a reading of the place a number was met in and not a
- * proof that two records are the same instance: nothing is mapped before the line it came from was
- * found to be well formed, so a column that carries no usable value is refused instead of being
- * turned into an ordinal that would compare equal to another unusable one. */
+/** Compares two replayed runs under the version they declare. A shape that cannot be read is
+ * refused with one of the REFUSED_ constants instead of being answered, and an empty sample is
+ * refused too: two runs that wrote nothing are no evidence that they wrote the same thing. Those
+ * reasons are this class's own words and not refusal codes of the write path, whose set stays
+ * closed. A versioned comparison reads the logical columns of a step and never the numbers a run
+ * happened to assign, and it reads no namespace column: a collision between two lifecycles is
+ * decided without the thread. */
 public final class ReplayComparator {
 
     public static final String REFUSED_SIDE_MISSING = "side-missing";
@@ -44,24 +27,18 @@ public final class ReplayComparator {
     public static final String REFUSED_EMPTY_SAMPLE = "empty-sample";
     public static final String REFUSED_ILLEGAL_IDENTITY = "illegal-identity";
 
-    /** The columns a versioned comparison reads, in the order it reports them. What it deliberately
-     * does not read: the runtime namespace (owner, lifetime, reset generation, thread), the expected
-     * version of the batch (the integrity check requires it to be the authorization column, which is
-     * read), and the columns of a line that are not part of a step at all (its report number, its
-     * tick and its handle). */
+    /** The columns a versioned comparison reads, in the order it reports them. The runtime namespace
+     * and the line's own report number, tick and handle are deliberately not read. */
     public static final List<String> CANONICAL_FIELDS = List.of("world", "domain", "node", "plan",
         "position", "writeSet", "rows", "epoch", "chunk", "status", "instance", "authorization",
         "effect", "operation", "outcome", "declared", "content", "contentDigest", "disposition");
 
-    /** What a comparison decided. */
     public enum Decision {
         EQUAL,
         DIFFERENT,
         REFUSED
     }
 
-    /** The answer of one comparison: the decision, how many steps differ, the reason of a refusal
-     * and the columns that differed. */
     public record Verdict(Decision decision, int differences, String reason, List<String> fields,
                           String note) {
 
@@ -89,10 +66,8 @@ public final class ReplayComparator {
     private long different;
     private long refused;
 
-    /** Wraps a plain replay as a side that declares version 0. It is the only way a three-field
-     * comparison is reached, so a record that declares no version is never read as a legacy one. A
-     * replay that is not there stays missing: it is not rebuilt as an empty sample that would answer
-     * "equal" against anything. */
+    /** Wraps a plain replay as a side that declares version 0, which is the only way a three-field
+     * comparison is reached. A replay that is not there stays missing. */
     public CommitLog.SchemaReplay legacyDeclared(CommitLog.Replay replay) {
         if (replay == null) {
             return null;
@@ -100,8 +75,8 @@ public final class ReplayComparator {
         return new CommitLog.SchemaReplay(CommitLog.SCHEMA_LEGACY, replay.steps(), List.of(), 0);
     }
 
-    /** Compares two sides under the version they declare. An empty sample is answered with its own
-     * reason and does not count as a compared pair. */
+    /** Compares two sides under the version they declare. An empty sample is refused and does not
+     * count as a pair the comparison passed judgement on. */
     public Verdict compare(CommitLog.SchemaReplay left, CommitLog.SchemaReplay right) {
         if (left == null || right == null) {
             return refuse(REFUSED_SIDE_MISSING, "");
@@ -143,7 +118,6 @@ public final class ReplayComparator {
         return compareTyped(left.typedSteps(), right.typedSteps());
     }
 
-    /** Compares the three fields of two plain projections, which is all version 0 carries. */
     private Verdict comparePlain(List<CommitLog.Entry.Step> left, List<CommitLog.Entry.Step> right) {
         int differences = Math.abs(left.size() - right.size());
         int shared = Math.min(left.size(), right.size());
@@ -171,7 +145,6 @@ public final class ReplayComparator {
         return decide(differences, fields, LEGACY_NOTE);
     }
 
-    /** Compares the logical columns of two versioned projections. */
     private Verdict compareTyped(List<CommitLog.TypedStep> left, List<CommitLog.TypedStep> right) {
         Canonical leftOrdinals = new Canonical();
         Canonical rightOrdinals = new Canonical();
@@ -195,10 +168,6 @@ public final class ReplayComparator {
         return decide(differences, fields, "");
     }
 
-    /** A versioned side refuses a line that declares another schema, a line whose columns are not all
-     * declared or do not agree with each other, a line whose effect is not there or is not the one it
-     * names, one reference that carries two contents, and one instance number that is worn by two
-     * lifecycles, two chunks or two states. */
     private static String integrity(CommitLog.SchemaReplay side) {
         if (side.effectMissing() > 0) {
             return REFUSED_EFFECT_MISSING;
@@ -240,8 +209,6 @@ public final class ReplayComparator {
         return null;
     }
 
-    /** The lifecycle of a versioned line: the owner, the lifetime and the reset generation of both
-     * namespaces. The thread column is a diagnostic and never decides a collision. */
     private static String lifecycleOf(CommitLog.Identity identity) {
         CommitNamespaces.Namespace producer = identity.producer();
         CommitNamespaces.Namespace controller = identity.controller();
@@ -295,8 +262,7 @@ public final class ReplayComparator {
         return new Verdict(Decision.REFUSED, 0, reason, List.of(), note);
     }
 
-    /** An empty sample is a state of its own: it is refused, and it is not counted as a pair the
-     * comparison passed judgement on. */
+    // Refused, and not counted as a pair the comparison passed judgement on.
     private Verdict emptySample(String note) {
         refused++;
         refusals.merge(REFUSED_EMPTY_SAMPLE, 1L, Long::sum);
@@ -309,7 +275,6 @@ public final class ReplayComparator {
         }
     }
 
-    /** The run-local renumbering of the runtime counters a versioned comparison reads. */
     private static final class Canonical {
 
         private final Map<String, Integer> ordinals = new LinkedHashMap<>();

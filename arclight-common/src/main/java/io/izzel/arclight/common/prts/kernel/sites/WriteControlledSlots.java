@@ -22,12 +22,10 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** The claim table of the controlled write channel. A slot is declared for one world, domain and
- * level and names the spatial range its writes fall in; a write no active range covers is not a
- * domain write and stays on the default path. A write that is covered is judged against the
- * contract the slot carries, and only a covered write whose contract still holds is captured.
- * Nothing here decides a write by itself: the guard hands a covered write to the judged path it
- * already had. */
+/** The claim table of the controlled write channel. A slot declares a range for one world, domain
+ * and level; a write no active range covers is not a domain write and stays on the default path,
+ * and only a covered write whose contract still holds is captured. Nothing here decides a write by
+ * itself: the guard hands a covered write to the judged path it already had. */
 public final class WriteControlledSlots {
 
     public enum Verdict {
@@ -36,8 +34,7 @@ public final class WriteControlledSlots {
         REJECTED
     }
 
-    /** Why a slot was refused when it was declared. These are declaration labels, not write-path
-     * reject codes: a refused slot never reaches the write path. */
+    /** Why a slot was refused when it was declared: declaration labels, not reject codes. */
     public enum Refusal {
         NONE,
         WILDCARD_KEY,
@@ -47,16 +44,15 @@ public final class WriteControlledSlots {
         DUPLICATE_KEY
     }
 
-    /** The granularity one declared spatial range is named at: a section is the 16x16x16 block
-     * volume the game itself addresses chunks by. */
+    /** The granularity a declared range is named at: a section is the 16x16x16 block volume. */
     public enum CellKind {
         CHUNK,
         SECTION,
         BLOCK
     }
 
-    /** The block position one write is made at, or the absence of one. A caller that cannot read
-     * the position says so here, and such a write is never matched against a range. */
+    /** The block position one write is made at, or the absence of one: such a write is never matched
+     * against a range. */
     public record WritePosition(boolean readable, int x, int y, int z) {
 
         public static final WritePosition NONE = new WritePosition(false, 0, 0, 0);
@@ -66,15 +62,13 @@ public final class WriteControlledSlots {
         }
     }
 
-    /** One declared spatial range: the granularity its cells are named at, the cell keys themselves
-     * in ascending order, and the fold that names the range. The cells are what membership is
-     * decided on; the fold only names them. */
+    /** One declared spatial range: the cells are what membership is decided on; the fold only names
+     * them. */
     public record WriteSpace(CellKind kind, long[] cells, String digest) {
 
         /** A declared bound, not a measured one: a range that names more is refused. */
         public static final int MAX_CELLS = 16;
 
-        /** No range at all: what a declaration that names none carries. */
         public static final WriteSpace NONE = new WriteSpace(null, new long[0], "");
 
         public WriteSpace {
@@ -86,14 +80,13 @@ public final class WriteControlledSlots {
             return new WriteSpace(kind, cells, "");
         }
 
-        /** The cells, ascending, as a copy: a reader that verifies membership reads these. */
         @Override
         public long[] cells() {
             return cells.clone();
         }
 
-        /** Whether one write falls inside this range. The position is folded at this range's own
-         * granularity, so a range declared in sections is never asked about a block. */
+        /** Whether one write falls inside this range: the position is folded at this range's own
+         * granularity. */
         public boolean covers(WritePosition position) {
             return wellFormed() && position != null && position.readable()
                 && Arrays.binarySearch(cells, cellOf(kind, position)) >= 0;
@@ -138,8 +131,8 @@ public final class WriteControlledSlots {
         }
     }
 
-    /** The key of one controlled slot. The segment is the fixed token of the spatial range the slot
-     * was frozen for, so a key whose segment is not that token names no placeable range. */
+    /** The key of one controlled slot: the segment is the fixed token of the spatial range the slot
+     * was frozen for. */
     public record SlotKey(String worldId, String domainId, WriteLevel level, String segment,
                           long planSequence) {
 
@@ -151,16 +144,13 @@ public final class WriteControlledSlots {
             return blank(worldId) || blank(domainId) || blank(segment) || level == null;
         }
 
-        /** The stable name of one key, so a reader that needs a fixed order over slots has one and
-         * does not depend on the iteration order of the table. It is a reading: the table no longer
-         * chooses between slots that cover the same write by it. */
+        /** The stable name of one key, so a reader that needs a fixed order over slots has one. */
         public String rank() {
             return worldId + "|" + domainId + "|" + level + "|" + segment + "|" + planSequence;
         }
 
         /** The fixed encoding of one range as the segment of a slot key: the granularity and every
-         * cell key in ascending order, so a key names its range exactly and not by a fold of it. A
-         * range that cannot be written into a key spells nothing. */
+         * cell key in ascending order, so a key names its range exactly and not by a fold of it. */
         public static String segmentOf(WriteSpace space) {
             if (space == null || !space.wellFormed()) {
                 return "";
@@ -186,15 +176,13 @@ public final class WriteControlledSlots {
         }
     }
 
-    /** The fold of a declared write set, over the keys of the set: two sets that declare the same
-     * keys fold to the same digest, so the digest names a set wherever it is read - in the slot a
-     * claim carries, and in the review that compares a declared set with the set actually held. */
+    /** The fold of a declared write set over its keys: two sets that declare the same keys fold to
+     * the same digest. */
     public static String fold(Collection<String> writeSet) {
         return Long.toHexString(foldValue(writeSet));
     }
 
-    /** The same fold as a value: a producer that reports a batch to the commit log names the write
-     * set of the batch by this number, and the two forms of one set are the same number. */
+    /** The same fold as a value: the number a producer reports and the string form are one. */
     public static long foldValue(Collection<String> writeSet) {
         long hash = FOLD_BASIS;
         for (String key : new TreeSet<>(writeSet == null ? Set.of() : writeSet)) {
@@ -205,9 +193,6 @@ public final class WriteControlledSlots {
         return hash;
     }
 
-    /** The fold of the cells of one range, over the canonical cell tokens: the same range folds to
-     * the same number wherever it is read. The fold names the range; whether a write is inside it
-     * is always decided on the cells themselves. */
     private static String foldCells(CellKind kind, long[] cells) {
         List<String> tokens = new ArrayList<>(cells.length);
         for (long cell : cells) {
@@ -216,8 +201,7 @@ public final class WriteControlledSlots {
         return fold(tokens);
     }
 
-    /** The key of one position at one granularity. A section is 16 blocks on a side and its key is
-     * the packing the game itself uses, so a negative coordinate needs no bias of its own. */
+    // The section key is the packing the game itself uses, so no bias of its own is needed.
     private static long cellOf(CellKind kind, WritePosition position) {
         return switch (kind) {
             case CHUNK -> ChunkPos.asLong(position.x() >> 4, position.z() >> 4);
@@ -227,7 +211,7 @@ public final class WriteControlledSlots {
     }
 
     /** One declared slot: the spatial range it covers, the write set it declares and the contract a
-     * covered write has to satisfy. A slot that names no range is refused at declaration. */
+     * covered write has to satisfy. */
     public record Slot(SlotKey key, Object levelRef, String planNodeKey, int position,
                        long expectedVersion, long slotGeneration, long worldEpoch, long expireTick,
                        HolderKind holderKind, String holderSiteId, Set<String> writeSet,
@@ -255,7 +239,6 @@ public final class WriteControlledSlots {
             return pathDigest();
         }
 
-        /** The fold of the declared range, reported beside the path digest. */
         public String spaceDigest() {
             return space.digest();
         }
@@ -266,8 +249,7 @@ public final class WriteControlledSlots {
     }
 
     /** The facts the table cannot read from its own registries: which world a level belongs to, and
-     * which step the frozen plan of the recent ticks holds for a slot. While nothing is wired, no
-     * world is named and no step is held, so a covered write is refused instead of captured. */
+     * which step the frozen plan holds for a slot. */
     public interface Source {
 
         /** The world a write is happening in, as the platform names it; empty while nothing is wired. */
@@ -276,7 +258,6 @@ public final class WriteControlledSlots {
         /** The step the plan holds for a slot, or null while the plan does not carry it. */
         Step stepOf(String worldId, String domainId, String planNodeKey);
 
-        /** A source that names no world and holds no step. */
         Source NONE = new Source() {
 
             @Override
@@ -294,9 +275,8 @@ public final class WriteControlledSlots {
         }
     }
 
-    /** One judgement. A captured write carries the plan identity the contract resolved; a rejected
-     * one names the term that failed. The two folds are reported apart: the path categories the
-     * declaration claimed and the spatial range it named. */
+    /** One judgement: a captured write carries the plan identity the contract resolved, a rejected
+     * one names the term that failed. */
     public record Decision(Verdict verdict, SlotKey key, String planNodeKey, long planSequence,
                            int position, String pathDigest, String spaceDigest, int covering,
                            String reason) {
@@ -311,9 +291,7 @@ public final class WriteControlledSlots {
         }
     }
 
-    /** The refusal of one covered write, with the elements a diagnosis needs: the world, the tick,
-     * the holder, the version that was expected and the one that was carried, the slot, the path
-     * categories and the spatial range, and how many active ranges covered the write. */
+    /** The refusal of one covered write, with the elements a diagnosis needs. */
     public record WriteRefusal(String reason, String worldId, String domainId, WriteLevel level,
                           String segment, long planSequence, String planNodeKey, String siteId,
                           HolderKind holderKind, long tickIndex, long expectedVersion,
@@ -331,7 +309,6 @@ public final class WriteControlledSlots {
     private static final String REASON_UNREADABLE_POSITION = "segment";
     private static final String REASON_AMBIGUOUS_RANGE = "owner";
 
-    /** The instance a guard asks while no claim table is wired into it. */
     public static final WriteControlledSlots NOTHING = new WriteControlledSlots(new OwnerRegistry(),
         WriteVersionSlots.NOTHING, new WorldEpochs(), Source.NONE);
 
@@ -357,7 +334,6 @@ public final class WriteControlledSlots {
     private volatile Slot lastRefusingSlot;
     private volatile Slot lastCoveredSlot;
 
-    /** Creates the table. */
     public WriteControlledSlots(OwnerRegistry owners, WriteVersionSlots versions, WorldEpochs epochs,
                                 Source source) {
         this.owners = owners;
@@ -366,8 +342,8 @@ public final class WriteControlledSlots {
         this.source = source;
     }
 
-    /** Decides whether the claim table is consulted at all. Off, every write of the short path is
-     * counted as a default-path write and no slot is ever looked up. */
+    /** Decides whether the claim table is consulted at all: off, every write is counted as a
+     * default-path write and no slot is looked up. */
     public void refresh(boolean enabled) {
         this.enabled = enabled;
     }
@@ -377,8 +353,7 @@ public final class WriteControlledSlots {
     }
 
     /** Declares one slot. A slot that names no usable range, or whose key does not spell the range
-     * it carries, declares an empty effective write set and is refused here, when it is declared,
-     * and not repaired when a write arrives. */
+     * it carries, is refused here and not repaired when a write arrives. */
     public Refusal register(Slot slot) {
         Refusal refusal = refusalOf(slot);
         if (refusal != Refusal.NONE) {
@@ -400,23 +375,22 @@ public final class WriteControlledSlots {
         return Refusal.NONE;
     }
 
-    /** Retires the slot of one key. The writes it covered fall back to the default path. */
+    /** Retires the slot of one key: the writes it covered fall back to the default path. */
     public boolean retire(SlotKey key) {
         generations.remove(key);
         return slots.remove(key) != null;
     }
 
-    /** Retires the generation of one key without seating a new slot: everything the seated slot
-     * covers is refused from here on, until a slot of the new generation is declared. */
+    /** Retires the generation of one key without seating a new slot: what the seated slot covers is
+     * refused from here on. */
     public long advance(SlotKey key) {
         long minted = generations.merge(key, 1L, Long::sum);
         advanced.incrementAndGet();
         return minted;
     }
 
-    /** Judges one write of one write path against the table. The position the write is made at is
-     * what decides whether an active range covers it; a caller that cannot name it says so and the
-     * write is refused rather than matched at world level. */
+    /** Judges one write of one write path against the table. A caller that cannot name the position
+     * says so and the write is refused rather than matched at world level. */
     public Decision judge(Object levelRef, String domainKey, WritePosition position, long tickIndex) {
         if (levelRef == null || domainKey == null || domainKey.isEmpty()) {
             notExecutable.incrementAndGet();
@@ -473,15 +447,11 @@ public final class WriteControlledSlots {
             covering.size(), "");
     }
 
-    /** Judges one write whose caller cannot name the position it is made at. A write no active
-     * range could cover keeps the path it had; one that could is refused. */
+    /** Judges one write whose caller cannot name the position it is made at. */
     public Decision judge(Object levelRef, String domainKey, long tickIndex) {
         return judge(levelRef, domainKey, WritePosition.NONE, tickIndex);
     }
 
-    /** The active slots that could cover one write: they were declared for the very level the write
-     * arrives on, their write set names the write path it takes, and the range they carry is
-     * usable. A slot with no usable range covers nothing. */
     private List<Slot> candidates(Object levelRef, String domainKey) {
         List<Slot> found = new ArrayList<>();
         for (Slot slot : slots.values()) {
@@ -493,14 +463,13 @@ public final class WriteControlledSlots {
         return found;
     }
 
-    /** The identity a covering slot is counted under: two entries that name the same slot instance
-     * are one covering slot and not two, so only genuinely distinct ranges make a write ambiguous. */
+    // Two entries naming one slot instance are one covering slot, not two.
     private static String identityOf(Slot slot) {
         return slot.key().rank() + "#" + slot.slotGeneration();
     }
 
-    /** The exact range one seat was declared with, so a reader can verify whether a write is inside
-     * it against the cells themselves instead of against the fold. */
+    /** The exact range one seat was declared with, so a reader can verify membership against the
+     * cells instead of the fold. */
     public WriteSpace spaceOf(SlotKey key) {
         Slot slot = key == null ? null : slots.get(key);
         return slot == null ? WriteSpace.NONE : slot.space();
@@ -518,9 +487,6 @@ public final class WriteControlledSlots {
             slot.pathDigest(), slot.spaceDigest(), covering, reason);
     }
 
-    /** The contract of a covered write: the world, the holder the token names, the version the slot
-     * and the token expect, the generation, the expiry and the plan step the slot was frozen with.
-     * A term that cannot be read at all fails the same way a wrong one does. */
     private WriteRefusal inspect(Slot slot, String world, Source.Step step, long tickIndex,
                                  int covering) {
         SlotKey key = slot.key();
@@ -588,9 +554,6 @@ public final class WriteControlledSlots {
         return Refusal.NONE;
     }
 
-    /** Whether a slot carries a range that can be written into a key and whether its key spells
-     * that very range. A slot whose segment is not the token of the range it carries, or that
-     * carries no range at all, has an empty effective write set. */
     private static boolean namesItsSpace(Slot slot) {
         WriteSpace space = slot.space();
         return space.wellFormed() && SlotKey.segmentOf(space).equals(slot.key().segment());
@@ -642,7 +605,7 @@ public final class WriteControlledSlots {
         return rejected.get();
     }
 
-    /** How often a caller handed the table nothing to judge. It is counted on its own so the three
+    /** How often a caller handed the table nothing to judge, counted on its own so the three
      * verdicts stay the three a write can leave with. */
     public long notExecutableCount() {
         return notExecutable.get();
@@ -662,18 +625,16 @@ public final class WriteControlledSlots {
         return lastRefusal;
     }
 
-    /** The slot the last refusal was taken against, so a reader can name the slot as a whole. */
     public Slot lastRefusingSlot() {
         return lastRefusingSlot;
     }
 
-    /** The slot the newest judgement was taken against, captured or refused. The thread that made
-     * the write reads it to carry the claim of the write it just handed to the judged path. */
+    /** The slot the newest judgement was taken against, captured or refused: the thread that made
+     * the write reads it to carry the claim it just handed on. */
     public Slot lastCoveredSlot() {
         return lastCoveredSlot;
     }
 
-    /** Clears the counters and the slot table. */
     public void reset() {
         slots.clear();
         generations.clear();
