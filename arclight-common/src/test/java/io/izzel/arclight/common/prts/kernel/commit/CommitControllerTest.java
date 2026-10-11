@@ -102,13 +102,13 @@ class CommitControllerTest {
     }
 
     @Test
-    void aResetInsideThePublishActionWaitsForTheTerminalLine() {
+    void aResetInsideThePublishActionIsRefusedAndTheControllerEndsNoLifecycle() {
         Fixture f = new Fixture(2, 4096, 4);
         long epoch = f.epochs.current();
         CommitController[] holder = new CommitController[1];
         AtomicReference<String> during = new AtomicReference<>();
         holder[0] = new CommitController(f.reservations, ticket -> {
-            CommitController.ResetDecision decision = holder[0].resetAtSafePoint();
+            CommitController.ResetDecision decision = holder[0].enterReset();
             during.set(decision.reason() + "/" + (f.epochs.current() - epoch) + "/"
                 + f.reservations.outstanding() + "/" + f.reservations.publishing() + "/"
                 + f.log.reservedSlots() + "/" + f.store.capacitySlots());
@@ -120,18 +120,23 @@ class CommitControllerTest {
             "mid-publish nothing moved: not the epoch, not the ticket, not one reservation");
         assertTrue(result.admitted());
         assertEquals(CommitTicket.Terminal.PUBLISHED, result.terminal());
-        assertEquals(1L, f.epochs.current() - epoch, "the deferred reset moved the generation once");
-        assertEquals(1L, holder[0].resets());
-        assertEquals(1L, holder[0].deferredResets());
+        assertEquals(0L, f.epochs.current() - epoch,
+            "the refused request moves no generation, here or later on its own");
+        assertEquals(0L, holder[0].resets());
+        assertEquals(1L, holder[0].deferredResets(), "the request is counted where it was refused");
         assertEquals(1L, holder[0].resetReentrantRefusals());
-        assertFalse(holder[0].pendingReset());
         assertEquals(0, f.reservations.outstanding());
         assertEquals(0, f.log.reservedSlots());
         assertEquals(0, f.store.capacitySlots());
-        assertEquals(1, f.log.lastResetTyped().typedSteps().size(),
-            "the line was recorded before the reset ended the lifecycle");
-        assertEquals(7L, f.log.lastResetTyped().typedSteps().get(0).planSequence());
-        assertEquals(0L, f.log.sequence(), "the reset started the log over after the line was read");
+        assertEquals(1L, f.log.sequence(), "the line the action wrote is still the line of this log");
+        assertNull(f.log.lastResetTyped(),
+            "and the log carries no terminal projection at all: the controller ended no lifecycle");
+
+        CommitController.ResetDecision granted = holder[0].enterReset();
+        assertTrue(granted.granted(), "the safe point after the action is where the request lands");
+        assertEquals(1L, granted.epoch(), "the generation moves there, and once");
+        assertEquals(1L, f.log.sequence(),
+            "the log of the chain still carries its line: ending a lifecycle is not the controller's");
 
         CommitReservation.FinalizeResult late = f.reservations.finalize(result.ticket(),
             outcome(CommitTicket.Terminal.PUBLISHED, 3));
@@ -437,7 +442,7 @@ class CommitControllerTest {
             AtomicReference<CommitController.ResetDecision> reset = new AtomicReference<>();
             pool.submit(() -> {
                 reserved.set(f.reservations.reserve(f.request(2)));
-                reset.set(controller.resetAtSafePoint());
+                reset.set(controller.enterReset());
             }).get(30, TimeUnit.SECONDS);
 
             assertFalse(reserved.get().admitted());

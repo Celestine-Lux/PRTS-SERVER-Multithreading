@@ -4,20 +4,14 @@ package io.izzel.arclight.common.prts.kernel.commit;
 import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 
 /** The one control path of a controlled write: validate, reserve, publish, finalize, record. The
- * first two steps happen before the first side effect, so an order refusal or a capacity refusal
- * leaves the publish action uncalled; the last two happen whatever the publish action did, so a
- * published line, a partial one and a failed one each end exactly once.
+ * first two steps happen before the first side effect, so an order or a capacity refusal leaves the
+ * action uncalled; the last two happen whatever it did, so every line ends exactly once.
  *
- * <p>The publish action is a function handed in here. In this build it is a synthetic action and
- * nothing else: no host supplier is bound, no world is written, and the controller has no production
- * caller. The column that says so reads SYNTHETIC.
- *
- * <p>The controller is confined to the owner thread of the reservations it judges, and its reset is a
- * safe point: while a publish action is running, or while a line is publishing, a destructive reset is
- * refused and remembered as pending. It is carried out at the next safe point, after the terminal line
- * of every in-flight reservation was recorded, and the reset generation moves by one only when that
- * happens. A request that arrives from another thread is refused there and taken over to that same
- * safe point instead of running on the caller's thread. */
+ * <p>The action is handed in, and the controller is confined to the owner thread of the reservations
+ * it judges. A build without an action refuses every request before the reservation is touched,
+ * instead of reporting a run that never happened. Its reset is a safe point: while an action runs or
+ * a line publishes, a destructive reset is refused and owed by the caller, and ending the lifecycle
+ * of a log is not expressible here at all. */
 public final class CommitController {
 
     /** What one publish action is. It reports the state it reached and the units it published. */
@@ -40,8 +34,8 @@ public final class CommitController {
     private final CommitReservation reservations;
     private final Publisher publisher;
     private int publishDepth;
-    private volatile boolean pendingReset;
     private long submits;
+    private long notWiredRefusals;
     private long supplierCalls;
     private long acceptedPublished;
     private long publishedUnits;
@@ -50,13 +44,14 @@ public final class CommitController {
     private long publishFailures;
     private long resetReentrantRefusals;
     private long resetWhilePublishing;
+    private long resetPendingDispositions;
     private long resetOffThread;
     private long resetHandOffs;
     private long resets;
     private long deferredResets;
 
-    /** The owner thread is the one the reservations were bound to and is asked of them on every
-     * call: a holder that re-bound would otherwise be judged by a thread the controller remembered. */
+    /** The owner is asked of the reservations on every call: a holder that re-bound would otherwise
+     * be judged by a thread the controller remembered. */
     public CommitController(CommitReservation reservations, Publisher publisher) {
         this.reservations = reservations;
         this.publisher = publisher;
@@ -71,14 +66,24 @@ public final class CommitController {
         return publisher == null ? "NONE" : "SYNTHETIC";
     }
 
-    /** Runs the whole path for one controlled write, on the owner thread. */
+    /** Whether this build has an action to run: bound and able to run are two columns. */
+    public boolean executable() {
+        return publisher != null;
+    }
+
+    /** Runs the whole path for one controlled write, on the owner thread. A build with no action
+     * refuses the request after the owner is judged and before anything is moved. */
     public SubmitResult submit(CommitTicket.ReserveRequest request) {
         if (!reservations.ownsThread()) {
             refusals++;
             return new SubmitResult(false, null, RejectCode.COUNTER_MISSING, "off-owner-thread", 0, 0L,
                 null);
         }
-        drainPendingReset();
+        if (publisher == null) {
+            notWiredRefusals++;
+            return new SubmitResult(false, null, RejectCode.NATIVE_UNDECLARED, "not-wired", 0, 0L,
+                null);
+        }
         submits++;
         CommitReservation.ReserveResult reserved = reservations.reserve(request);
         if (!reserved.admitted()) {
@@ -87,8 +92,7 @@ public final class CommitController {
         }
         CommitTicket ticket = reserved.ticket();
         if (!reservations.beginPublish(ticket)) {
-            // The side effect does not run for a line the holder will not start: the reservation goes
-            // back rather than holding a slot for a line that never ran, and the caller is told so.
+            // A line the holder will not start gives its reservation back instead of holding it.
             reservations.release(ticket, CommitTicket.ReleaseReason.CANCELLED);
             refusals++;
             refusedStarts++;
@@ -101,15 +105,15 @@ public final class CommitController {
             acceptedPublished++;
             publishedUnits += done.unitCount();
         }
-        drainPendingReset();
         return new SubmitResult(done.finalized(), done.terminal(), done.code(), done.diagnostic(),
             done.successBatch(), done.unitCount(), ticket);
     }
 
     private CommitTicket.Outcome publish(CommitTicket ticket, CommitTicket.ReserveRequest request) {
         if (publisher == null) {
-            return new CommitTicket.Outcome(CommitTicket.Terminal.FAILED,
-                request.failed().operationKind(), request.failed().rows(), 0, "publisher-threw");
+            // Unreachable: submit refuses such a request before it reserves anything. Stood where a
+            // missing action was once turned into a terminal line.
+            throw new IllegalStateException("a request was admitted with no publish action to run");
         }
         publishDepth++;
         try {
@@ -128,8 +132,8 @@ public final class CommitController {
         }
     }
 
-    /** The owner safe point of a reset: the lifecycle is entered here, and only when nothing is
-     * publishing. The caller that owns the log runs its own reset after a granted decision. */
+    /** The owner safe point of a reset, entered only when nothing is publishing and no item waits
+     * for a disposition. What the holder of the log does with a granted decision comes after it. */
     public ResetDecision enterReset() {
         ResetDecision refusal = refuseReset();
         if (refusal != null) {
@@ -137,52 +141,38 @@ public final class CommitController {
         }
         CommitReservation.ResetResult onReset = reservations.onReset();
         long epoch = reservations.advanceReset();
-        pendingReset = false;
         resets++;
         return new ResetDecision(true, "reset-at-safe-point", onReset.voided(), onReset.publishing(),
             epoch);
     }
 
-    /** The same safe point where the controller also ends the lifecycle of the log it was built on. */
-    public ResetDecision resetAtSafePoint() {
-        ResetDecision decision = enterReset();
-        if (decision.granted()) {
-            reservations.log().reset();
-        }
-        return decision;
-    }
-
     private ResetDecision refuseReset() {
         long epoch = epoch();
         if (!reservations.ownsThread()) {
-            // Not run here and not dropped either: the request is taken over and lands at the next
-            // owner safe point, so the caller knows the generation it just read has not moved.
+            // Taken over rather than dropped: the caller knows the generation it read has not moved.
             resetOffThread++;
             resetHandOffs++;
-            pendingReset = true;
+            deferredResets++;
             return new ResetDecision(false, "off-owner-thread", 0, reservations.publishing(), epoch);
         }
         if (publishDepth > 0) {
             resetReentrantRefusals++;
-            pendingReset = true;
+            deferredResets++;
             return new ResetDecision(false, "reentrant-publish", 0, reservations.publishing(), epoch);
         }
         if (reservations.publishing() > 0) {
             resetWhilePublishing++;
-            pendingReset = true;
+            deferredResets++;
             return new ResetDecision(false, "publishing-in-flight", 0, reservations.publishing(), epoch);
         }
-        return null;
-    }
-
-    /** The whole reset the module asked for, run once at the owner safe point: a request taken over
-     * from another thread and a request refused inside a publish action both land here. */
-    public ResetDecision resetCarriedOut() {
-        if (!pendingReset) {
-            return new ResetDecision(false, "nothing-pending", 0, reservations.publishing(), epoch());
+        if (reservations.pendingCount() > 0) {
+            // A reset ends the generation such an item was minted under, and with it the window where
+            // its owner can still hand it a line. The reset waits for that disposition.
+            resetPendingDispositions++;
+            deferredResets++;
+            return new ResetDecision(false, "pending-dispositions", 0, reservations.publishing(), epoch);
         }
-        deferredResets++;
-        return resetAtSafePoint();
+        return null;
     }
 
     /** Ends this controller: nothing new is taken, every reservation that never published is given
@@ -191,24 +181,17 @@ public final class CommitController {
         return reservations.close();
     }
 
-    private void drainPendingReset() {
-        if (!pendingReset || publishDepth > 0 || reservations.publishing() > 0) {
-            return;
-        }
-        deferredResets++;
-        resetAtSafePoint();
-    }
-
-    public boolean pendingReset() {
-        return pendingReset;
-    }
-
     public long epoch() {
         return reservations.epoch();
     }
 
     public long submits() {
         return submits;
+    }
+
+    /** How often a request was refused because this build has no publish action to run it. */
+    public long notWiredRefusals() {
+        return notWiredRefusals;
     }
 
     /** How often the publish action was called. In this build that action is synthetic. */
@@ -246,6 +229,11 @@ public final class CommitController {
         return resetWhilePublishing;
     }
 
+    /** How often a reset was refused for an item that still waits for its terminal line. */
+    public long resetPendingDispositions() {
+        return resetPendingDispositions;
+    }
+
     public long resetOffThread() {
         return resetOffThread;
     }
@@ -258,6 +246,7 @@ public final class CommitController {
         return resets;
     }
 
+    /** How often a reset was refused where it was asked for and left to be carried out later. */
     public long deferredResets() {
         return deferredResets;
     }

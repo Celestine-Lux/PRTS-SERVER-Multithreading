@@ -1175,19 +1175,25 @@ public final class KernelModule {
         return control;
     }
 
-    /** The safe point a reset of the commit lifecycle is asked for: the lifecycle of the commit log
-     * is ended there too, so the reset this module carries out is complete. A build with no controller
-     * bound has no lifecycle to isolate and keeps the path it always had. */
-    private boolean commitSafePoint() {
+    /** Carries out one whole reset, once, at the owner safe point: the controller is asked first and
+     * nothing is cleared while it refuses, the counters of this module are cleared next, and the
+     * lifecycle of the commit log is ended inside that clear and nowhere else. A build with no
+     * controller bound has no lifecycle to isolate and keeps the path it always had. */
+    private boolean carryOutOwningReset() {
         CommitController controller = this.commitController;
-        if (controller == null) {
-            return true;
+        if (controller != null && !controller.enterReset().granted()) {
+            // The controller counts why it refused; the whole reset this module owes is held here and
+            // is carried out by the next request that reaches this safe point, not by the refusal.
+            resetPending = true;
+            return false;
         }
-        return controller.resetAtSafePoint().granted();
+        resetPending = false;
+        clearReadings();
+        return true;
     }
 
-    /** Binds the controller whose lifecycle this module ends when it clears its counters. With
-     * nothing bound the reset is the one it always was. */
+    /** Binds the controller that coordinates the reset this module carries out when it clears its
+     * counters. With nothing bound the reset is the one it always was. */
     public void bindCommitController(CommitController controller) {
         this.commitController = controller;
     }
@@ -1201,17 +1207,15 @@ public final class KernelModule {
         return resetPending;
     }
 
-    /** Carries out the reset this module owes, in full, once, at an owner safe point. Nothing is done
-     * when it owes none, and the lifecycle of the commit log is not reset a second time here: the
-     * controller carries that one out at its own safe point, and this call clears what is left. */
+    /** Carries out the reset this module owes, in full and once, at an owner safe point. Nothing is
+     * done when it owes none, and a request that was carried out leaves no debt behind: a second call
+     * over it moves neither the generation nor a count. A request refused again leaves the debt where
+     * it is for the call after it. */
     public boolean drainCommitReset() {
-        CommitController controller = this.commitController;
-        if (!resetPending || (controller != null && controller.reservations().publishing() > 0)) {
+        if (!resetPending) {
             return false;
         }
-        resetPending = false;
-        clearReadings();
-        return true;
+        return carryOutOwningReset();
     }
 
     /** Whether a controller is bound to this module: the readout says so of itself. */
@@ -1219,19 +1223,13 @@ public final class KernelModule {
         return commitController == null ? "NOT_WIRED" : "BOUND";
     }
 
-    /** Clears the live counters. Where a commit controller is bound, its owner safe point is asked
-     * first: while a publish action or a publishing line is in flight the whole reset is refused,
-     * nothing is cleared and no generation advances. */
+    /** Clears the live counters. Where a commit controller is bound, its owner safe point decides
+     * first: while a publish action or a publishing line is in flight, or while an item whose side
+     * effect ran still waits for its terminal line, the whole reset is refused, nothing is cleared and
+     * no generation advances. The request is a request for the whole reset and is never carried out
+     * anywhere but in {@link #carryOutOwningReset()}. */
     public void resetReadings() {
-        if (!commitSafePoint()) {
-            // The module owns the request, and it is a request for the whole reset and not only for the
-            // lifecycle of the commit log: nothing is cleared now, and the request is carried out once
-            // at the next safe point this module is asked to clear at.
-            resetPending = true;
-            return;
-        }
-        resetPending = false;
-        clearReadings();
+        carryOutOwningReset();
     }
 
     private void clearReadings() {

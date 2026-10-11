@@ -181,10 +181,13 @@ class CommitControllerLifecycleTest {
                 "a reservation that never publishes at round " + round);
             assertBalance(f.reservations, "with one item in flight at round " + round);
 
-            CommitController.ResetDecision decision = controller.resetAtSafePoint();
+            CommitController.ResetDecision decision = controller.enterReset();
             assertTrue(decision.granted(), "round " + round);
             assertEquals(round + 1L, decision.epoch(), "the generation moved by one at round " + round);
             assertEquals(1, decision.voided(), "the item that never published is given back");
+            // The decision is the controller's; ending the lifecycle of the log is the work of the
+            // holder that owns it and happens after a granted decision, never inside one.
+            f.log.reset();
             assertBalance(f.reservations, "after a reset at round " + round);
             assertTrue(f.reservations.terminalLedger().size() <= 64,
                 "the terminal ledger stays bounded at round " + round);

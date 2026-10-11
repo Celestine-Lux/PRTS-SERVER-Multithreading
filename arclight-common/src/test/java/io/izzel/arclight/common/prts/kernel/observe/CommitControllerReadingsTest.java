@@ -15,6 +15,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The face of the commit controller: what it reads while nothing is bound, and what the module
  * does with a reset while a line is publishing. */
@@ -90,7 +93,7 @@ class CommitControllerReadingsTest {
     }
 
     @Test
-    void aResetThatArrivesInsideAPublishActionClearsNothing() {
+    void aResetThatArrivesInsideAPublishActionClearsNothingAndIsCarriedOutOnceByTheModule() {
         System.setProperty("arclight.prts.kernel", "true");
         EffectStore store = new EffectStore(4096, 8);
         CommitLog.OrderSource plans = (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
@@ -99,25 +102,38 @@ class CommitControllerReadingsTest {
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         final CommitController[] holder = new CommitController[1];
         final String[] inside = new String[1];
+        KernelModule module = KernelModule.instance();
         holder[0] = new CommitController(reservations, ticket -> {
-            KernelModule.instance().resetReadings();
+            module.resetReadings();
             inside[0] = holder[0].resetReentrantRefusals() + "/" + holder[0].resets() + "/"
                 + epochs.current();
             return new CommitTicket.Outcome(CommitTicket.Terminal.PUBLISHED, "publish",
                 List.of("a=1"), 1, "");
         });
-        KernelModule.instance().bindCommitController(holder[0]);
+        module.bindCommitController(holder[0]);
         try {
             holder[0].submit(request(epochs, reservations));
             assertEquals("1/0/0", inside[0],
                 "the module asked for a reset inside the publish action and nothing was cleared");
-            assertEquals(1L, holder[0].resets(), "the deferred reset ran after the terminal line");
-            assertEquals(1L, holder[0].deferredResets());
-            assertEquals("BOUND", KernelModule.instance().commitControllerWiring());
+            assertEquals(0L, holder[0].resets(),
+                "the controller runs no reset of its own once the action is over");
+            assertEquals(1L, holder[0].deferredResets(), "the request is owed, and it is owed here");
+            assertTrue(module.commitResetPending());
+            assertEquals("BOUND", module.commitControllerWiring());
             assertEquals(1L, holder[0].acceptedPublished());
-            assertEquals(1, log.lastResetTyped().typedSteps().size());
+            assertEquals(1L, log.sequence(), "the log of the chain still carries the line it wrote");
+            assertNull(log.lastResetTyped(),
+                "and carries no projection at all: the controller ends no lifecycle of its own");
+
+            assertTrue(module.drainCommitReset(), "the module carries the reset it owes out, once");
+            assertEquals(1L, holder[0].resets());
+            assertEquals(1L, epochs.current(), "and the generation moves once for one request");
+            assertFalse(module.drainCommitReset(), "the same request is not carried out a second time");
+            assertEquals(1L, holder[0].resets());
+            assertEquals(1L, epochs.current());
+            assertFalse(module.commitResetPending());
         } finally {
-            KernelModule.instance().bindCommitController(null);
+            module.bindCommitController(null);
         }
     }
 

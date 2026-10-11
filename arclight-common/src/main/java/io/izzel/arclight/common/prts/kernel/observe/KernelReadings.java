@@ -850,19 +850,23 @@ public final class KernelReadings {
     }
 
     /** The face of the commit controller. With none bound every key of it reads zero, a dash or
-     * NOT_WIRED, and the publish action column says what the controller would run. */
+     * NOT_WIRED, and the publish action column says what the controller would run. Being bound and
+     * being able to run are two columns: a bound controller with no action reads executable zero. */
     private static void controllerFace(List<String> lines, KernelModule module, EffectStore effects) {
         CommitController controller = module.commitController();
         CommitReservation reservations = controller == null ? null : controller.reservations();
         add(lines, "product.commit.controller_wiring", module.commitControllerWiring());
         add(lines, "product.commit.controller_publisher",
             controller == null ? "NONE" : controller.publisherWiring());
+        add(lines, "product.commit.controller_executable",
+            controller != null && controller.executable() ? 1 : 0);
         add(lines, "product.commit.controller_owner",
             reservations == null ? "-" : reservations.controller().ownerId());
         add(lines, "product.commit.controller_reset_epoch", controller == null ? 0L : controller.epoch());
-        add(lines, "product.commit.controller_reset_pending",
-            controller != null && controller.pendingReset() ? 1 : 0);
+        add(lines, "product.commit.controller_reset_pending", module.commitResetPending() ? 1 : 0);
         add(lines, "product.commit.submits", controller == null ? 0L : controller.submits());
+        add(lines, "product.commit.not_wired_refusals",
+            controller == null ? 0L : controller.notWiredRefusals());
         add(lines, "product.commit.supplier_calls", controller == null ? 0L : controller.supplierCalls());
         add(lines, "product.commit.reserve_success",
             reservations == null ? 0L : reservations.reserveSuccess());
@@ -873,6 +877,9 @@ public final class KernelReadings {
         add(lines, "product.commit.publishing", reservations == null ? 0 : reservations.publishing());
         add(lines, "product.commit.pending_dispositions",
             reservations == null ? "-" : pendingDispositions(reservations));
+        add(lines, "product.commit.pending", reservations == null ? 0 : reservations.pendingCount());
+        add(lines, "product.commit.attention",
+            reservations != null && reservations.pendingCount() > 0 ? 1 : 0);
         add(lines, "product.commit.state_entries", reservations == null ? 0 : reservations.stateEntries());
         add(lines, "product.commit.finished_entries",
             reservations == null ? 0 : reservations.finishedEntries());
@@ -908,6 +915,8 @@ public final class KernelReadings {
             controller == null ? 0L : controller.resetWhilePublishing());
         add(lines, "product.commit.reset_reentrant_refusals",
             controller == null ? 0L : controller.resetReentrantRefusals());
+        add(lines, "product.commit.reset_pending_dispositions",
+            controller == null ? 0L : controller.resetPendingDispositions());
         add(lines, "product.commit.reset_handoffs", controller == null ? 0L : controller.resetHandOffs());
         add(lines, "product.commit.resets", controller == null ? 0L : controller.resets());
         add(lines, "product.commit.resets_deferred",

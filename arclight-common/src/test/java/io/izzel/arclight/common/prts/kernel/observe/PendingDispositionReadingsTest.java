@@ -116,11 +116,15 @@ class PendingDispositionReadingsTest {
 
             assertEquals("true/0/0", inside[0],
                 "the module owes the whole reset and nothing was cleared while the action ran");
-            assertEquals(1L, holder[0].resets(), "the lifecycle was reset once, at its safe point");
-            assertEquals(1L, epochs.current(), "and the generation moved once");
+            assertEquals(0L, holder[0].resets(),
+                "nothing ran the lifecycle before the module was asked to clear");
+            assertEquals(0L, epochs.current(), "and no generation moved with it");
             assertTrue(module.commitResetPending(), "the module still owes the clear of its counters");
             assertTrue(module.drainCommitReset(), "which it carries out at its next safe point");
             assertFalse(module.commitResetPending());
+            assertEquals(1L, holder[0].resets(), "the lifecycle is reset once, at that safe point");
+            assertEquals(1L, epochs.current(), "and the generation moves once with it");
+            assertFalse(module.drainCommitReset(), "the request is not carried out twice");
             assertEquals(1L, holder[0].resets(), "without ending a second lifecycle");
             assertEquals(1L, epochs.current());
         } finally {
