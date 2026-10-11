@@ -12,6 +12,7 @@ import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import io.izzel.arclight.common.prts.kernel.codes.RejectTrigger;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
+import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.support.PrtsChunkFlow;
 import io.izzel.arclight.common.prts.support.PrtsChunkMaterialization;
@@ -797,6 +798,35 @@ public final class KernelReadings {
             add(lines, prefix + "popped", ring.popped());
             add(lines, prefix + "refused_full", ring.refusedFull());
         }
+        versionedFace(lines, commits);
+    }
+
+    /** The declared versioned face of the commit log. Every key of it is new and only added: with
+     * the face off they read zero or a dash, the keys of the plain log are untouched, and the
+     * wiring column says of itself whether anything is bound in this build. */
+    private static void versionedFace(List<String> lines, CommitLog commits) {
+        KernelSettings.ProductCommit declared = KernelSettings.productCommit();
+        EffectStore effects = commits.effects();
+        add(lines, "product.commit.observation_only", 1);
+        add(lines, "product.commit.enabled", declared.enabled() ? 1 : 0);
+        add(lines, "product.commit.executable", declared.executable() ? 1 : 0);
+        add(lines, "product.commit.schema_version", declared.schemaVersion());
+        add(lines, "product.commit.effect_capacity_bytes", declared.effectCapacityBytes());
+        add(lines, "product.commit.effect_capacity_records", declared.effectCapacityRecords());
+        add(lines, "product.commit.effect_records", effects == null ? 0 : effects.records());
+        add(lines, "product.commit.effect_bytes", effects == null ? 0 : effects.bytes());
+        add(lines, "product.commit.effect_reserved_bytes", effects == null ? 0 : effects.reservedBytes());
+        add(lines, "product.commit.effect_pins", effects == null ? 0 : effects.pins());
+        add(lines, "product.commit.effect_evicted", effects == null ? 0L : effects.evicted());
+        add(lines, "product.commit.effect_missing", effects == null ? 0L : effects.missing());
+        add(lines, "product.commit.typed_stored", commits.typedStored());
+        add(lines, "product.commit.typed_refused", commits.typedRefused());
+        add(lines, "product.commit.identity_collisions", commits.identityCollisions());
+        add(lines, "product.commit.effect_missing_steps", commits.effectMissingSteps());
+        add(lines, "product.commit.reserved_slots", commits.reservedSlots());
+        add(lines, "product.commit.reservation_refusals", commits.reservationRefusals());
+        add(lines, "product.commit.refusal", declared.refusal().isEmpty() ? "-" : declared.refusal());
+        add(lines, "product.commit.store_wiring", effects == null ? "NOT_WIRED" : "BOUND");
     }
 
     private static String joinIds(List<Long> ids) {

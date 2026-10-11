@@ -14,7 +14,12 @@ import java.util.function.IntSupplier;
  * each (world, domain) pair keeps rising. The buffers are one ring per pair; the traversal that
  * closes the tick walks them in a fixed order and folds what it read, which is what a replayed run is
  * compared on. Nothing here sorts: the order is the plan's, and a report that contradicts it is
- * counted and dropped rather than reordered. */
+ * counted and dropped rather than reordered.
+ *
+ * <p>A report may also declare a schema version, the identity of the instance it published and the
+ * effect record it points at. That path takes the ring slot and the room of the record before it
+ * stores anything, and it copies the record into the replay before it releases the reference, while
+ * a report of the plain path keeps writing exactly the columns it always did. */
 public final class CommitLog {
 
     /** One commit a producer reached. The batch is the only shape that reaches the log, so no
@@ -44,6 +49,92 @@ public final class CommitLog {
         }
     }
 
+    /** The schema a line declares. Version 0 is the plain protocol: the plan order, the position
+     * and the write set of a step. Version 1 adds the typed columns. A line that declares nothing
+     * carries {@link #SCHEMA_UNDECLARED} and is never read as version 0. */
+    public static final int SCHEMA_UNDECLARED = -1;
+    public static final int SCHEMA_LEGACY = 0;
+    public static final int SCHEMA_TYPED = 1;
+
+    /** The declared default of the instance column: no product instance is numbered zero. */
+    public static final long NO_INSTANCE = 0L;
+
+    /** The declared default of the effect column: a line that points at no record. */
+    public static final long NO_EFFECT = 0L;
+
+    /** The declared default of the world generation column. */
+    public static final long NO_WORLD_EPOCH = 0L;
+
+    /** The declared default of the chunk column, read only under a declared schema. */
+    public static final long NO_CHUNK_POSITION = 0L;
+
+    /** The declared default of the authorization column: a write right that was not carried. */
+    public static final long NO_AUTHORIZATION_GENERATION = 0L;
+
+    /** Whether this build knows a schema version. */
+    public static boolean supportedSchema(int version) {
+        return version == SCHEMA_LEGACY || version == SCHEMA_TYPED;
+    }
+
+    /** The typed columns of one line. A line of the plain path carries {@link Identity#NONE}, which
+     * declares nothing: no schema, no instance, no effect. */
+    public record Identity(int schemaVersion, long instanceId, long worldEpoch, long chunkPos,
+                           String targetStatus, long authorizationGeneration, long effectRef,
+                           CommitNamespaces.Namespace producer,
+                           CommitNamespaces.Namespace controller) {
+
+        public static final Identity NONE = new Identity(SCHEMA_UNDECLARED, NO_INSTANCE, NO_WORLD_EPOCH,
+            NO_CHUNK_POSITION, "", NO_AUTHORIZATION_GENERATION, NO_EFFECT,
+            CommitNamespaces.Namespace.NONE, CommitNamespaces.Namespace.NONE);
+
+        public Identity {
+            targetStatus = targetStatus == null ? "" : targetStatus;
+            producer = producer == null ? CommitNamespaces.Namespace.NONE : producer;
+            controller = controller == null ? CommitNamespaces.Namespace.NONE : controller;
+        }
+
+        /** Whether every column a versioned line has to declare is there. A missing column is a
+         * refusal, not a default that reads as a value. */
+        public boolean declaredTyped() {
+            return schemaVersion == SCHEMA_TYPED && instanceId != NO_INSTANCE
+                && worldEpoch != NO_WORLD_EPOCH && !targetStatus.isEmpty()
+                && authorizationGeneration != NO_AUTHORIZATION_GENERATION && effectRef != NO_EFFECT
+                && producer.declared();
+        }
+    }
+
+    /** One versioned report: the plain report, the columns it declares and the effect it points at. */
+    public record TypedBatch(Batch batch, Identity identity, EffectStore.Effect effect) {
+    }
+
+    /** One step of the versioned projection: the plain step, the typed columns of the line and the
+     * effect record copied while the ring was read. A null effect could not be resolved. */
+    public record TypedStep(long planSequence, int position, long writeSetDigest, String worldId,
+                            String domainId, Identity identity, Entry.Disposition disposition,
+                            EffectStore.Recorded effect) {
+
+        public boolean effectResolved() {
+            return effect != null;
+        }
+    }
+
+    /** What closing one tick read in the versioned projection: the steps of the lines of the same
+     * traversal that declared no version, and the typed steps with the record each line pointed at.
+     * A versioned side that carries plain steps as well read two protocols in one tick and is
+     * refused by a comparison instead of being read as one of them. */
+    public record SchemaReplay(int schemaVersion, List<Entry.Step> plainSteps,
+                               List<TypedStep> typedSteps, int effectMissing) {
+
+        public SchemaReplay {
+            plainSteps = List.copyOf(plainSteps == null ? List.of() : plainSteps);
+            typedSteps = List.copyOf(typedSteps == null ? List.of() : typedSteps);
+        }
+    }
+
+    /** One ring slot handed out before anything is stored in it. */
+    public record RingSlot(String worldId, String domainId, long ticket) {
+    }
+
     /** The one entry a producer reaches. A producer with no sink bound keeps its own path unchanged;
      * a producer with one reports what it did and is answered whether that was the planned order. The
      * answer is a verdict, not an interception. */
@@ -68,7 +159,17 @@ public final class CommitLog {
     public record Entry(long sequence, long tickIndex, long planSequence, int position,
                         String worldId, String domainId, String nodeKey, long handle, Batch.Kind kind,
                         long expectedVersion, long writeSetDigest, int rows, Disposition disposition,
-                        RejectCode code, boolean intent) {
+                        RejectCode code, boolean intent, Identity identity) {
+
+        /** The line of a report of the plain path: the same columns as before, with the versioned
+         * ones at their declared defaults. */
+        public Entry(long sequence, long tickIndex, long planSequence, int position, String worldId,
+                     String domainId, String nodeKey, long handle, Batch.Kind kind, long expectedVersion,
+                     long writeSetDigest, int rows, Disposition disposition, RejectCode code,
+                     boolean intent) {
+            this(sequence, tickIndex, planSequence, position, worldId, domainId, nodeKey, handle, kind,
+                expectedVersion, writeSetDigest, rows, disposition, code, intent, Identity.NONE);
+        }
 
         /** What the log did with one reached commit. */
         public enum Disposition {
@@ -144,10 +245,32 @@ public final class CommitLog {
     private int watermarks;
     private Replay last;
     private long firstDivergencePosition = -1L;
+    private final EffectStore effects;
+    private final Map<Long, RingSlot> heldSlots = new LinkedHashMap<>();
+    private final Map<String, Integer> slotsByKey = new LinkedHashMap<>();
+    private final Map<String, String> instanceNamespaces = new LinkedHashMap<>();
+    private SchemaReplay lastSchema;
+    private long slotTickets;
+    private long reservationsTaken;
+    private long reservationsReleased;
+    private long reservationsConsumed;
+    private long reservationRefusals;
+    private long typedStored;
+    private long typedRefused;
+    private long identityCollisions;
+    private long effectMissingSteps;
 
     public CommitLog(IntSupplier ringCapacity, OrderSource source) {
+        this(ringCapacity, source, null);
+    }
+
+    /** The same log with an effect store bound. A log with no store cannot execute a versioned
+     * report: it answers a refusal instead of writing a line whose effect nothing could resolve,
+     * which is the state of the running server today. */
+    public CommitLog(IntSupplier ringCapacity, OrderSource source, EffectStore effects) {
         this.ringCapacity = ringCapacity;
         this.source = source;
+        this.effects = effects;
     }
 
     /** Opens one tick. The rings keep what a previous tick did not read, so a slow reader never loses
@@ -191,13 +314,7 @@ public final class CommitLog {
                 lastPlanOfRing.put(key(batch.worldId(), batch.domainId()), planSequence);
                 lastPositionOfRing.put(key(batch.worldId(), batch.domainId()), (int) position);
             }
-            disposition = switch (batch.kind()) {
-                case APPLY -> Entry.Disposition.ACCEPTED;
-                case MERGE -> Entry.Disposition.MERGED;
-                case INTENT -> Entry.Disposition.INTENT;
-                case RETRY -> Entry.Disposition.RETRIED;
-                case DROP -> Entry.Disposition.DROPPED;
-            };
+            disposition = dispositionOf(batch.kind());
             switch (disposition) {
                 case ACCEPTED -> accepted++;
                 case MERGED -> merged++;
@@ -211,6 +328,15 @@ public final class CommitLog {
             batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(),
             disposition, code, intent);
         CommitRing ring = ring(batch.worldId(), batch.domainId());
+        if (freeSlots(ring) <= 0) {
+            // The room a ring has is what its capacity leaves after the slots already handed out, so
+            // a plain report never takes a slot a versioned commit is holding. With no slot held the
+            // answer is the one the ring itself gives, refusal code and counters included.
+            refusedFull++;
+            dropped++;
+            return new Verdict(false, Entry.Disposition.DROPPED, RejectCode.QUEUE_CAP_EXCEEDED,
+                sequence, (int) position);
+        }
         CommitRing.Push push = ring.push(entry);
         if (!push.stored()) {
             refusedFull++;
@@ -228,6 +354,8 @@ public final class CommitLog {
         List<String> keys = new ArrayList<>(rings.keySet());
         keys.sort(String::compareTo);
         List<Entry.Step> steps = new ArrayList<>();
+        List<Entry.Step> plain = new ArrayList<>();
+        List<TypedStep> typed = new ArrayList<>();
         long hash = OFFSET_BASIS;
         int read = 0;
         for (String key : keys) {
@@ -237,13 +365,30 @@ public final class CommitLog {
                 steps.add(entry.step());
                 hash = fold(hash, entry.planSequence() + ":" + entry.position() + ":"
                     + entry.writeSetDigest() + ":" + entry.disposition());
+                if (entry.identity().effectRef() != NO_EFFECT) {
+                    typed.add(typedStep(entry));
+                } else {
+                    plain.add(entry.step());
+                }
                 read++;
             }
         }
         Replay replay = new Replay(tickIndex, read, (int) orderViolations, orderViolations == 0L,
             hash, steps, watermarks);
         last = replay;
+        lastSchema = new SchemaReplay(typed.isEmpty() ? SCHEMA_UNDECLARED : SCHEMA_TYPED, plain, typed,
+            unresolvedOf(typed));
         return replay;
+    }
+
+    private static int unresolvedOf(List<TypedStep> typed) {
+        int unresolved = 0;
+        for (TypedStep step : typed) {
+            if (!step.effectResolved()) {
+                unresolved++;
+            }
+        }
+        return unresolved;
     }
 
     /** The replay of the newest closed tick. */
@@ -251,9 +396,189 @@ public final class CommitLog {
         return last;
     }
 
+    /** The versioned projection of the newest closed tick: the version the records declare, the
+     * plain steps of the same traversal, and the typed steps with the record each line pointed at. */
+    public SchemaReplay lastTyped() {
+        return lastSchema;
+    }
+
+    /** The effect store bound to this log, or null when nothing is bound. */
+    public EffectStore effects() {
+        return effects;
+    }
+
     /** The number of steps two runs of the same input differ in; -1 means one of them is missing. */
     public static int compareRuns(Replay left, Replay right) {
         return Replay.compare(left, right);
+    }
+
+    /** The versioned report: the plain report plus the columns it declares and the effect it points
+     * at. The ring slot and the room of the effect are taken before anything is stored, and a report
+     * that is refused leaves neither a line nor a record behind.
+     *
+     * <p>A refusal of this path takes no report number of its own: the ordinal counts the reports the
+     * log took, and a report that never reached the store is not one of them. */
+    public Verdict reachTyped(TypedBatch typed) {
+        if (typed == null || typed.batch() == null || typed.identity() == null
+            || typed.effect() == null) {
+            return typedRefusal(RejectCode.COUNTER_MISSING, -1);
+        }
+        if (effects == null) {
+            return typedRefusal(RejectCode.COUNTER_MISSING, -1);
+        }
+        Batch batch = typed.batch();
+        Identity identity = typed.identity();
+        if (identity.schemaVersion() != SCHEMA_TYPED || !identity.declaredTyped()
+            || identity.effectRef() != typed.effect().effectRef()) {
+            return typedRefusal(RejectCode.VERSION_MISMATCH, -1);
+        }
+        Resolved resolved = source == null ? null
+            : source.resolve(batch.worldId(), batch.domainId(), batch.nodeKey());
+        if (resolved == null) {
+            return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, -1);
+        }
+        int position = resolved.position();
+        if (!ascending(batch.worldId(), batch.domainId(), resolved.planSequence(), position)) {
+            return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, position);
+        }
+        String namespace = namespaceOf(identity);
+        String instanceKey = key(batch.worldId(), batch.domainId()) + "/" + identity.instanceId();
+        String held = instanceNamespaces.get(instanceKey);
+        if (held != null && !held.equals(namespace)) {
+            // The same instance number under another lifecycle is two instances wearing one name:
+            // the number alone is not an assertion that they are the same one.
+            identityCollisions++;
+            return typedRefusal(RejectCode.VERSION_MISMATCH, position);
+        }
+        CommitRing ring = ring(batch.worldId(), batch.domainId());
+        RingSlot slot = reserveSlot(batch.worldId(), batch.domainId());
+        if (slot == null) {
+            return typedRefusal(RejectCode.QUEUE_CAP_EXCEEDED, position);
+        }
+        EffectStore.Result charged = effects.reserve(typed.effect());
+        if (!charged.admitted()) {
+            releaseSlot(slot);
+            return typedRefusal(charged.code(), position);
+        }
+        EffectStore.Result stored = effects.commit(charged.slot(), typed.effect());
+        if (!stored.admitted()) {
+            releaseSlot(slot);
+            return typedRefusal(stored.code(), position);
+        }
+        Entry.Disposition disposition = dispositionOf(batch.kind());
+        Entry entry = new Entry(++sequence, tickIndex, resolved.planSequence(), position,
+            batch.worldId(), batch.domainId(), batch.nodeKey() == null ? "" : batch.nodeKey(), 0L,
+            batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(), disposition,
+            null, resolved.intent(), identity);
+        CommitRing.Push push = ring.push(entry);
+        if (!push.stored()) {
+            // A slot was held for this line, so a ring that still refuses it is a defect and not a
+            // shortage: the record and the reservation go with it and no half line stays behind.
+            effects.unpin(identity.effectRef());
+            effects.evict(identity.effectRef());
+            releaseSlot(slot);
+            return typedRefusal(push.code(), position);
+        }
+        consumeSlot(slot);
+        lastPlanOfRing.put(key(batch.worldId(), batch.domainId()), resolved.planSequence());
+        lastPositionOfRing.put(key(batch.worldId(), batch.domainId()), position);
+        instanceNamespaces.put(instanceKey, namespace);
+        switch (disposition) {
+            case ACCEPTED -> accepted++;
+            case MERGED -> merged++;
+            case INTENT -> intents++;
+            case RETRIED -> retried++;
+            case DROPPED -> dropped++;
+        }
+        typedStored++;
+        watermarks = Math.max(watermarks, ring.depth());
+        return new Verdict(true, disposition, null, sequence, position);
+    }
+
+    /** Hands out one ring slot of a pair before anything is stored in it. While the slot is held the
+     * pair has that much less room, so a plain report cannot take it; a slot that is never filled is
+     * given back by {@link #releaseSlot}. */
+    public RingSlot reserveSlot(String worldId, String domainId) {
+        CommitRing ring = ring(worldId, domainId);
+        if (freeSlots(ring) <= 0) {
+            reservationRefusals++;
+            return null;
+        }
+        RingSlot slot = new RingSlot(worldId, domainId, ++slotTickets);
+        heldSlots.put(slot.ticket(), slot);
+        slotsByKey.merge(key(worldId, domainId), 1, Integer::sum);
+        reservationsTaken++;
+        return slot;
+    }
+
+    /** Gives back a slot that was not filled. */
+    public boolean releaseSlot(RingSlot slot) {
+        if (slot == null) {
+            return false;
+        }
+        String key = key(slot.worldId(), slot.domainId());
+        Integer held = slotsByKey.get(key);
+        if (held == null || held <= 0 || heldSlots.get(slot.ticket()) == null) {
+            return false;
+        }
+        heldSlots.remove(slot.ticket());
+        if (held == 1) {
+            slotsByKey.remove(key);
+        } else {
+            slotsByKey.put(key, held - 1);
+        }
+        reservationsReleased++;
+        return true;
+    }
+
+    /** Fills a held slot with the line that was reserved for it. */
+    private void consumeSlot(RingSlot slot) {
+        String key = key(slot.worldId(), slot.domainId());
+        Integer held = slotsByKey.get(key);
+        heldSlots.remove(slot.ticket());
+        if (held != null && held > 1) {
+            slotsByKey.put(key, held - 1);
+        } else {
+            slotsByKey.remove(key);
+        }
+        reservationsConsumed++;
+    }
+
+    private int freeSlots(CommitRing ring) {
+        return ring.capacity() - ring.depth() - slotsByKey.getOrDefault(ring.key(), 0);
+    }
+
+    private Verdict typedRefusal(RejectCode code, int position) {
+        typedRefused++;
+        return new Verdict(false, Entry.Disposition.DROPPED, code, sequence, position);
+    }
+
+    private static String namespaceOf(Identity identity) {
+        return identity.producer().text() + "|" + identity.controller().text();
+    }
+
+    private static Entry.Disposition dispositionOf(Batch.Kind kind) {
+        return switch (kind) {
+            case APPLY -> Entry.Disposition.ACCEPTED;
+            case MERGE -> Entry.Disposition.MERGED;
+            case INTENT -> Entry.Disposition.INTENT;
+            case RETRY -> Entry.Disposition.RETRIED;
+            case DROP -> Entry.Disposition.DROPPED;
+        };
+    }
+
+    private TypedStep typedStep(Entry entry) {
+        long effectRef = entry.identity().effectRef();
+        EffectStore.Recorded record = effects == null ? null : effects.record(effectRef);
+        if (record == null) {
+            effectMissingSteps++;
+        } else {
+            // The full normalized record is copied here, before the reference the line held is
+            // released: a reader of the replay never needs the store to still be holding it.
+            effects.unpin(effectRef);
+        }
+        return new TypedStep(entry.planSequence(), entry.position(), entry.writeSetDigest(),
+            entry.worldId(), entry.domainId(), entry.identity(), entry.disposition(), record);
     }
 
     private boolean ascending(String worldId, String domainId, long planSequence, long position) {
@@ -367,6 +692,48 @@ public final class CommitLog {
         return ringDepth();
     }
 
+    /** The ring slots handed out and neither filled nor given back. */
+    public int reservedSlots() {
+        return heldSlots.size();
+    }
+
+    public long reservationsTaken() {
+        return reservationsTaken;
+    }
+
+    public long reservationsReleased() {
+        return reservationsReleased;
+    }
+
+    public long reservationsConsumed() {
+        return reservationsConsumed;
+    }
+
+    public long reservationRefusals() {
+        return reservationRefusals;
+    }
+
+    /** The versioned reports the log took. */
+    public long typedStored() {
+        return typedStored;
+    }
+
+    /** The versioned reports the log refused, which took no report number of their own. */
+    public long typedRefused() {
+        return typedRefused;
+    }
+
+    /** The versioned reports refused because their instance number is already held by another
+     * lifecycle. */
+    public long identityCollisions() {
+        return identityCollisions;
+    }
+
+    /** The typed steps whose effect could not be resolved when the ring was read. */
+    public long effectMissingSteps() {
+        return effectMissingSteps;
+    }
+
     public void reset() {
         rings.clear();
         lastPlanOfRing.clear();
@@ -385,5 +752,18 @@ public final class CommitLog {
         watermarks = 0;
         last = null;
         firstDivergencePosition = -1L;
+        lastSchema = null;
+        heldSlots.clear();
+        slotsByKey.clear();
+        instanceNamespaces.clear();
+        slotTickets = 0L;
+        reservationsTaken = 0L;
+        reservationsReleased = 0L;
+        reservationsConsumed = 0L;
+        reservationRefusals = 0L;
+        typedStored = 0L;
+        typedRefused = 0L;
+        identityCollisions = 0L;
+        effectMissingSteps = 0L;
     }
 }

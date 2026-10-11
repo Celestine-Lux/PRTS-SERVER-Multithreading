@@ -98,6 +98,16 @@ public final class KernelSettings {
     /** Converges every commit producer on the commit log; off, each producer keeps its own path. */
     public static final String COMMIT_LOG = "commit-log";
 
+    /** Declares the versioned face of the commit log. */
+    public static final String PRODUCT_COMMIT = "product-commit";
+
+    /** The schema an operator declares for that face; the declared default declares none. */
+    public static final String PRODUCT_SCHEMA_VERSION = "product-schema-version";
+
+    public static final String EFFECT_CAPACITY_BYTES = "effect-capacity-bytes";
+
+    public static final String EFFECT_CAPACITY_RECORDS = "effect-capacity-records";
+
     /** Upper bound of the declarations one tick may hand to the planning period. */
     public static final String JOB_QUEUE_CAP = "job-queue-cap";
 
@@ -177,6 +187,32 @@ public final class KernelSettings {
     public static final int EXIT_WINDOW_TICKS_MAX = 6000;
 
     public static final int SAFETY_CASCADE_CAP_MAX = 64;
+
+    public static final int PRODUCT_SCHEMA_VERSION_MAX = 255;
+
+    public static final int EFFECT_CAPACITY_BYTES_MAX = 1 << 30;
+
+    public static final int EFFECT_CAPACITY_RECORDS_MAX = 1 << 20;
+
+    /** The schema of the versioned columns this build reads and writes. It is a protocol identifier
+     * and not a knob: another version is refused by name instead of being obeyed, and a test pins
+     * this number to the typed schema of the log. */
+    public static final int SUPPORTED_SCHEMA_VERSION = 1;
+
+    /** The declared default of the schema column: nothing was declared. */
+    public static final int SCHEMA_UNDECLARED = -1;
+
+    public static final String REFUSAL_SCHEMA = "unsupported-schema";
+
+    public static final String REFUSAL_EFFECT_BYTES = "effect-capacity-bytes";
+
+    public static final String REFUSAL_EFFECT_RECORDS = "effect-capacity-records";
+
+    /** The declared versioned face: what was asked for, whether this build can execute it, and the
+     * piece that is missing when it cannot, instead of an empty table that reads healthy. */
+    public record ProductCommit(boolean enabled, int schemaVersion, int effectCapacityBytes,
+                                int effectCapacityRecords, boolean executable, String refusal) {
+    }
 
     private KernelSettings() {
     }
@@ -373,6 +409,25 @@ public final class KernelSettings {
 
     public static int planHistoryCap() {
         return clamp(number(PLAN_HISTORY_CAP), 1, PLAN_HISTORY_CAP_MAX);
+    }
+
+    public static ProductCommit productCommit() {
+        boolean enabled = feature(PRODUCT_COMMIT);
+        int schemaVersion = number(PRODUCT_SCHEMA_VERSION);
+        int capacityBytes = number(EFFECT_CAPACITY_BYTES);
+        int capacityRecords = number(EFFECT_CAPACITY_RECORDS);
+        String refusal = "";
+        if (enabled) {
+            if (schemaVersion != SUPPORTED_SCHEMA_VERSION) {
+                refusal = REFUSAL_SCHEMA;
+            } else if (capacityBytes <= 0) {
+                refusal = REFUSAL_EFFECT_BYTES;
+            } else if (capacityRecords <= 0) {
+                refusal = REFUSAL_EFFECT_RECORDS;
+            }
+        }
+        return new ProductCommit(enabled, schemaVersion, capacityBytes, capacityRecords,
+            enabled && refusal.isEmpty(), refusal);
     }
 
     public static boolean safetyNet() {

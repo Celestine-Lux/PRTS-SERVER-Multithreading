@@ -243,6 +243,15 @@ public final class PrtsConfigManager {
                 + "# of each world and domain pair keeps rising, keeps it in a ring per pair and folds\n"
                 + "# what it read so a replayed run can be compared with the run that happened. The log\n"
                 + "# records and judges; it does not intercept a write.\n"
+                + "# 'product-commit: false' leaves the log writing exactly the columns it always wrote.\n"
+                + "# On, a report may declare a schema version, the identity of the instance it published\n"
+                + "# and the effect record it points at: the ring slot and the room of the record are taken\n"
+                + "# before anything is stored, and the record is copied into the replay before the line\n"
+                + "# lets its reference go. 'product-schema-version' declares which schema is wanted; the\n"
+                + "# declared default declares none and any version this build does not know is refused by\n"
+                + "# name instead of being obeyed. The store is in memory only, and the room it gets is\n"
+                + "# 'effect-capacity-bytes' and 'effect-capacity-records': a face that is switched on with\n"
+                + "# no room is not executable and names the piece that is missing.\n"
                 + "# 'job-queue-cap' is the upper bound of the declarations one tick may hand to the\n"
                 + "# planning period, 'commit-ring-cap' the capacity of one world and domain ring and\n"
                 + "# 'plan-history-cap' how many recent plans an order may be resolved against.\n"
@@ -301,6 +310,7 @@ public final class PrtsConfigManager {
         features.put("job-graph", false);
         features.put("pipeline-jobs", false);
         features.put("commit-log", false);
+        features.put("product-commit", false);
         features.put("safety-net", false);
         features.put("safety-degrade", false);
         features.put("dual-exits", false);
@@ -330,6 +340,9 @@ public final class PrtsConfigManager {
         numbers.put("job-queue-cap", new IntSetting(256, 1, 4096));
         numbers.put("commit-ring-cap", new IntSetting(512, 1, 65536));
         numbers.put("plan-history-cap", new IntSetting(8, 1, 64));
+        numbers.put("product-schema-version", new IntSetting(-1, -1, 255));
+        numbers.put("effect-capacity-bytes", new IntSetting(0, 0, 1 << 30));
+        numbers.put("effect-capacity-records", new IntSetting(0, 0, 1 << 20));
         numbers.put("safety-zero-effect-ticks", new IntSetting(100, 1, 6000));
         numbers.put("safety-cascade-cap", new IntSetting(3, 1, 64));
         numbers.put("exit-window-ticks", new IntSetting(20, 1, 6000));
