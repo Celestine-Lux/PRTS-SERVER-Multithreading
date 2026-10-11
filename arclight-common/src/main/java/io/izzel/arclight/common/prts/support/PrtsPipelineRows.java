@@ -28,6 +28,12 @@ public final class PrtsPipelineRows {
         void ownerTask(String world, String mailbox);
 
         void ownerRound(String world, String mailbox);
+
+        default void ownerTaskBegin(String world, String mailbox) {
+        }
+
+        default void ownerTaskEnd(String world, String mailbox) {
+        }
     }
 
     private static volatile MailboxRowTap tap;
@@ -111,6 +117,20 @@ public final class PrtsPipelineRows {
         String world = worldOf(mailbox);
         for (MailboxOwnerTap watcher : ownerTaps) {
             watcher.ownerRound(world, name);
+        }
+    }
+
+    public static void ownerTaskBegin(Object mailbox, String name) {
+        String world = worldOf(mailbox);
+        for (MailboxOwnerTap watcher : ownerTaps) {
+            watcher.ownerTaskBegin(world, name);
+        }
+    }
+
+    public static void ownerTaskEnd(Object mailbox, String name) {
+        String world = worldOf(mailbox);
+        for (MailboxOwnerTap watcher : ownerTaps) {
+            watcher.ownerTaskEnd(world, name);
         }
     }
 }

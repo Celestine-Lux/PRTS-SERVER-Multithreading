@@ -52,6 +52,11 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
     private volatile ArrivalWriteTap arrivalTap;
     private volatile WriteVersionSlots versions = WriteVersionSlots.NOTHING;
     private volatile WriteControlledSlots controlled = WriteControlledSlots.NOTHING;
+    private volatile ClaimLandedTap claimLanded;
+    /** The claim of the write the short path just handed over, held on the thread that made it. */
+    private final ThreadLocal<WriteControlledSlots.Slot> pendingClaim = new ThreadLocal<>();
+    private final LongAdder claimedWrites = new LongAdder();
+    private final LongAdder landedWrites = new LongAdder();
 
     /** Creates the guard. */
     public WorldWriteGuard(WritePathCounters counters, WriteAuthority authority, IntentQueue intents,
@@ -79,6 +84,24 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
      * table is wired in, no write is covered and every write keeps the path it had. */
     public void controlledSlots(WriteControlledSlots slots) {
         this.controlled = slots == null ? WriteControlledSlots.NOTHING : slots;
+    }
+
+    /** One write a claim captured and the judged path took: it landed in the world, and the batch
+     * it belongs to is what a commit log orders. Only a write that proceeded is reported. */
+    public interface ClaimLandedTap {
+
+        void landed(WriteControlledSlots.Slot claim, String worldId, long tickIndex);
+    }
+
+    /** Names the entry a landed claim is reported to. A null tap keeps the write path as it was. */
+    public void claimLandedTap(ClaimLandedTap tap) {
+        this.claimLanded = tap;
+    }
+
+    /** Whether the calling thread is the one the short path judges writes on. A claim is only seated
+     * for that thread, because a write of any other thread never reaches the claim table. */
+    public boolean onServerThread() {
+        return Thread.currentThread() == serverThread;
     }
 
     /** The per tick write face: one call per write attempt, from the thread about to write. */
@@ -152,8 +175,18 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
             // A write a declared slot covers does not take the short path: it is handed to the judged
             // path below, which is where a claim is decided and where a refused claim is refused. A
             // write no slot covers is not a domain write and keeps the short path unchanged.
-            if (controlled.judge(levelRef, WritePath.BLOCK_WRITE.key(), tickIndex).verdict()
-                != WriteControlledSlots.Verdict.DEFAULT_PATH) {
+            WriteControlledSlots.Decision decision =
+                controlled.judge(levelRef, WritePath.BLOCK_WRITE.key(), tickIndex);
+            if (decision.verdict() != WriteControlledSlots.Verdict.DEFAULT_PATH) {
+                // A captured claim is handed to the judged path on this thread, so the attempt that
+                // follows is built from the claim and not from the write path it arrived on. A claim
+                // that was refused carries no identity: its write is judged as the write path write
+                // it was, and the refusal stays readable on the claim face.
+                pendingClaim.remove();
+                if (decision.verdict() == WriteControlledSlots.Verdict.CAPTURED) {
+                    pendingClaim.set(controlled.lastCoveredSlot());
+                    claimedWrites.increment();
+                }
                 return JUDGE;
             }
             counters.noteAttempt(WritePath.BLOCK_WRITE, ThreadOrigin.MAIN, serverHolder.kind());
@@ -177,6 +210,11 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         ThreadOrigin origin = thread == serverThread ? ThreadOrigin.MAIN : ThreadOrigin.WORKER;
         HolderIdentity holder = holderOf(thread);
         WritePath path = WritePath.BLOCK_WRITE;
+        WriteControlledSlots.Slot claim = pendingClaim.get();
+        if (claim != null && claim.levelRef() != levelRef) {
+            claim = null;
+        }
+        pendingClaim.remove();
         counters.noteAttempt(path, origin, holder.kind());
         ArrivalWriteTap arrival = arrivalTap;
         if (arrival != null) {
@@ -203,7 +241,9 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         } else {
             WriteVerdict verdict;
             try {
-                verdict = authority.authorize(attemptOf(path, origin, holder, worldId));
+                verdict = authority.authorize(claim == null
+                    ? attemptOf(path, origin, holder, worldId)
+                    : claimAttemptOf(path, claim, worldId));
             } catch (Throwable thrown) {
                 // The decision point left the attempt without a verdict; the pair has to say so.
                 counters.noteUnjudged(path, origin, holder.kind());
@@ -216,7 +256,19 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         if (code != null) {
             ledger.noteCode(code);
         }
-        lastDecision = new WriteDecision(path, origin, holder.kind(), disposition, code, holder.siteId(),
+        HolderKind decidedHolder = claim == null ? holder.kind() : claim.holderKind();
+        String decidedSite = claim == null ? holder.siteId() : claim.holderSiteId();
+        if (claim != null && !handedOver && disposition == WriteDisposition.GRANT) {
+            // The claim was captured and the judged path let the write through: the write lands, and
+            // the batch it belongs to is handed to whoever keeps the commit order. Nothing is
+            // reported for a write that was refused or deferred.
+            landedWrites.increment();
+            ClaimLandedTap tap = claimLanded;
+            if (tap != null) {
+                tap.landed(claim, worldId, tickIndex);
+            }
+        }
+        lastDecision = new WriteDecision(path, origin, decidedHolder, disposition, code, decidedSite,
             thread.getName(), worldId, tickIndex);
         return !handedOver && !(enforce && disposition == WriteDisposition.DENY);
     }
@@ -279,6 +331,16 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         return foreignCommits.sum();
     }
 
+    /** The writes a claim captured and the short path handed to the judged path. */
+    public long claimedWrites() {
+        return claimedWrites.sum();
+    }
+
+    /** The captured writes the judged path let through, so they landed in the world. */
+    public long landedWrites() {
+        return landedWrites.sum();
+    }
+
     public long staleWorldRefusals() {
         return staleWorldRefusals.sum();
     }
@@ -288,6 +350,9 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         counters.reset();
         nextAttemptId.set(1L);
         lastDecision = null;
+        pendingClaim.remove();
+        claimedWrites.reset();
+        landedWrites.reset();
     }
 
     private HolderIdentity holderOf(Thread thread) {
@@ -309,6 +374,23 @@ public final class WorldWriteGuard implements PrtsWorldWriteTaps.BlockWriteTap, 
         }
         payloads.drop(handle);
         return RejectCode.QUEUE_CAP_EXCEEDED;
+    }
+
+    /** The attempt of a write a claim covers: the write is made under the identity of the job that
+     * claimed it, for the domain and level that job declared, against the version its slot carries
+     * and for the write set its declaration froze. */
+    private WriteAttempt claimAttemptOf(WritePath path, WriteControlledSlots.Slot claim,
+                                        String worldId) {
+        Set<String> writeSet = claim.writeSet();
+        return WriteAttempt.builder(nextAttemptId.getAndIncrement(), worldId, claim.holderSiteId())
+            .holder(claim.holderKind(), claim.holderSiteId(), Thread.currentThread().getName())
+            .target(claim.key().level(), claim.key().domainId())
+            .domains(writeSet, writeSet)
+            .version(claim.expectedVersion(), tickIndex, claim.key().planSequence())
+            .worldEpoch(claim.worldEpoch())
+            .declaredWorld(claim.key().worldId())
+            .admitted(true)
+            .build();
     }
 
     private WriteAttempt attemptOf(WritePath path, ThreadOrigin origin, HolderIdentity holder,

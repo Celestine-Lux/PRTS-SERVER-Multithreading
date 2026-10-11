@@ -64,6 +64,7 @@ import io.izzel.arclight.common.prts.kernel.observe.RegionIdentityObserver;
 import io.izzel.arclight.common.prts.kernel.observe.SaveIdentityObserver;
 import io.izzel.arclight.common.prts.kernel.observe.StallAttributionObserver;
 import io.izzel.arclight.common.prts.kernel.observe.TickDigestObserver;
+import io.izzel.arclight.common.prts.kernel.domain.entity.LiveEntityAccess;
 import io.izzel.arclight.common.prts.kernel.meter.SelfCostTap;
 import io.izzel.arclight.common.prts.support.PrtsChunkMaterialization;
 import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
@@ -147,7 +148,7 @@ public final class KernelModule {
     private final WriteVersionSlots versionSlots = new WriteVersionSlots();
     private final OwnerGrantPoint ownerGrants = new OwnerGrantPoint(owners, versionSlots);
     private final WriteControlledSlots controlledSlots = new WriteControlledSlots(owners, versionSlots,
-        guard.worldEpochs(), WriteControlledSlots.Source.NONE);
+        guard.worldEpochs(), new ClaimSource());
     private final WaitPointRegistry waitPoints = new WaitPointRegistry(KernelSettings::waitBoundMs,
         KernelSettings::refuseUnregisteredWaits);
     private final WaitSiteObserver waitSites = new WaitSiteObserver(waitPoints, this::tickIndex,
@@ -177,6 +178,8 @@ public final class KernelModule {
     private final JobIntake jobIntake = new JobIntake(KernelSettings::jobQueueCap);
     private final JobScheduler scheduler = new JobScheduler();
     private final PipelineRoundJobs pipelineJobs = new PipelineRoundJobs();
+    private final PipelineWriteClaims claims = new PipelineWriteClaims(versionSlots,
+        guard.worldEpochs(), guard::onServerThread, LiveEntityAccess::level);
     private final ShareMeterPoint jobMeter = new ShareMeterPoint();
     private final TickPlanStore plans = new TickPlanStore(KernelSettings.planHistoryCap());
     private final SafetyNet safety = new SafetyNet(KernelSettings::safetyDegrade,
@@ -190,6 +193,7 @@ public final class KernelModule {
     private boolean waitSiteTapInstalled;
     private boolean pipelineRowTapInstalled;
     private boolean pipelineOwnerTapInstalled;
+    private boolean claimsTapInstalled;
     private long jobDeclarations;
     private long lastDispatchHandedOut;
     private boolean loadProbeInstalled;
@@ -214,6 +218,10 @@ public final class KernelModule {
         intents.bindPayload(guard);
         guard.versionSlots(versionSlots);
         guard.controlledSlots(controlledSlots);
+        // The claim point seats the slot a declared job covers and reports the batches that landed;
+        // the guard hands a captured write over to it and the judged path decides the write.
+        claims.table(controlledSlots);
+        guard.claimLandedTap((slot, worldId, tick) -> claims.noteLanded(slot, worldId));
         // The progress side of the two rows whose producer already exists: the intent channel depth
         // and the world epoch change count are the same counters the readout publishes, so a signal
         // reading and its control-plane value can never disagree.
@@ -254,6 +262,7 @@ public final class KernelModule {
             versionSlots.refresh(false);
             ownerGrants.refresh(false);
             controlledSlots.refresh(false);
+            claims.refresh(false);
             syncWaitSiteTap(false);
             syncPipelineRowTap(false);
             syncLoadProbe(false);
@@ -277,6 +286,9 @@ public final class KernelModule {
         versionSlots.noteWorlds(worldIds);
         ownerGrants.refresh(KernelSettings.writeOwnerGrants());
         controlledSlots.refresh(KernelSettings.writeControlledSlot());
+        claims.refresh(KernelSettings.writeControlledSlot() && KernelSettings.pipelineJobs()
+            && KernelSettings.tickPlan());
+        claims.noteTick(tickIndex);
         guard.refresh(KernelSettings.writePathGuard(),
             KernelSettings.enforceUnregisteredWrites(),
             KernelSettings.routeUnregisteredWrites(), tickIndex);
@@ -441,14 +453,23 @@ public final class KernelModule {
      * reads the same rows the digest reads and takes nothing away from it, and it is only installed
      * while a plan exists to consume the declarations. */
     private void syncPipelineOwnerTap(boolean wanted) {
-        if (pipelineOwnerTapInstalled == wanted) {
+        boolean claimTap = wanted && KernelSettings.writeControlledSlot();
+        if (pipelineOwnerTapInstalled == wanted && claimsTapInstalled == claimTap) {
             return;
         }
+        if (pipelineOwnerTapInstalled) {
+            PrtsPipelineRows.removeOwnerTap(pipelineJobs);
+        }
+        if (claimsTapInstalled) {
+            PrtsPipelineRows.removeOwnerTap(claims);
+        }
         pipelineOwnerTapInstalled = wanted;
+        claimsTapInstalled = claimTap;
         if (wanted) {
             PrtsPipelineRows.installOwnerTap(pipelineJobs);
-        } else {
-            PrtsPipelineRows.removeOwnerTap(pipelineJobs);
+        }
+        if (claimTap) {
+            PrtsPipelineRows.installOwnerTap(claims);
         }
     }
 
@@ -613,6 +634,13 @@ public final class KernelModule {
             plans.publish(result.plan());
             grantVersionSlots(result.plan());
             ownerGrants.apply(result.plan().graph(), tickIndex);
+            if (claimsEnabled()) {
+                // The span the pipeline just closed is reported to the commit log first, so the
+                // batches of a landed write are ordered by the plan that carries their node, and the
+                // declarations of the plan that just froze are taken for the span that follows.
+                claims.reportLanded(result.plan().graph(), this::noteLandedBatch);
+                claims.declare(result.plan().graph(), result.plan().planSequence(), tickIndex);
+            }
             if (KernelSettings.pipelineJobs() && KernelSettings.tickPlan()) {
                 dispatchFrozen(result.plan());
             }
@@ -647,6 +675,24 @@ public final class KernelModule {
         lastDispatchHandedOut = handed;
     }
 
+    /** Whether a declared write set is turned into a claim in this tick. */
+    private boolean claimsEnabled() {
+        return KernelSettings.writeControlledSlot() && KernelSettings.pipelineJobs()
+            && KernelSettings.tickPlan();
+    }
+
+    /** Reports one batch a claim landed to the one write entry of the tick. The log resolves the
+     * order of the batch by the node the plan assigned it, and a batch no plan ordered is counted
+     * as unplanned rather than reordered. */
+    private void noteLandedBatch(PipelineWriteClaims.Report report) {
+        if (!KernelSettings.commitLog()) {
+            return;
+        }
+        commits.reach(new CommitLog.Batch(report.worldId(), report.domainId(), report.nodeKey(),
+            CommitLog.Batch.Kind.APPLY, report.expectedVersion(), report.writeSetDigest(),
+            report.rows()));
+    }
+
     /** Counts the declarations the domains handed to the planning period, whether the intake took
      * them or refused them: the count is what a reader of the job layer sees as declared. */
     public void noteJobDeclarations(int count) {
@@ -666,6 +712,11 @@ public final class KernelModule {
     /** The rounds of the chunk pipeline this kernel declares as jobs. */
     public PipelineRoundJobs pipelineJobs() {
         return pipelineJobs;
+    }
+
+    /** The claims the declared write sets of the chunk pipeline are turned into. */
+    public PipelineWriteClaims claims() {
+        return claims;
     }
 
     /** Grants the version slot of every write domain the frozen plan declares. The value is minted
@@ -778,6 +829,23 @@ public final class KernelModule {
         return TickPlanStore.Control.of(tickIndex, planSequence, generation, control.minMarginMs(),
             control.overrunHits(), control.waitBoundHits(), control.reserveRemainingMs(),
             control.degradeState());
+    }
+
+    /** The two facts the claim table cannot read from its own registries: which world a write is
+     * happening in, and which step the newest plan holds for a claim. A key no plan holds answers
+     * no step, and a claim whose step is missing is refused instead of captured. */
+    private final class ClaimSource implements WriteControlledSlots.Source {
+
+        @Override
+        public String worldOf(Object levelRef) {
+            return claims.worldOf(levelRef);
+        }
+
+        @Override
+        public Step stepOf(String worldId, String domainId, String nodeKey) {
+            TickPlanStore.StepRef ref = plans.resolve(worldId, domainId, nodeKey);
+            return ref == null ? null : new Step(ref.planSequence(), ref.position());
+        }
     }
 
     /** Resolves the order of one commit against the plans of the recent ticks. */
@@ -1149,6 +1217,7 @@ public final class KernelModule {
         jobIntake.reset();
         scheduler.reset();
         pipelineJobs.reset();
+        claims.reset();
         jobDeclarations = 0L;
         lastDispatchHandedOut = 0L;
         jobMeter.reset();

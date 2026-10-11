@@ -71,13 +71,19 @@ public final class WriteControlledSlots {
      * keys fold to the same digest, so the digest names a set wherever it is read - in the slot a
      * claim carries, and in the review that compares a declared set with the set actually held. */
     public static String fold(Collection<String> writeSet) {
+        return Long.toHexString(foldValue(writeSet));
+    }
+
+    /** The same fold as a value: a producer that reports a batch to the commit log names the write
+     * set of the batch by this number, and the two forms of one set are the same number. */
+    public static long foldValue(Collection<String> writeSet) {
         long hash = FOLD_BASIS;
         for (String key : new TreeSet<>(writeSet == null ? Set.of() : writeSet)) {
             for (int index = 0; index < key.length(); index++) {
                 hash = (hash ^ key.charAt(index)) * FOLD_PRIME;
             }
         }
-        return Long.toHexString(hash);
+        return hash;
     }
 
     /** One declared slot: the write set it covers and the contract a covered write has to satisfy.
@@ -173,6 +179,7 @@ public final class WriteControlledSlots {
     private volatile Decision lastDecision;
     private volatile WriteRefusal lastRefusal;
     private volatile Slot lastRefusingSlot;
+    private volatile Slot lastCoveredSlot;
 
     /** Creates the table. */
     public WriteControlledSlots(OwnerRegistry owners, WriteVersionSlots versions, WorldEpochs epochs,
@@ -242,6 +249,7 @@ public final class WriteControlledSlots {
             defaultPath.incrementAndGet();
             return lastDecision = Decision.defaultPath("");
         }
+        lastCoveredSlot = slot;
         String world = source.worldOf(levelRef);
         Source.Step step = source.stepOf(slot.key().worldId(), slot.key().domainId(),
             slot.planNodeKey());
@@ -412,6 +420,12 @@ public final class WriteControlledSlots {
         return lastRefusingSlot;
     }
 
+    /** The slot the newest judgement was taken against, captured or refused. The thread that made
+     * the write reads it to carry the claim of the write it just handed to the judged path. */
+    public Slot lastCoveredSlot() {
+        return lastCoveredSlot;
+    }
+
     /** Clears the counters and the slot table. */
     public void reset() {
         slots.clear();
@@ -429,5 +443,6 @@ public final class WriteControlledSlots {
         lastDecision = null;
         lastRefusal = null;
         lastRefusingSlot = null;
+        lastCoveredSlot = null;
     }
 }

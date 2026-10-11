@@ -2,6 +2,7 @@
 package io.izzel.arclight.common.prts.kernel.observe;
 
 import io.izzel.arclight.common.prts.kernel.KernelModule;
+import io.izzel.arclight.common.prts.kernel.PipelineWriteClaims;
 import io.izzel.arclight.common.prts.kernel.OwnerGrantPoint;
 import io.izzel.arclight.common.prts.kernel.auth.OwnerRegistry;
 import io.izzel.arclight.common.prts.kernel.auth.WriteLedger;
@@ -42,6 +43,7 @@ import io.izzel.arclight.common.prts.kernel.shares.ShareMeter;
 import io.izzel.arclight.common.prts.kernel.shares.SharePlanner;
 import io.izzel.arclight.common.prts.kernel.shares.ShareTable;
 import io.izzel.arclight.common.prts.kernel.sites.WorldWriteGuard.WriteDecision;
+import io.izzel.arclight.common.prts.kernel.sites.WriteClaimTable;
 import io.izzel.arclight.common.prts.kernel.sites.WritePath;
 import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots;
 import io.izzel.arclight.common.prts.kernel.sites.WritePathCounters;
@@ -100,6 +102,7 @@ public final class KernelReadings {
         exits(lines, module);
         pipelineRows(lines, module);
         pipelineJobs(lines, module);
+        pipelineClaims(lines, module);
         pipelineRights(lines, module);
         tickDigest(lines, module);
         arrivalDigest(lines, module);
@@ -1317,6 +1320,53 @@ public final class KernelReadings {
         add(lines, "r02.nodes_without_declaration", nodes - traced.size());
         for (int index = 0; index < traced.size(); index++) {
             add(lines, "r02.node." + (index + 1), traced.get(index));
+        }
+    }
+
+    /** The claim a declared write set became, one row per job the plan carries: the write set the
+     * claim table translated out of that declaration, the version the slot names and the writes the
+     * span landed. Zero values are published too, so a face nothing claimed is readable as the
+     * absence of a claim and not as a missing row. */
+    private static void pipelineClaims(List<String> lines, KernelModule module) {
+        PipelineWriteClaims claims = module.claims();
+        add(lines, "r02.claim.enabled", claims.enabled() ? 1 : 0);
+        add(lines, "r02.claim.table_domains", WriteClaimTable.domains().size());
+        add(lines, "r02.claim.table_paths", WriteClaimTable.PATHS);
+        add(lines, "r02.claim.table_rows",
+            String.join(",", WriteClaimTable.pathsOf(WriteClaimTable.CHUNK_PIPELINE)));
+        add(lines, "r02.claim.declared", claims.declaredCount());
+        add(lines, "r02.claim.active", claims.active());
+        add(lines, "r02.claim.open_windows", claims.openWindows());
+        add(lines, "r02.claim.seated", claims.seatedCount());
+        add(lines, "r02.claim.disarmed", claims.disarmedCount());
+        add(lines, "r02.claim.swept", claims.sweptCount());
+        add(lines, "r02.claim.refused", claims.refusedCount());
+        add(lines, "r02.claim.windows_unclaimed", claims.unclaimedWindowCount());
+        add(lines, "r02.claim.windows_unplaced", claims.unplacedWindowCount());
+        add(lines, "r02.claim.windows_off_thread", claims.offThreadWindowCount());
+        add(lines, "r02.claim.last_unclaimed_window",
+            claims.lastWindow().isEmpty() ? "none" : claims.lastWindow());
+        add(lines, "r02.claim.landed_writes", claims.landedWriteCount());
+        add(lines, "r02.claim.reported_batches", claims.reportedBatchCount());
+        add(lines, "r02.claim.landed_without_node", claims.landedWithoutNodeCount());
+        add(lines, "r02.claim.unclaimed_domain", claims.unclaimedDomainCount());
+        add(lines, "r02.claim.foreign_ref", claims.foreignRefCount());
+        add(lines, "r02.claim.empty_write_set", claims.emptyWriteSetCount());
+        add(lines, "r02.claim.no_mailbox", claims.noMailboxCount());
+        add(lines, "r02.claim.no_demand", claims.noDemandCount());
+        add(lines, "r02.claim.no_world", claims.noWorldCount());
+        add(lines, "r02.claim.no_version", claims.noVersionCount());
+        add(lines, "r02.claim.no_epoch", claims.noEpochCount());
+        List<PipelineWriteClaims.Claim> rows = claims.claims();
+        for (int index = 0; index < rows.size(); index++) {
+            PipelineWriteClaims.Claim claim = rows.get(index);
+            add(lines, "r02.claim.node." + (index + 1), "key=" + claim.nodeKey() + "|world="
+                + claim.worldId() + "|mailbox=" + claim.mailbox() + "|domain=" + claim.domainId()
+                + "|plan_sequence=" + claim.planSequence() + "|position=" + claim.position()
+                + "|write_set=" + String.join(",", claim.writeSet()) + "|expected_version="
+                + claim.expectedVersion() + "|world_epoch=" + claim.worldEpoch() + "|expire_tick="
+                + claim.expireTick() + "|holder=" + claim.holderSiteId() + "|landed="
+                + claims.landedOf(claim.nodeKey()));
         }
     }
 

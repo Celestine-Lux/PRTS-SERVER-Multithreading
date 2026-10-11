@@ -1,0 +1,536 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+package io.izzel.arclight.common.prts.kernel;
+
+import io.izzel.arclight.common.prts.kernel.auth.HolderKind;
+import io.izzel.arclight.common.prts.kernel.auth.WriteLevel;
+import io.izzel.arclight.common.prts.kernel.auth.WriteVersionSlots;
+import io.izzel.arclight.common.prts.kernel.jobs.JobDeclaration;
+import io.izzel.arclight.common.prts.kernel.jobs.JobGraph;
+import io.izzel.arclight.common.prts.kernel.jobs.PipelineRoundJobs;
+import io.izzel.arclight.common.prts.kernel.sites.WriteClaimTable;
+import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots;
+import io.izzel.arclight.common.prts.kernel.sites.WorldEpochs;
+import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+/** Turns the write set a frozen job declared into the claim a physical write arrives against.
+ *
+ * <p>The plan declares a write set per job; the claim table translates that declared set into the
+ * write path keys the domain writes through, and this point seats one slot for the span in which the
+ * declaring job is the writer. A job is the writer while the thread the writes are judged on is
+ * inside one of its own work items: the window is opened by the mailbox seam and closed by it again,
+ * so a write made while no job of the domain runs is not a domain write and keeps the default path.
+ *
+ * <p>Nothing here decides a write: a write the seated slot covers is handed to the same judged path
+ * the short path always had, and only a claim whose contract still holds is captured. The writes a
+ * claim landed are reported once, at the freeze that closes the span, as the batches a real commit
+ * log ordered - a span that landed nothing reports nothing.
+ */
+public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerTap {
+
+    /** How many ticks a claim of one declared job covers; the declaration names the window and this
+     * point never extends it. */
+    public static final int HOLD_TICKS = 40;
+
+    /** One declared job that claims writes: the batch the plan ordered, the write set the claim table
+     * translated out of its declaration and the contract a slot carries. */
+    public record Claim(String nodeKey, String worldId, String mailbox, String domainId,
+                        long planSequence, int position, long expectedVersion, long worldEpoch,
+                        long expireTick, HolderKind holderKind, String holderSiteId,
+                        Set<String> writeSet, Object levelRef) {
+    }
+
+    /** One batch a claim landed, named the way the commit log identifies a batch. It is reported for
+     * a span that actually landed writes and for a node the plan still carries. */
+    public record Report(String worldId, String domainId, String nodeKey, long expectedVersion,
+                         long writeSetDigest, int rows) {
+    }
+
+    /** One open window: the slots it seated and the tick it was seated on. A window whose mailbox
+     * the placement table did not know seats the claim of every declared job of that mailbox, and the
+     * level the write arrives on decides which of them covers it. */
+    private record Window(List<WriteControlledSlots.SlotKey> keys, long tickIndex) {
+    }
+
+    private static final class Landed {
+
+        private final WriteControlledSlots.Slot slot;
+        private final LongAdder rows = new LongAdder();
+
+        private Landed(WriteControlledSlots.Slot slot) {
+            this.slot = slot;
+        }
+    }
+
+    private final WriteVersionSlots versions;
+    private final WorldEpochs epochs;
+    private final BooleanSupplier judgeThread;
+    private final Function<String, Object> levelOf;
+    private final Map<Object, String> levelWorlds = new ConcurrentHashMap<>();
+    private final Map<Thread, Window> windows = new ConcurrentHashMap<>();
+    private final Map<String, Landed> landings = new ConcurrentHashMap<>();
+    private volatile Map<String, List<Claim>> byMailbox = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> landedByNode = new ConcurrentHashMap<>();
+
+    private volatile WriteControlledSlots table = WriteControlledSlots.NOTHING;
+    private volatile Map<String, Claim> declarations = Map.of();
+    private volatile String lastWindow = "";
+    private volatile boolean enabled;
+    private long tickIndex;
+    private long generations;
+    private long declared;
+    private long seated;
+    private long disarmed;
+    private long swept;
+    private long refused;
+    private long claimedWindows;
+    private long unclaimedWindows;
+    private long unplacedWindows;
+    private long offThreadWindows;
+    private long landedWrites;
+    private long reportedBatches;
+    private long landedWithoutNode;
+    private long unclaimedDomain;
+    private long foreignRefs;
+    private long emptyWriteSet;
+    private long noMailbox;
+    private long noDemand;
+    private long noWorld;
+    private long noVersion;
+    private long noEpoch;
+
+    /** Creates the point. Nothing arms a claim until a table is wired in and the window is on. */
+    public PipelineWriteClaims(WriteVersionSlots versions, WorldEpochs epochs,
+                               BooleanSupplier judgeThread, Function<String, Object> levelOf) {
+        this.versions = versions;
+        this.epochs = epochs;
+        this.judgeThread = judgeThread;
+        this.levelOf = levelOf;
+    }
+
+    /** Names the claim table a seated slot is registered in. */
+    public void table(WriteControlledSlots slots) {
+        this.table = slots == null ? WriteControlledSlots.NOTHING : slots;
+    }
+
+    /** Decides whether a declared write set is turned into a claim at all. Off, no window seats or
+     * retires anything and every write keeps the path it had. */
+    public void refresh(boolean enabled) {
+        this.enabled = enabled;
+        if (!enabled) {
+            closeAll();
+        }
+    }
+
+    public boolean enabled() {
+        return enabled;
+    }
+
+    /** Takes the write sets the plan just froze and turns the claimed ones into the claims the next
+     * span writes against. A job the plan carries no claim for declares nothing here. */
+    public int declare(JobGraph graph, long planSequence, long tick) {
+        Map<String, Claim> next = new LinkedHashMap<>();
+        if (graph != null) {
+            for (JobGraph.Node node : graph.nodes()) {
+                Claim claim = claimOf(node, planSequence, tick);
+                if (claim != null) {
+                    next.put(node.key(), claim);
+                }
+            }
+        }
+        Map<String, List<Claim>> byMailboxNext = new ConcurrentHashMap<>();
+        for (Claim claim : next.values()) {
+            byMailboxNext.computeIfAbsent(claim.mailbox(), key -> new ArrayList<>()).add(claim);
+        }
+        declarations = Map.copyOf(next);
+        byMailbox = byMailboxNext;
+        declared += next.size();
+        return next.size();
+    }
+
+    /** Reports the batches the closed span landed, one per node the plan carries, and keeps what
+     * landed for a node the plan no longer carries as a reading of its own. */
+    public int reportLanded(JobGraph graph, Consumer<Report> sink) {
+        int reported = 0;
+        if (graph != null && sink != null) {
+            for (JobGraph.Node node : graph.nodes()) {
+                Landed landed = landings.remove(node.key());
+                long rows = landed == null ? 0L : landed.rows.sum();
+                if (rows <= 0L) {
+                    continue;
+                }
+                WriteControlledSlots.Slot slot = landed.slot;
+                sink.accept(new Report(node.worldId(), node.domainId(), node.key(),
+                    slot.expectedVersion(), WriteControlledSlots.foldValue(slot.writeSet()),
+                    (int) Math.min(Integer.MAX_VALUE, rows)));
+                reported++;
+            }
+        }
+        for (String key : new ArrayList<>(landings.keySet())) {
+            if (landings.remove(key) != null) {
+                landedWithoutNode++;
+            }
+        }
+        reportedBatches += reported;
+        return reported;
+    }
+
+    /** The world one level reference belongs to, as the claim that seated the slot named it. */
+    public String worldOf(Object levelRef) {
+        String world = levelRef == null ? null : levelWorlds.get(levelRef);
+        return world == null ? "" : world;
+    }
+
+    @Override
+    public void ownerTask(String world, String mailbox) {
+    }
+
+    @Override
+    public void ownerRound(String world, String mailbox) {
+    }
+
+    /** One work item of a mailbox begins: while it runs, the job that mailbox carried is the writer
+     * of its world, and the claim of that job is seated for exactly that span. */
+    @Override
+    public void ownerTaskBegin(String world, String mailbox) {
+        if (!enabled) {
+            return;
+        }
+        if (judgeThread != null && !judgeThread.getAsBoolean()) {
+            offThreadWindows++;
+            return;
+        }
+        List<Claim> candidates = candidatesOf(world, mailbox);
+        if (candidates.isEmpty()) {
+            unclaimedWindows++;
+            lastWindow = (world == null ? "" : world) + "|" + (mailbox == null ? "" : mailbox);
+            return;
+        }
+        List<WriteControlledSlots.SlotKey> keys = new ArrayList<>(candidates.size());
+        for (Claim claim : candidates) {
+            long generation = ++generations;
+            WriteControlledSlots.Slot slot = new WriteControlledSlots.Slot(
+                new WriteControlledSlots.SlotKey(claim.worldId(), claim.domainId(),
+                    WriteLevel.REGION, claim.mailbox(), claim.planSequence()),
+                claim.levelRef(), claim.nodeKey(), claim.position(), claim.expectedVersion(),
+                generation, claim.worldEpoch(), claim.expireTick(), claim.holderKind(),
+                claim.holderSiteId(), claim.writeSet());
+            if (table.register(slot) != WriteControlledSlots.Refusal.NONE) {
+                refused++;
+                continue;
+            }
+            keys.add(slot.key());
+            seated++;
+        }
+        if (keys.isEmpty()) {
+            return;
+        }
+        windows.put(Thread.currentThread(), new Window(List.copyOf(keys), tickIndex));
+    }
+
+    /** The claims one window seats. A mailbox the placement table placed on a world seats the claim
+     * of that world alone; a mailbox it could not place seats the claim of every world whose plan
+     * declared a job of that mailbox, and the level a write arrives on is what decides which of them
+     * covers it. Nothing is claimed that no plan declared. */
+    private List<Claim> candidatesOf(String world, String mailbox) {
+        if (mailbox == null || mailbox.isEmpty()) {
+            return List.of();
+        }
+        if (world != null && !world.isEmpty() && !PrtsPipelineRows.UNPLACED_WORLD.equals(world)) {
+            Claim claim = declarations.get(keyOf(world, mailbox));
+            return claim == null ? List.of() : List.of(claim);
+        }
+        List<Claim> candidates = byMailbox.get(mailbox);
+        if (candidates == null || candidates.isEmpty()) {
+            return List.of();
+        }
+        unplacedWindows++;
+        return candidates;
+    }
+
+    /** One work item ends: the claim of the span is retired, and the writes it covered fall back to
+     * the default path. A window that was never opened closes nothing. */
+    @Override
+    public void ownerTaskEnd(String world, String mailbox) {
+        Window open = windows.remove(Thread.currentThread());
+        if (open == null) {
+            return;
+        }
+        for (WriteControlledSlots.SlotKey key : open.keys()) {
+            if (table.retire(key)) {
+                disarmed++;
+            }
+        }
+    }
+
+    /** One tick of the kernel: a window that was left open across the tick boundary is retired, so a
+     * claim the writer never closed cannot cover the writes of a later tick. */
+    public void noteTick(long tick) {
+        tickIndex = tick;
+        for (Map.Entry<Thread, Window> entry : windows.entrySet()) {
+            Window open = entry.getValue();
+            if (open.tickIndex() == tick || !windows.remove(entry.getKey(), open)) {
+                continue;
+            }
+            for (WriteControlledSlots.SlotKey key : open.keys()) {
+                if (table.retire(key)) {
+                    disarmed++;
+                }
+            }
+            swept++;
+        }
+    }
+
+    /** One write a claim landed: the batch it belongs to is counted here and reported at the freeze
+     * that closes the span, never during the write. */
+    public void noteLanded(WriteControlledSlots.Slot slot, String worldId) {
+        if (slot == null) {
+            return;
+        }
+        landings.computeIfAbsent(slot.planNodeKey(), key -> new Landed(slot)).rows.increment();
+        landedByNode.computeIfAbsent(slot.planNodeKey(), key -> new LongAdder()).increment();
+        landedWrites++;
+    }
+
+    /** The claims the newest plan declared, in a fixed order. */
+    public List<Claim> claims() {
+        Map<String, Claim> current = declarations;
+        List<String> keys = new ArrayList<>(current.keySet());
+        keys.sort(String::compareTo);
+        List<Claim> rows = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            rows.add(current.get(key));
+        }
+        return rows;
+    }
+
+    /** The writes one declared job landed since the readings were cleared. */
+    public long landedOf(String nodeKey) {
+        LongAdder cell = landedByNode.get(nodeKey);
+        return cell == null ? 0L : cell.sum();
+    }
+
+    /** How many claims the newest plan carries. */
+    public int active() {
+        return declarations.size();
+    }
+
+    /** How many windows are open right now. */
+    public int openWindows() {
+        return windows.size();
+    }
+
+    public long declaredCount() {
+        return declared;
+    }
+
+    public long seatedCount() {
+        return seated;
+    }
+
+    public long disarmedCount() {
+        return disarmed;
+    }
+
+    public long sweptCount() {
+        return swept;
+    }
+
+    public long refusedCount() {
+        return refused;
+    }
+
+    public long unclaimedWindowCount() {
+        return unclaimedWindows;
+    }
+
+    /** The windows whose mailbox the placement table did not know and whose claim the plan declared
+     * for the mailbox name; each of them seated the claim of every world that declared it. */
+    public long unplacedWindowCount() {
+        return unplacedWindows;
+    }
+
+    /** The world and mailbox of the newest window no declaration covered, so a face that claimed
+     * nothing can name the mailbox it saw. */
+    public String lastWindow() {
+        return lastWindow;
+    }
+
+    public long offThreadWindowCount() {
+        return offThreadWindows;
+    }
+
+    public long landedWriteCount() {
+        return landedWrites;
+    }
+
+    public long reportedBatchCount() {
+        return reportedBatches;
+    }
+
+    public long landedWithoutNodeCount() {
+        return landedWithoutNode;
+    }
+
+    public long unclaimedDomainCount() {
+        return unclaimedDomain;
+    }
+
+    public long foreignRefCount() {
+        return foreignRefs;
+    }
+
+    public long emptyWriteSetCount() {
+        return emptyWriteSet;
+    }
+
+    public long noMailboxCount() {
+        return noMailbox;
+    }
+
+    public long noDemandCount() {
+        return noDemand;
+    }
+
+    public long noWorldCount() {
+        return noWorld;
+    }
+
+    public long noVersionCount() {
+        return noVersion;
+    }
+
+    public long noEpochCount() {
+        return noEpoch;
+    }
+
+    /** Clears every reading and every claim. */
+    public void reset() {
+        closeAll();
+        levelWorlds.clear();
+        landings.clear();
+        landedByNode.clear();
+        declarations = Map.of();
+        byMailbox = new ConcurrentHashMap<>();
+        declared = 0L;
+        generations = 0L;
+        seated = 0L;
+        disarmed = 0L;
+        swept = 0L;
+        refused = 0L;
+        claimedWindows = 0L;
+        unclaimedWindows = 0L;
+        unplacedWindows = 0L;
+        offThreadWindows = 0L;
+        lastWindow = "";
+        landedWrites = 0L;
+        reportedBatches = 0L;
+        landedWithoutNode = 0L;
+        unclaimedDomain = 0L;
+        foreignRefs = 0L;
+        emptyWriteSet = 0L;
+        noMailbox = 0L;
+        noDemand = 0L;
+        noWorld = 0L;
+        noVersion = 0L;
+        noEpoch = 0L;
+    }
+
+    private void closeAll() {
+        for (Map.Entry<Thread, Window> entry : windows.entrySet()) {
+            Window open = entry.getValue();
+            if (windows.remove(entry.getKey(), open)) {
+                for (WriteControlledSlots.SlotKey key : open.keys()) {
+                    table.retire(key);
+                }
+            }
+        }
+    }
+
+    private Claim claimOf(JobGraph.Node node, long planSequence, long tick) {
+        if (!WriteClaimTable.claims(node.domainId())) {
+            unclaimedDomain++;
+            return null;
+        }
+        String mailbox = mailboxOf(node.domainId(), node.worldId(), node.key());
+        if (mailbox == null) {
+            noMailbox++;
+            return null;
+        }
+        Set<String> paths = new TreeSet<>();
+        for (JobDeclaration.DomainRef ref : node.writeSet()) {
+            if (!ref.worldId().equals(node.worldId()) || !ref.domainId().equals(node.domainId())) {
+                foreignRefs++;
+                continue;
+            }
+            paths.addAll(WriteClaimTable.pathsOf(ref.domainId()));
+        }
+        if (paths.isEmpty()) {
+            emptyWriteSet++;
+            return null;
+        }
+        JobDeclaration.OwnerDemand demand = demandOf(node);
+        if (demand == null) {
+            noDemand++;
+            return null;
+        }
+        long version = versions.carried(node.worldId(), WriteLevel.REGION, node.domainId());
+        if (version == WriteVersionSlots.NOT_CARRIED) {
+            noVersion++;
+            return null;
+        }
+        long epoch = epochs.epochOf(node.worldId());
+        if (epoch <= 0L) {
+            noEpoch++;
+            return null;
+        }
+        Object level = levelOf == null ? null : levelOf.apply(node.worldId());
+        if (level == null) {
+            noWorld++;
+            return null;
+        }
+        levelWorlds.put(level, node.worldId());
+        int hold = Math.max(1, demand.holdTicks());
+        return new Claim(node.key(), node.worldId(), mailbox, node.domainId(), planSequence,
+            node.position(), version, epoch, tick + hold, demand.holderKind(), demand.holderSiteId(),
+            Set.copyOf(paths), level);
+    }
+
+    private static JobDeclaration.OwnerDemand demandOf(JobGraph.Node node) {
+        for (JobDeclaration.OwnerDemand demand : node.ownerDemands()) {
+            if (demand.worldId().equals(node.worldId()) && demand.domainId().equals(node.domainId())
+                && demand.level() == WriteLevel.REGION) {
+                return demand;
+            }
+        }
+        return null;
+    }
+
+    /** The mailbox a node names, or null when its key does not carry one. */
+    private static String mailboxOf(String domainId, String worldId, String nodeKey) {
+        if (nodeKey == null || worldId == null || domainId == null) {
+            return null;
+        }
+        String prefix = domainId + "/" + worldId + "/";
+        if (!nodeKey.startsWith(prefix) || nodeKey.length() == prefix.length()) {
+            return null;
+        }
+        return nodeKey.substring(prefix.length());
+    }
+
+    private static String keyOf(String worldId, String mailbox) {
+        return PipelineRoundJobs.keyOf(worldId, mailbox);
+    }
+}

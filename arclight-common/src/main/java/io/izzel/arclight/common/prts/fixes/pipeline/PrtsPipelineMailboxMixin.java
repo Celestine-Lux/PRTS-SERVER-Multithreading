@@ -34,10 +34,12 @@ public abstract class PrtsPipelineMailboxMixin {
         if (PrtsPipelineRows.installed()) {
             prts$taskStartedAt = System.nanoTime();
         }
+        PrtsPipelineRows.ownerTaskBegin(this, name());
     }
 
     @Inject(method = "pollTask", at = @At("RETURN"))
     private void prts$countPipelineTask(CallbackInfoReturnable<Boolean> cir) {
+        PrtsPipelineRows.ownerTaskEnd(this, name());
         if (cir.getReturnValueZ()) {
             PrtsPipelineRows.task(name(), System.nanoTime() - prts$taskStartedAt);
             PrtsPipelineRows.ownerTask(this, name());
