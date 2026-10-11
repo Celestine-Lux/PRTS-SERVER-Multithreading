@@ -3,9 +3,19 @@ plugins {
     id 'com.gradleup.shadow'
 }
 
+apply from: rootProject.file('gradle/build-stamp.gradle')
+
 architectury {
     platformSetupLoomIde()
     fabric()
+}
+
+// Same reason as the NeoForge side: the archive carries a stamp and entry times, and both are
+// pinned so the published bootstrap archive does not move between two builds of one revision.
+jar {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    manifest.attributes 'Implementation-Timestamp': "$buildTimestamp"
 }
 
 dependencies {

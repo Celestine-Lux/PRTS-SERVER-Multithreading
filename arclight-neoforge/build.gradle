@@ -3,9 +3,21 @@ plugins {
     id 'com.gradleup.shadow'
 }
 
+apply from: rootProject.file('gradle/build-stamp.gradle')
+
 architectury {
     platformSetupLoomIde()
     neoForge()
+}
+
+// The stamp the root build script reads from the wall clock is replaced here by the one derived
+// from the revision, and the entry times this archive would otherwise take from the build
+// machine's disk are pinned: this jar is embedded into the published bootstrap archive, so a
+// stamp or a time that moves would move that archive with it.
+jar {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    manifest.attributes 'Implementation-Timestamp': "$buildTimestamp"
 }
 
 loom {

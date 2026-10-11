@@ -1,6 +1,8 @@
 import io.izzel.arclight.gradle.tasks.GenerateInstallerInfo
 import io.izzel.arclight.gradle.tasks.RenameAsyncCatcherTask
 
+apply from: rootProject.file('gradle/build-stamp.gradle')
+
 apply plugin: 'java'
 apply plugin: 'idea'
 apply plugin: 'maven-publish'
@@ -141,11 +143,15 @@ jar {
 
 tasks.register('neoforgeJar', Jar) {
     archiveBaseName.set "PRTS-neoforge-${libs.versions.minecraft.get()}"
+    // Reproducibility: entry times come from source mtimes and entry order from the walk order,
+    // so both are pinned to the archive defaults instead of the build machine's clock and disk.
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
     manifest.attributes 'Main-Class': 'io.izzel.arclight.server.Launcher'
     manifest.attributes 'Implementation-Title': 'PRTS'
     manifest.attributes 'Implementation-Version': "PRTS-${libs.versions.minecraft.get()}-${project.version}-$gitHash"
     manifest.attributes 'Implementation-Vendor': 'PRTS Team'
-    manifest.attributes 'Implementation-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss")
+    manifest.attributes 'Implementation-Timestamp': "$buildTimestamp"
     manifest.attributes 'Automatic-Module-Name': 'luminara.boot'
     from(configurations.embed.collect { it.isDirectory() ? it : zipTree(it) }) {
         exclude 'META-INF/MANIFEST.MF'
@@ -174,11 +180,13 @@ tasks.register('neoforgeJar', Jar) {
 
 tasks.register('fabricJar', Jar) {
     archiveBaseName.set "PRTS-fabric-${libs.versions.minecraft.get()}"
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
     manifest.attributes 'Main-Class': 'io.izzel.arclight.server.Launcher'
     manifest.attributes 'Implementation-Title': 'PRTS'
     manifest.attributes 'Implementation-Version': "PRTS-${libs.versions.minecraft.get()}-${project.version}-$gitHash"
     manifest.attributes 'Implementation-Vendor': 'PRTS Team'
-    manifest.attributes 'Implementation-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss")
+    manifest.attributes 'Implementation-Timestamp': "$buildTimestamp"
     manifest.attributes 'Automatic-Module-Name': 'luminara.boot'
     from(configurations.embedFabric.collect { it.isDirectory() ? it : zipTree(it) })
     into('/') {

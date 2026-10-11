@@ -1,0 +1,19 @@
+// Deterministic build stamp. The archives this build produces carry a build stamp in their
+// manifest, and a stamp read from the wall clock makes every archive differ from the one before it,
+// so the stamp is derived from the revision instead: the same commit built twice gives the same
+// bytes. A caller that wants an explicit stamp still sets SOURCE_DATE_EPOCH.
+//
+// Applied by the scripts that produce an archive; it is kept out of the root build script on
+// purpose, because that script is hashed into the Spigot cache key and a stamp has nothing to do
+// with how Spigot is generated.
+def stamp = System.getenv('SOURCE_DATE_EPOCH')
+if (stamp != null && !stamp.trim().isEmpty()) {
+    ext.buildTimestamp = new Date(Long.parseLong(stamp.trim()) * 1000L).format("yyyy-MM-dd HH:mm:ss")
+} else {
+    def stdout = new ByteArrayOutputStream()
+    exec {
+        commandLine 'git', 'show', '-s', '--date=format:%Y-%m-%d %H:%M:%S', '--format=%cd', 'HEAD'
+        standardOutput = stdout
+    }
+    ext.buildTimestamp = stdout.toString().trim()
+}
