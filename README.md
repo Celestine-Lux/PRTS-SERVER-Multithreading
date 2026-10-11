@@ -6,16 +6,16 @@ A **Minecraft 1.21.1** server on **NeoForge 21.1.250**, running Bukkit/Spigot pl
 
 ## This branch (`base/new-kernel`)
 
-This branch starts building the **next-generation PRTS server kernel — a two-axis scheduling kernel** — on a clean upstream base.
+This branch develops the **next-generation PRTS server kernel — a two-axis scheduling kernel** — on a clean upstream base.
 
-The kernel has two axes, and **every part of it is off by default**:
+The kernel has two axes:
 
 - **Axis A, waiting.** A wait-point registry: each wait declares its producer, a progress reading, a timeout action and where it degrades to. Wait bounds are measured, not assumed.
-- **Axis B, sharing.** Per-domain share metering, a share table and a degradation ladder: a domain that starts to stall has its share cut, instead of dragging the whole tick down with it.
+- **Axis B, sharing.** Per-domain share metering, a share table and a degradation ladder: a domain that starts to stall has its share cut instead of slowing the whole tick down.
 - **Planning and commit.** A per-tick plan, a job graph and scheduler, and a commit log whose order is the plan order.
 - **Safety and observation.** A safety net and a zero-effect detector on the write path, plus read-only observation keys that report what the kernel actually saw.
 
-**Defaults are unchanged.** Every capability here is off by default; with default settings, behaviour matches the base it came from, and each change ships with an equivalence check against the previous revision.
+**Release target: the validated kernel path and capability set enabled by default.** Until then each capability is verified behind its own switch: with default settings, behaviour matches the base it came from, and each change ships with an equivalence check against the previous revision. What passes verification joins the default path; experiments that fail validation or show a regression stay off, or are replaced by the formal path.
 
 Kept from the base:
 
@@ -28,7 +28,7 @@ Other branches:
 
 - `legacy/old-framework` — the previous multithreading framework, kept for reference and history.
 
-Status: `0.1.0-SNAPSHOT` — work in progress, no stability guarantees. The kernel is built stage by stage, nothing is enabled by default, and no production stability is promised.
+Status: `0.1.0-SNAPSHOT` — work in progress, no stability guarantees. The kernel is built stage by stage; its capabilities are still being verified one by one and are enabled by default once verified. No production stability is promised.
 
 ## Requirements
 
