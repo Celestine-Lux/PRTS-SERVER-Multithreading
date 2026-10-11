@@ -14,6 +14,7 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.support.PrtsChunkFlow;
+import io.izzel.arclight.common.prts.support.PrtsChunkMaterialization;
 import io.izzel.arclight.common.prts.support.PrtsLoadProbe;
 import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
 import io.izzel.arclight.common.prts.kernel.jobs.JobDeclaration;
@@ -1077,6 +1078,7 @@ public final class KernelReadings {
         add(lines, "wp.signal_rows", registry.progress().declaredCount());
         add(lines, "wp.signal_bound", registry.progress().boundCount());
         chunkMaterialization(lines, module);
+        materializationCallbackThread(lines, module);
         add(lines, "wait.refuse_unregistered", KernelSettings.refuseUnregisteredWaits() ? 1 : 0);
         add(lines, "wait.refused_unregistered", registry.refusedUnregistered());
         ForcedConvergence gate = registry.convergence();
@@ -1121,6 +1123,48 @@ public final class KernelReadings {
             for (Map.Entry<Long, Long> group : producer.tickGroups(world).entrySet()) {
                 add(lines, prefix + "tick." + group.getKey(), group.getValue());
             }
+        }
+    }
+
+    /** The thread the completion callbacks of the chunk materialization ran on, next to the thread
+     * the running server itself owns: the newest callback is published as a pair of named readings,
+     * and every path, thread and world keeps its own count beside it, so a second thread or a second
+     * world can never be hidden behind one last value. The thread id is a process-local diagnostic
+     * only - it is not an identity, not part of an order, and never compared across runs. */
+    private static void materializationCallbackThread(List<String> lines, KernelModule module) {
+        ChunkMaterializationObserver producer = module.chunkMaterialization();
+        ChunkMaterializationObserver.CallbackReading reading = producer.callbackThreads();
+        String prefix = "pipeline.materialization.callback_thread.";
+        add(lines, prefix + "identity_source", PrtsChunkMaterialization.SERVER_THREAD_SOURCE);
+        add(lines, prefix + "is_server", reading.lastServerOwned() ? 1 : 0);
+        add(lines, prefix + "id", reading.calls() == 0L ? "-" : reading.lastThreadId());
+        add(lines, prefix + "world", reading.lastWorldId());
+        add(lines, prefix + "last_path",
+            reading.lastPath() == null ? "-" : reading.lastPath().name());
+        add(lines, prefix + "calls", reading.calls());
+        add(lines, prefix + "server_owned", reading.serverOwned());
+        add(lines, prefix + "off_server", reading.offServer());
+        add(lines, prefix + "registered_late", reading.registeredLate());
+        add(lines, prefix + "failed", reading.failed());
+        add(lines, prefix + "identity_unknown", reading.unknownIdentity());
+        add(lines, prefix + "report_failures", PrtsChunkMaterialization.callbackFailures());
+        add(lines, prefix + "threads", reading.threads());
+        add(lines, prefix + "folded_threads", reading.foldedThreads());
+        add(lines, prefix + "worlds", reading.worlds());
+        add(lines, prefix + "folded_worlds", reading.foldedWorlds());
+        long paths = 0L;
+        for (Map.Entry<ChunkMaterializationObserver.CallbackPath, Long> entry
+                : reading.byPath().entrySet()) {
+            paths += entry.getValue();
+            add(lines, prefix + "path." + entry.getKey().name().toLowerCase(Locale.ROOT),
+                entry.getValue());
+        }
+        add(lines, prefix + "paths_total", paths);
+        for (Map.Entry<Long, Long> entry : producer.callbackThreadCounts().entrySet()) {
+            add(lines, prefix + "thread." + entry.getKey(), entry.getValue());
+        }
+        for (Map.Entry<String, Long> entry : producer.callbackWorldCounts().entrySet()) {
+            add(lines, prefix + "world." + safe(entry.getKey()), entry.getValue());
         }
     }
 
