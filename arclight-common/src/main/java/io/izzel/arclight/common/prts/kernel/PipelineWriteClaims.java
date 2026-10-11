@@ -344,6 +344,17 @@ public final class PipelineWriteClaims implements PrtsPipelineRows.MailboxOwnerT
         return windows.size();
     }
 
+    /** How many window frames are held right now, taken as the total over the threads that hold
+     * one. A frame is counted from the moment the span that opened it seats its window until that
+     * span ends, the tick moves past it or the window is turned off, so a frame a writer never
+     * closed stays counted until one of those three points and no frame is counted twice. A window
+     * a declaration never claimed holds no frame, and the bookkeeping holds one frame per open
+     * window: the two readings therefore keep their own keys, and this is the one that keeps its
+     * meaning once a thread can hold more than one frame. */
+    public int openWindowFrames() {
+        return windows.size();
+    }
+
     public long declaredCount() {
         return declared;
     }

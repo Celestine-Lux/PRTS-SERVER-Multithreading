@@ -1388,6 +1388,11 @@ public final class KernelReadings {
         add(lines, "r02.claim.declared", claims.declaredCount());
         add(lines, "r02.claim.active", claims.active());
         add(lines, "r02.claim.open_windows", claims.openWindows());
+        if (claims.enabled()) {
+            // The frame total is published only while the window is on: with the table off no window
+            // is open, so the reading has nothing to name and the face stays as it was.
+            add(lines, "r02.claim.open_window_frames", claims.openWindowFrames());
+        }
         add(lines, "r02.claim.seated", claims.seatedCount());
         add(lines, "r02.claim.disarmed", claims.disarmedCount());
         add(lines, "r02.claim.swept", claims.sweptCount());

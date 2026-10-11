@@ -411,6 +411,75 @@ class PipelineWriteClaimsTest {
             "the landing face keeps its own field");
     }
 
+    /** The two readings answer different questions: one counts the threads that hold a window, the
+     * other counts the frames those threads hold. Both are driven against what the bookkeeping holds
+     * at that point, so a change that made one of them answer the other's question would fail here. */
+    @Test
+    void theFrameTotalAndTheWindowCountAreReadApartAndReconciledWithTheBookkeeping() {
+        Scratch scratch = new Scratch();
+        scratch.declare(ROUNDS);
+
+        assertWindowReadings(scratch.claims, 0, 0, "no window is open yet");
+
+        scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
+        assertWindowReadings(scratch.claims, 1, 1, "the span that seated a window holds one frame");
+
+        scratch.claims.ownerTaskBegin(PrtsPipelineRows.UNPLACED_WORLD, "no-such-mailbox");
+        assertEquals(1L, scratch.claims.unclaimedWindowCount());
+        assertWindowReadings(scratch.claims, 1, 1,
+            "a span no declaration covered seats no window and holds no frame");
+
+        scratch.claims.noteTick(TICK + 1);
+        assertEquals(1L, scratch.claims.sweptCount(), "the frame left open is swept at the tick");
+        assertWindowReadings(scratch.claims, 0, 0, "the sweep takes the frame with the window");
+
+        scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
+        scratch.claims.ownerTaskEnd(WORLD, MAILBOX);
+        assertWindowReadings(scratch.claims, 0, 0, "the end of the span drops its frame");
+
+        scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
+        scratch.claims.refresh(false);
+        assertWindowReadings(scratch.claims, 0, 0, "turning the window off drops every frame");
+        scratch.claims.ownerTaskBegin(WORLD, MAILBOX);
+        assertWindowReadings(scratch.claims, 0, 0, "a window that is off opens no frame");
+        scratch.claims.refresh(true);
+    }
+
+    /** The row the claim face publishes while the window is on, and its absence while it is off. The
+     * key is additive: the count of open windows keeps its own row and its own value in both. */
+    @Test
+    void theReadoutNamesTheFrameTotalOnlyWhileTheWindowIsOn() {
+        KernelModule module = KernelModule.instance();
+        module.claims().refresh(false);
+        try {
+            List<String> off = KernelReadings.export(module);
+            assertTrue(off.stream().anyMatch(line -> line.startsWith("r02.claim.open_windows=")),
+                "the window count keeps its row while the table is off");
+            assertFalse(off.stream().anyMatch(line -> line.startsWith("r02.claim.open_window_frames=")),
+                "with the table off no window is open, so the frame total is not published");
+
+            module.claims().refresh(true);
+            List<String> on = KernelReadings.export(module);
+            assertTrue(on.stream().anyMatch(line -> line.equals("r02.claim.open_window_frames=0")),
+                "with the table on the frame total is published, zero included");
+            assertTrue(on.stream().anyMatch(line -> line.equals("r02.claim.open_windows=0")),
+                "and the window count is published next to it");
+        } finally {
+            module.claims().refresh(false);
+        }
+    }
+
+    /** Drives both readings against what the bookkeeping holds: the frame total is the frames the
+     * open windows hold, the window count is the threads that hold one. */
+    private static void assertWindowReadings(PipelineWriteClaims claims, int frames, int threads,
+                                             String where) {
+        assertEquals(frames, claims.openWindowFrames(), () -> "frame total after " + where);
+        assertEquals(threads, claims.openWindows(), () -> "window count after " + where);
+        assertTrue(frames >= threads, () -> "a thread that holds a window holds at least one frame: "
+            + where);
+        assertEquals(frames == 0, threads == 0, () -> "both readings are zero together: " + where);
+    }
+
     /** Drives one claim whose contract a fixture was moved out of, and answers the reason the write
      * face read. */
     private static String scratchOf(java.util.function.Consumer<Scratch> move) {
