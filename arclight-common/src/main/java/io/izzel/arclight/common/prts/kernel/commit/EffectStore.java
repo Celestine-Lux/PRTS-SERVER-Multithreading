@@ -26,6 +26,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * record that outgrows its promise is not written and not thrown away: it is counted as an
  * integrity fault and stays readable, and the store answers every later reservation with a refusal.
  *
+ * <p>Room is handed out only while the store is whole: once a terminal record outgrew its promise
+ * the store is halted, and every later reservation is refused on every path, the freeze path
+ * included.
+ *
+ * <p>Every method that reads the ledgers and then moves them runs under the store's monitor, so a
+ * handle is checked and consumed in one step: of two threads ending the same room-only handle one
+ * terminal is admitted and the other is answered as a handle this store does not hold, and no ledger
+ * is moved twice. What a caller reads of those ledgers is read under the same monitor.
+ *
  * <p>The store is in memory only: nothing here writes a file, so nothing here survives a restart.
  * A reference that cannot be resolved is answered as missing and never as an empty record. */
 public final class EffectStore {
@@ -127,7 +136,11 @@ public final class EffectStore {
 
     /** Charges the room one effect will take and freezes the record it charged for. Nothing is
      * stored yet; the slot is filled by {@link #commit} or given back by {@link #release}. */
-    public Result reserve(Effect effect) {
+    public synchronized Result reserve(Effect effect) {
+        if (halted) {
+            refused++;
+            return new Result(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
+        }
         if (effect == null || effect.effectRef() <= 0L) {
             refused++;
             return new Result(false, RejectCode.COUNTER_MISSING, null, null);
@@ -150,7 +163,7 @@ public final class EffectStore {
     /** Stores the record one reservation was charged for. The frozen record and the one that arrives
      * are compared field by field, so a record that changed in between is refused and its room is
      * given back even when the two are the same length. */
-    public Result commit(Slot slot, Effect effect) {
+    public synchronized Result commit(Slot slot, Effect effect) {
         Slot held = slot == null ? null : slots.get(slot.ticket());
         if (held == null || effect == null || held.effectRef() != effect.effectRef()) {
             refused++;
@@ -192,7 +205,7 @@ public final class EffectStore {
 
     /** Gives back a reservation that was not used. A ticket that is not held is a no-op, and a
      * handle another store handed out is refused instead of giving back this store's room. */
-    public boolean release(Slot slot) {
+    public synchronized boolean release(Slot slot) {
         Slot held = slot == null ? null : slots.get(slot.ticket());
         if (held == null || held != slot) {
             if (slot != null) {
@@ -208,7 +221,7 @@ public final class EffectStore {
 
     /** Charges room for a record whose outcome is not known yet: the room covers the largest of the
      * terminal variants the caller declares, and the record is written later inside that promise. */
-    public CapacityResult reserveCapacity(long effectRef, int maxRecords, int maxBytes) {
+    public synchronized CapacityResult reserveCapacity(long effectRef, int maxRecords, int maxBytes) {
         if (halted) {
             refused++;
             return new CapacityResult(false, RejectCode.QUEUE_CAP_EXCEEDED, null, null);
@@ -234,8 +247,9 @@ public final class EffectStore {
     }
 
     /** Writes the terminal record inside the room that was reserved for it. The promise is the
-     * bound: a record that outgrows it is not written, not billed and not dropped quietly. */
-    public CapacityResult finalizeCapacity(CapacitySlot slot, Effect terminal) {
+     * bound: a record that outgrows it is not written, not billed and not dropped quietly. The handle
+     * is looked up and consumed in one step, so one reservation ends exactly once. */
+    public synchronized CapacityResult finalizeCapacity(CapacitySlot slot, Effect terminal) {
         CapacitySlot held = slot == null ? null : capacitySlots.get(slot.ticket());
         if (held == null || held != slot || slot.storeId() != storeId || terminal == null
             || terminal.effectRef() != held.effectRef()) {
@@ -267,8 +281,9 @@ public final class EffectStore {
         return new CapacityResult(true, null, null, record);
     }
 
-    /** Gives back room that was reserved and not used. */
-    public boolean releaseCapacity(CapacitySlot slot) {
+    /** Gives back room that was reserved and not used. The handle is looked up and given back in
+     * one step, so a give-back that races the terminal of the same handle loses to it. */
+    public synchronized boolean releaseCapacity(CapacitySlot slot) {
         CapacitySlot held = slot == null ? null : capacitySlots.get(slot.ticket());
         if (held == null || held != slot || slot.storeId() != storeId) {
             foreignHandles++;
@@ -282,7 +297,7 @@ public final class EffectStore {
     }
 
     /** The stored record one reference names, or null and a missing count when there is none. */
-    public Recorded record(long effectRef) {
+    public synchronized Recorded record(long effectRef) {
         Recorded record = records.get(effectRef);
         if (record == null) {
             missing++;
@@ -291,7 +306,7 @@ public final class EffectStore {
     }
 
     /** Adds one reference to a stored record. The line that points at a record holds one. */
-    public boolean pin(long effectRef) {
+    public synchronized boolean pin(long effectRef) {
         if (!records.containsKey(effectRef)) {
             missing++;
             return false;
@@ -301,7 +316,7 @@ public final class EffectStore {
     }
 
     /** Drops one reference from a stored record. */
-    public boolean unpin(long effectRef) {
+    public synchronized boolean unpin(long effectRef) {
         Integer held = pins.get(effectRef);
         if (held == null || held <= 0) {
             return false;
@@ -315,7 +330,7 @@ public final class EffectStore {
     }
 
     /** Drops a record and gives its room back. A record a line still holds is not evicted. */
-    public boolean evict(long effectRef) {
+    public synchronized boolean evict(long effectRef) {
         Recorded record = records.get(effectRef);
         if (record == null) {
             missing++;
@@ -443,23 +458,23 @@ public final class EffectStore {
         return capacityRecords;
     }
 
-    public int records() {
+    public synchronized int records() {
         return records.size();
     }
 
-    public int bytes() {
+    public synchronized int bytes() {
         return usedBytes;
     }
 
-    public int reservedBytes() {
+    public synchronized int reservedBytes() {
         return reservedBytes;
     }
 
-    public int reservedRecords() {
+    public synchronized int reservedRecords() {
         return slots.size();
     }
 
-    public int pins() {
+    public synchronized int pins() {
         int held = 0;
         for (Integer count : pins.values()) {
             held += count;
@@ -467,35 +482,35 @@ public final class EffectStore {
         return held;
     }
 
-    public long tickets() {
+    public synchronized long tickets() {
         return tickets;
     }
 
-    public long stored() {
+    public synchronized long stored() {
         return stored;
     }
 
-    public long committed() {
+    public synchronized long committed() {
         return committed;
     }
 
-    public long refused() {
+    public synchronized long refused() {
         return refused;
     }
 
-    public long released() {
+    public synchronized long released() {
         return released;
     }
 
-    public long evicted() {
+    public synchronized long evicted() {
         return evicted;
     }
 
-    public long missing() {
+    public synchronized long missing() {
         return missing;
     }
 
-    public long evictionRefusals() {
+    public synchronized long evictionRefusals() {
         return evictionRefusals;
     }
 
@@ -504,52 +519,52 @@ public final class EffectStore {
         return storeId;
     }
 
-    public int capacityReservedBytes() {
+    public synchronized int capacityReservedBytes() {
         return capacityReservedBytes;
     }
 
-    public int capacityReservedRecords() {
+    public synchronized int capacityReservedRecords() {
         return capacityReservedRecords;
     }
 
     /** The room-only reservations handed out and neither filled nor given back. */
-    public int capacitySlots() {
+    public synchronized int capacitySlots() {
         return capacitySlots.size();
     }
 
-    public long capacityReserved() {
+    public synchronized long capacityReserved() {
         return capacityReserved;
     }
 
-    public long capacityFinalized() {
+    public synchronized long capacityFinalized() {
         return capacityFinalized;
     }
 
-    public long capacityReleased() {
+    public synchronized long capacityReleased() {
         return capacityReleased;
     }
 
     /** Handles of another store, of an earlier lifecycle or of no reservation at all. */
-    public long foreignHandles() {
+    public synchronized long foreignHandles() {
         return foreignHandles;
     }
 
-    public long integrityFaults() {
+    public synchronized long integrityFaults() {
         return integrityFaults;
     }
 
     /** Whether a terminal record outgrew its promise: the store then hands out no more room. */
-    public boolean halted() {
+    public synchronized boolean halted() {
         return halted;
     }
 
-    public String integrityReason() {
+    public synchronized String integrityReason() {
         return integrityReason;
     }
 
     /** The terminal items that are still waiting for room: bounded by the record capacity and
      * readable, so a fault leaves a trace instead of a lost audit. */
-    public List<String> unresolvedTerminals() {
+    public synchronized List<String> unresolvedTerminals() {
         List<String> pending = new ArrayList<>();
         for (CapacitySlot slot : capacitySlots.values()) {
             pending.add(slot.effectRef() + "@" + slot.maxRecords() + "r/" + slot.maxBytes() + "b");
@@ -557,7 +572,7 @@ public final class EffectStore {
         return pending;
     }
 
-    public List<Long> references() {
+    public synchronized List<Long> references() {
         return new ArrayList<>(records.keySet());
     }
 }

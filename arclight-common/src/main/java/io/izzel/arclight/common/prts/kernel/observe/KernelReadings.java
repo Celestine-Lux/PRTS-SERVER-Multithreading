@@ -871,6 +871,8 @@ public final class KernelReadings {
             reservations == null ? 0L : reservations.releasedCount());
         add(lines, "product.commit.outstanding", reservations == null ? 0 : reservations.outstanding());
         add(lines, "product.commit.publishing", reservations == null ? 0 : reservations.publishing());
+        add(lines, "product.commit.pending_dispositions",
+            reservations == null ? "-" : pendingDispositions(reservations));
         add(lines, "product.commit.published_total",
             reservations == null ? 0L : reservations.publishedTotal());
         add(lines, "product.commit.partial_total", reservations == null ? 0L : reservations.partialTotal());
@@ -905,6 +907,23 @@ public final class KernelReadings {
         add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
         add(lines, "product.commit.effect_unresolved_terminals",
             effects == null ? 0 : effects.unresolvedTerminals().size());
+    }
+
+    /** The items whose side effect has run and whose terminal line is not written: the ticket, the
+     * refusal it waits on and how often it was tried. A dash means nothing waits. */
+    private static String pendingDispositions(CommitReservation reservations) {
+        if (reservations.pendingDispositions().isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (CommitReservation.Pending pending : reservations.pendingDispositions()) {
+            if (builder.length() > 0) {
+                builder.append(",");
+            }
+            builder.append(pending.ticketId()).append(':').append(pending.code()).append(':')
+                .append(pending.attempts());
+        }
+        return builder.toString();
     }
 
     private static String terminalLedger(CommitReservation reservations) {

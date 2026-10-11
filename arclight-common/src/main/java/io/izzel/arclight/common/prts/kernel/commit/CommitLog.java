@@ -395,7 +395,6 @@ public final class CommitLog {
             unplanned++;
             disposition = Entry.Disposition.DROPPED;
             code = RejectCode.COMMIT_ORDER_VIOLATION;
-            dropped++;
         } else if (resolved != null && !ascending(batch.worldId(), batch.domainId(), planSequence,
             position)) {
             orderViolations++;
@@ -404,32 +403,19 @@ public final class CommitLog {
             }
             disposition = Entry.Disposition.DROPPED;
             code = RejectCode.COMMIT_ORDER_VIOLATION;
-            dropped++;
         } else {
-            if (resolved != null) {
-                lastPlanOfRing.put(key(batch.worldId(), batch.domainId()), planSequence);
-                lastPositionOfRing.put(key(batch.worldId(), batch.domainId()), (int) position);
-            }
             disposition = dispositionOf(batch.kind());
-            switch (disposition) {
-                case ACCEPTED -> accepted++;
-                case MERGED -> merged++;
-                case INTENT -> intents++;
-                case RETRIED -> retried++;
-                case DROPPED -> dropped++;
-            }
         }
         Entry entry = new Entry(++sequence, tickIndex, planSequence, (int) position,
             batch.worldId(), batch.domainId(), batch.nodeKey() == null ? "" : batch.nodeKey(), 0L,
             batch.kind(), batch.expectedVersion(), batch.writeSetDigest(), batch.rows(),
             disposition, code, intent);
         CommitRing ring = ring(batch.worldId(), batch.domainId());
-        long[] floor = reservedFloors.get(ring.key());
-        if (floor != null && resolved != null
-            && (planSequence > floor[0] || (planSequence == floor[0] && position >= floor[1]))) {
+        if (resolved != null && crossesReservedFloor(ring.key(), planSequence, position)) {
             // A reservation of this pair holds this place: the plain path does not carry the pair's
             // order past a place a versioned line reserved, nor onto it a second time. With no
-            // reservation held there is no floor and nothing here reads.
+            // reservation held there is no floor and nothing here reads. The refusal is counted where
+            // it happened and the place the pair had taken is left where it was.
             hybridOrderRefusals++;
             orderViolations++;
             dropped++;
@@ -454,6 +440,19 @@ public final class CommitLog {
             dropped++;
             return new Verdict(false, Entry.Disposition.DROPPED, push.code(), sequence,
                 (int) position);
+        }
+        // The line is stored: only now does it move the order of its pair and the count of what it
+        // did. Every refusal above took none of that with it.
+        if (resolved != null) {
+            lastPlanOfRing.put(ring.key(), planSequence);
+            lastPositionOfRing.put(ring.key(), (int) position);
+        }
+        switch (disposition) {
+            case ACCEPTED -> accepted++;
+            case MERGED -> merged++;
+            case INTENT -> intents++;
+            case RETRIED -> retried++;
+            case DROPPED -> dropped++;
         }
         watermarks = Math.max(watermarks, ring.depth());
         return new Verdict(true, disposition, code, sequence, (int) position);
@@ -558,6 +557,13 @@ public final class CommitLog {
         if (!ascending(batch.worldId(), batch.domainId(), resolved.planSequence(), position)) {
             return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, position);
         }
+        if (crossesReservedFloor(key(batch.worldId(), batch.domainId()), resolved.planSequence(),
+            position)) {
+            // A reservation of this pair holds this place or one before it: this line does not take
+            // its own slot and write past a place that reservation is still holding.
+            orderViolations++;
+            return typedRefusal(RejectCode.COMMIT_ORDER_VIOLATION, position);
+        }
         String instance = instanceOf(identity);
         String instanceKey = instanceKeyOf(batch.worldId(), batch.domainId(), identity.instanceId());
         String held = instanceNamespaces.get(instanceKey);
@@ -639,6 +645,19 @@ public final class CommitLog {
         if (outcome.rows().size() != ticket.batch().rows()) {
             return ticketRefusal(RejectCode.VERSION_MISMATCH, ticket.position());
         }
+        String pairKey = key(ticket.batch().worldId(), ticket.batch().domainId());
+        long[] frozen = heldPlans.get(ringSlot.ticket());
+        if (frozen == null || frozen[0] != ticket.planSequence() || frozen[1] != ticket.position()
+            || !ascending(ticket.batch().worldId(), ticket.batch().domainId(), ticket.planSequence(),
+                ticket.position())
+            || holdsAnEarlierPlace(pairKey, ticket.planSequence(), ticket.position())) {
+            // The place the plan froze into this ticket is judged here, before the room is filled and
+            // before a line is stored: a terminal of a place an earlier reservation of the pair still
+            // holds waits for that one, and a place the pair has already passed is refused. A refusal
+            // leaves the ticket, its slot, its room and the order of the pair where they were.
+            orderViolations++;
+            return ticketRefusal(RejectCode.COMMIT_ORDER_VIOLATION, ticket.position());
+        }
         EffectStore.CapacityResult finished = effects.finalizeCapacity(ticket.effectSlot(),
             outcome.asEffect(ticket.identity().effectRef()));
         if (!finished.admitted()) {
@@ -664,7 +683,6 @@ public final class CommitLog {
             return ticketRefusal(push.code(), ticket.position());
         }
         consumeSlot(ringSlot);
-        String pairKey = key(ticket.batch().worldId(), ticket.batch().domainId());
         lastPlanOfRing.put(pairKey, ticket.planSequence());
         lastPositionOfRing.put(pairKey, ticket.position());
         instanceNamespaces.put(instanceKeyOf(ticket.batch().worldId(), ticket.batch().domainId(),
@@ -716,6 +734,12 @@ public final class CommitLog {
             reservationRefusals++;
             return null;
         }
+        if (plan != null && !ascending(worldId, domainId, plan[0], (int) plan[1])) {
+            // A place the pair has already passed can never be written: a slot held for it could only
+            // end in a refusal, so none is handed out.
+            reservationRefusals++;
+            return null;
+        }
         RingSlot slot = new RingSlot(worldId, domainId, ++slotTickets, lifetime, resetEpoch);
         heldSlots.put(slot.ticket(), slot);
         slotsByKey.merge(key(worldId, domainId), 1, Integer::sum);
@@ -725,6 +749,13 @@ public final class CommitLog {
         }
         reservationsTaken++;
         return slot;
+    }
+
+    /** Whether a line of this place still rises above what the pair has taken. Read-only: it counts
+     * nothing and takes no slot, so a caller that reserves can tell a place that is gone from a ring
+     * that has no room. */
+    public boolean placeAscending(String worldId, String domainId, long planSequence, int position) {
+        return ascending(worldId, domainId, planSequence, position);
     }
 
     private void raiseFloor(String key, long planSequence, int position) {
@@ -849,6 +880,24 @@ public final class CommitLog {
         return new TypedStep(entry.planSequence(), entry.position(), entry.writeSetDigest(),
             entry.worldId(), entry.domainId(), entry.nodeKey(), entry.expectedVersion(), entry.rows(),
             entry.identity(), entry.disposition(), record);
+    }
+
+    /** Whether this place is at or past the floor a reservation of the pair holds. The floor is the
+     * earliest place a held reservation carries, and a plain or versioned line stays strictly before
+     * it; with nothing held there is no floor and nothing here reads. */
+    private boolean crossesReservedFloor(String pairKey, long planSequence, long position) {
+        long[] floor = reservedFloors.get(pairKey);
+        return floor != null && (planSequence > floor[0]
+            || (planSequence == floor[0] && position >= floor[1]));
+    }
+
+    /** Whether a reservation of this pair still holds a place before this one. Only the earliest
+     * place the pair holds may end, so the terminal of a later place waits for it instead of writing
+     * past it and leaving the ring in an order the plan never gave. */
+    private boolean holdsAnEarlierPlace(String pairKey, long planSequence, int position) {
+        long[] floor = reservedFloors.get(pairKey);
+        return floor != null && (floor[0] < planSequence
+            || (floor[0] == planSequence && floor[1] < position));
     }
 
     private boolean ascending(String worldId, String domainId, long planSequence, long position) {
