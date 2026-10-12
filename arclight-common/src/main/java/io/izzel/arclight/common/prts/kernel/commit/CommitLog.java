@@ -101,12 +101,12 @@ public final class CommitLog {
         }
 
         /** Whether every column a versioned line has to declare is there. A missing column is a
-         * refusal, not a default that reads as a value. */
+         * refusal, not a default that reads as a value: both namespaces are read. */
         public boolean declaredTyped() {
             return schemaVersion == SCHEMA_TYPED && instanceId != NO_INSTANCE
                 && liveWorldEpoch(worldEpoch) && !targetStatus.isEmpty()
                 && authorizationGeneration != NO_AUTHORIZATION_GENERATION && effectRef != NO_EFFECT
-                && producer.declared();
+                && producer.declared() && controller.declared();
         }
     }
 
@@ -330,6 +330,7 @@ public final class CommitLog {
     private Replay last;
     private long firstDivergencePosition = -1L;
     private final EffectStore effects;
+    private final IdentityWitness.Source identitySource;
     private final long lifetime = CommitNamespaces.Lifetimes.mint();
     private final Object ringKey = new Object();
     private final Map<Long, RingSlot> heldSlots = new LinkedHashMap<>();
@@ -357,16 +358,24 @@ public final class CommitLog {
     private long integrityFaults;
 
     public CommitLog(IntSupplier ringCapacity, OrderSource source) {
-        this(ringCapacity, source, null);
+        this(ringCapacity, source, null, IdentityWitness.NONE);
     }
 
     /** The same log with an effect store bound. A log with no store cannot execute a versioned
      * report: it answers a refusal instead of writing a line whose effect nothing could resolve,
      * which is the state of the running server today. */
     public CommitLog(IntSupplier ringCapacity, OrderSource source, EffectStore effects) {
+        this(ringCapacity, source, effects, IdentityWitness.NONE);
+    }
+
+    /** The same log with the holder that answers for the freeze a typed line claims to come from.
+     * A chain bound without one admits no typed report. */
+    public CommitLog(IntSupplier ringCapacity, OrderSource source, EffectStore effects,
+                     IdentityWitness.Source identitySource) {
         this.ringCapacity = ringCapacity;
         this.source = source;
         this.effects = effects;
+        this.identitySource = identitySource == null ? IdentityWitness.NONE : identitySource;
     }
 
     /** Opens one tick. The rings keep what a previous tick did not read, so a slow reader never loses
@@ -523,6 +532,11 @@ public final class CommitLog {
         return source;
     }
 
+    /** Where this log reads the declarations a typed line is judged against. Read-only. */
+    public IdentityWitness.Source identitySource() {
+        return identitySource;
+    }
+
     /** The number of steps two runs of the same input differ in; -1 means one of them is missing. */
     public static int compareRuns(Replay left, Replay right) {
         return Replay.compare(left, right);
@@ -577,6 +591,13 @@ public final class CommitLog {
             // state it carries. Another lifecycle, another chunk or another state under that number
             // is a second instance wearing the name of the first, and the number alone says nothing.
             identityCollisions++;
+            return typedRefusal(RejectCode.VERSION_MISMATCH, position);
+        }
+        IdentityWitness.Verdict witness = IdentityWitness.verify(
+            identitySource.declarations(batch.worldId(), batch.domainId(), resolved.planSequence()),
+            resolved, batch.worldId(), batch.domainId(), batch.nodeKey(), identity,
+            identitySource.currentController());
+        if (!witness.accepted()) {
             return typedRefusal(RejectCode.VERSION_MISMATCH, position);
         }
         CommitRing ring = ring(batch.worldId(), batch.domainId());

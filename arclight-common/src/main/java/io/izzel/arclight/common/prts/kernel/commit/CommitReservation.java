@@ -108,6 +108,8 @@ public final class CommitReservation {
     private long resetDuringPublish;
     private long publishRefusals;
     private long ledgerEvicted;
+    private long witnessRefusals;
+    private long driftRefusals;
     private boolean closed;
 
     public CommitReservation(CommitLog log, EffectStore store, CommitLog.OrderSource plans,
@@ -248,6 +250,17 @@ public final class CommitReservation {
             || resolved.position() != request.position()) {
             return new Refusal(RejectCode.COMMIT_ORDER_VIOLATION, "plan-ref-mismatch");
         }
+        // The seat the plan resolved is what the sealed declarations are looked up by, so this runs
+        // after the plan reference was checked and before a ring slot or a room is taken. The
+        // namespace agreement is asked of the holder's current controller, not of the request.
+        IdentityWitness.Verdict witness = IdentityWitness.verify(
+            log.identitySource().declarations(request.worldId(), request.domainId(),
+                resolved.planSequence()), resolved, request.worldId(), request.domainId(),
+            request.nodeKey(), identity, controller());
+        if (!witness.accepted()) {
+            witnessRefusals++;
+            return new Refusal(RejectCode.VERSION_MISMATCH, witness.reason());
+        }
         if (log.instanceCollision(request.worldId(), request.domainId(), identity)) {
             return new Refusal(RejectCode.VERSION_MISMATCH, "instance-collision");
         }
@@ -313,6 +326,13 @@ public final class CommitReservation {
             crossLogRefusals++;
             return false;
         }
+        if (frozenValuesMoved(ticket)) {
+            // The generations the line was frozen under are read again here and never written back:
+            // a world that moved on or a grant that was retired refuses the start instead of the
+            // frozen columns being replaced by today's values.
+            driftRefusals++;
+            return false;
+        }
         if (phases.get(ticket.ticketId()) != Phase.RESERVED) {
             return false;
         }
@@ -325,6 +345,22 @@ public final class CommitReservation {
         }
         phases.put(ticket.ticketId(), Phase.PUBLISHING);
         return true;
+    }
+
+    /** Whether the world generation or the grant the line was frozen under has moved since. A plain
+     * line declares neither, so nothing of it can drift. */
+    private boolean frozenValuesMoved(CommitTicket ticket) {
+        CommitLog.Identity identity = ticket.identity();
+        if (identity.schemaVersion() != CommitLog.SCHEMA_TYPED) {
+            return false;
+        }
+        IdentityWitness.Source source = log.identitySource();
+        if (source == null) {
+            return true;
+        }
+        return source.liveWorldEpoch(ticket.batch().worldId()) != identity.worldEpoch()
+            || source.liveAuthorization(ticket.batch().worldId(), ticket.batch().domainId(),
+                ticket.batch().nodeKey()) != identity.authorizationGeneration();
     }
 
     /** Writes the terminal line of a publishing ticket from the reservations it holds. */
@@ -721,5 +757,16 @@ public final class CommitReservation {
     /** The side effects that were not started because an earlier place of their pair had not ended. */
     public long publishRefusals() {
         return publishRefusals;
+    }
+
+    /** The reservations the sealed declarations refused before a ring slot or a room was taken. */
+    public long witnessRefusals() {
+        return witnessRefusals;
+    }
+
+    /** The starts refused because the live world generation or grant no longer matched the frozen
+     * one. */
+    public long driftRefusals() {
+        return driftRefusals;
     }
 }

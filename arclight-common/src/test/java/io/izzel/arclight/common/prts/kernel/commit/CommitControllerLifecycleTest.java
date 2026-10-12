@@ -49,7 +49,9 @@ class CommitControllerLifecycleTest {
 
         Fixture(int ringCap, int storeBytes, int storeRecords) {
             store = new EffectStore(storeBytes, storeRecords);
-            log = new CommitLog(() -> ringCap, plans, store);
+            log = new CommitLog(() -> ringCap, plans, store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
+                    () -> plans.plan, NODE));
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         }
 

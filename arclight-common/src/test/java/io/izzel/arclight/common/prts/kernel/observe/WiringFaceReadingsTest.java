@@ -19,6 +19,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** The columns that say whether a bound controller can run anything, what it refused for that
  * reason, and whether an item is waiting for a line its owner has to hand it. */
@@ -43,7 +44,8 @@ class WiringFaceReadingsTest {
         final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(4096, 8);
-        final CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        final CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);

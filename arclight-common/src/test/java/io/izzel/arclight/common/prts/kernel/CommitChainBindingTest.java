@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** One chain is taken whole or not at all. The five checks of an install are references — the log
  * the holder mints in, the store that log carries, the one plan authority of the module, the owner
@@ -59,7 +60,8 @@ class CommitChainBindingTest {
         }
 
         Chain(CommitLog.OrderSource source, CommitController.Publisher publisher) {
-            log = new CommitLog(() -> 4, source, store);
+            log = new CommitLog(() -> 4, source, store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, publisher);
         }

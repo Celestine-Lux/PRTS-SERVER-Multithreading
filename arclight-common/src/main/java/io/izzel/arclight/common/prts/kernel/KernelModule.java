@@ -18,6 +18,8 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
+import io.izzel.arclight.common.prts.kernel.commit.IdentityWitness;
 import io.izzel.arclight.common.prts.kernel.exits.DualExits;
 import io.izzel.arclight.common.prts.kernel.safety.SafetyNet;
 import io.izzel.arclight.common.prts.kernel.safety.ZeroEffectDetector;
@@ -208,9 +210,42 @@ public final class KernelModule {
     /** The one plan authority of this module. A chain is adopted only when the log it carries asks
      * this very instance, so the identity of an order source is a reference and not a shape. */
     private final CommitLog.OrderSource commitOrderSource = this::resolveCommitOrder;
+    /** Where a typed line's freeze is read from: the declarations this module sealed and the
+     * generations live right now. The table is written by the freeze alone. */
+    private final IdentityWitness.Source commitIdentitySource = new IdentityWitness.Source() {
+
+        @Override
+        public FrozenDeclarations declarations(String worldId, String domainId, long planSequence) {
+            FrozenDeclarations held = frozenDeclarations;
+            // The freeze it holds is the only one it can answer for: a seat of another plan is
+            // answered with nothing, which is what makes the interval around a publish inert.
+            return held.planSequence() == planSequence ? held : FrozenDeclarations.none();
+        }
+
+        @Override
+        public long liveWorldEpoch(String worldId) {
+            return guard.worldEpochs().epochOf(worldId);
+        }
+
+        @Override
+        public long liveAuthorization(String worldId, String domainId, String nodeKey) {
+            return versionSlots.peek(worldId, WriteLevel.REGION, domainId);
+        }
+
+        @Override
+        public CommitNamespaces.Namespace currentController() {
+            CommitController bound = commitController;
+            return bound == null ? null : bound.reservations().controller();
+        }
+    };
+    /** The declarations of the freeze that is published, replaced whole by the next freeze. */
+    private volatile FrozenDeclarations frozenDeclarations = FrozenDeclarations.none();
+    private String declarationRefusal = "";
+    private long declarationRefusals;
+    private long declarationsSealed;
     /** The log this module built for itself: the path every tick uses while nothing is bound. */
     private final CommitLog ownCommits = new CommitLog(KernelSettings::commitRingCap,
-        commitOrderSource);
+        commitOrderSource, null, commitIdentitySource);
     /** The log in use: the module's own until a whole chain is adopted, and the log of that chain
      * afterwards. Only an install moves it, and an install moves it whole or not at all. */
     private CommitLog commits = ownCommits;
@@ -705,6 +740,9 @@ public final class KernelModule {
             planNanosMax = freezeNanos;
         }
         if (result.ok()) {
+            // Sealed against this plan's own commit order and bound before the plan is published:
+            // the interval authorizes nothing because the pair is told apart by the plan sequence.
+            sealDeclarations(result.plan());
             plans.publish(result.plan());
             grantVersionSlots(result.plan());
             ownerGrants.apply(result.plan().graph(), tickIndex);
@@ -726,6 +764,60 @@ public final class KernelModule {
         // Taken last, so the frame the next tick consumes carries this tick's deltas and nothing of
         // the plan that just read the previous one.
         plans.takeFeedback(tickIndex, planSequence);
+    }
+
+    /** Seals the declarations this freeze accepted against the places the plan's own commit order
+     * gave them. A seal that refuses writes no table, so a refusal leaves nothing authorizable. */
+    private void sealDeclarations(TickPlan plan) {
+        if (plan.planSequence() <= frozenDeclarations.planSequence()) {
+            declarationRefusal = "declaration-not-newer";
+            declarationRefusals++;
+            return;
+        }
+        List<FrozenDeclarations.Assignment> places = new ArrayList<>();
+        for (TickPlan.CommitStep step : plan.commitOrder()) {
+            places.add(new FrozenDeclarations.Assignment(step.worldId(), step.domainId(),
+                step.nodeKey(), step.position()));
+        }
+        FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(plan.planSequence(),
+            pipelineJobs.candidateDeclarations(), places);
+        if (!sealed.sealed()) {
+            declarationRefusal = sealed.refusal();
+            declarationRefusals++;
+            frozenDeclarations = FrozenDeclarations.none();
+            return;
+        }
+        declarationRefusal = "";
+        frozenDeclarations = sealed.declarations();
+        declarationsSealed++;
+    }
+
+    /** The declarations of the freeze that is published, as the readings and the commit chain read
+     * them. A table that was never sealed reads a named state, not a zero. */
+    public FrozenDeclarations declarations() {
+        return frozenDeclarations;
+    }
+
+    /** The piece that refused the last seal, or an empty string. */
+    public String declarationRefusal() {
+        return declarationRefusal;
+    }
+
+    public long declarationRefusals() {
+        return declarationRefusals;
+    }
+
+    public long declarationsSealed() {
+        return declarationsSealed;
+    }
+
+    /** The candidate declarations the pipeline producer handed over, and how many carry no artefact. */
+    public long pipelineJobCandidates() {
+        return pipelineJobs.candidateCount();
+    }
+
+    public long pipelineCandidatesWithoutArtefact() {
+        return pipelineJobs.candidatesWithoutArtefact();
     }
 
     /** Hands the plan of this tick out through the job scheduler of this kernel: every node of the
@@ -2044,7 +2136,8 @@ public final class KernelModule {
         }
         EffectStore store = new EffectStore(declared.effectCapacityBytes(),
             declared.effectCapacityRecords());
-        CommitLog log = new CommitLog(KernelSettings::commitRingCap, commitOrderSource, store);
+        CommitLog log = new CommitLog(KernelSettings::commitRingCap, commitOrderSource, store,
+            commitIdentitySource);
         CommitReservation reservations = new CommitReservation(log, store, commitOrderSource,
             CHAIN_OWNER_ID, commitChainEpochs);
         // The publish action is absent by construction: an adopted chain is bound, not executable.

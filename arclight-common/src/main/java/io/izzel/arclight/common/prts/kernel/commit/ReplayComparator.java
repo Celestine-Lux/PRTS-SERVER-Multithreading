@@ -60,6 +60,22 @@ public final class ReplayComparator {
     private static final String LEGACY_NOTE = "declared version 0: the plan order, the position and "
         + "the write set of a plain step only; the typed columns of these records are not read";
 
+    private static final String UNVERIFIED_NOTE = "typed columns compared without a sealed "
+        + "declaration: the instance column is a first-appearance ordinal of this side and the "
+        + "provenance of the records is not verified";
+
+    private static final long OFFSET_BASIS = 0xcbf29ce484222325L;
+    private static final long PRIME = 0x100000001b3L;
+
+    /** What one side of a strict comparison is read through: the commit the records were taken from,
+     * the integrity summary of those records, and the declarations sealed for the freeze that
+     * ordered them. All four have to agree before a conclusion is drawn; a closure carrying a table
+     * of another freeze, or a summary that does not match its own records, is refused instead of
+     * being read as the weaker historical comparison. */
+    public record Evidence(String sourceCommit, String recordDigest,
+                           FrozenDeclarations declarations, CommitLog.SchemaReplay replay) {
+    }
+
     private final Map<String, Long> refusals = new LinkedHashMap<>();
     private long compared;
     private long equal;
@@ -75,9 +91,79 @@ public final class ReplayComparator {
         return new CommitLog.SchemaReplay(CommitLog.SCHEMA_LEGACY, replay.steps(), List.of(), 0);
     }
 
+    /** Compares two sides under the version they declare, through the closure each was handed in
+     * with. The instance column of this reading is the canonical form of the logical key the sealed
+     * declarations back, so two runs that assigned other runtime numbers still compare equal and two
+     * runs whose declarations differ are never answered equal on a first-appearance ordinal. */
+    public Verdict compare(Evidence left, Evidence right) {
+        if (left == null || right == null || left.replay() == null || right.replay() == null) {
+            return refuse(REFUSED_SIDE_MISSING, "");
+        }
+        String broken = closure(left);
+        if (broken == null) {
+            broken = closure(right);
+        }
+        if (broken != null) {
+            return refuse(broken, "closure");
+        }
+        return compare(left.replay(), right.replay(),
+            new Strict(left.declarations(), right.declarations()));
+    }
+
+    /** The integrity summary of one side, computed from the records themselves. A closure that
+     * carries another summary is a closure of another run. */
+    public static String recordsDigest(CommitLog.SchemaReplay side) {
+        if (side == null) {
+            return "";
+        }
+        long hash = OFFSET_BASIS;
+        for (CommitLog.Entry.Step step : side.plainSteps()) {
+            hash = fold(hash, "p/" + step.planSequence() + "/" + step.position() + "/"
+                + step.writeSetDigest());
+        }
+        for (CommitLog.TypedStep step : side.typedSteps()) {
+            hash = fold(hash, "t/" + step.worldId() + "/" + step.domainId() + "/" + step.nodeKey()
+                + "/" + step.planSequence() + "/" + step.position() + "/" + step.writeSetDigest() + "/"
+                + step.rows() + "/" + step.expectedVersion() + "/" + step.disposition());
+            EffectStore.Recorded effect = step.effect();
+            hash = fold(hash, effect == null ? "e/-" : "e/" + effect.effectRef() + "/"
+                + effect.contentDigest() + "/" + effect.operationKind() + "/" + effect.outcome());
+            CommitLog.Identity identity = step.identity();
+            hash = fold(hash, "i/" + identity.schemaVersion() + "/" + identity.instanceId() + "/"
+                + identity.worldEpoch() + "/" + identity.chunkPos() + "/" + identity.targetStatus()
+                + "/" + identity.authorizationGeneration() + "/" + identity.effectRef() + "/"
+                + identity.producer().lifecycleKey() + "/" + identity.controller().lifecycleKey());
+        }
+        return Long.toHexString(hash);
+    }
+
+    private static String closure(Evidence evidence) {
+        if (evidence.sourceCommit() == null || evidence.sourceCommit().isEmpty()
+            || evidence.declarations() == null || evidence.recordDigest() == null) {
+            return REFUSED_ILLEGAL_IDENTITY;
+        }
+        if (!recordsDigest(evidence.replay()).equals(evidence.recordDigest())) {
+            return REFUSED_ILLEGAL_IDENTITY;
+        }
+        return null;
+    }
+
+    private static long fold(long hash, String text) {
+        long value = hash;
+        for (int index = 0; index < text.length(); index++) {
+            value ^= text.charAt(index);
+            value *= PRIME;
+        }
+        return value;
+    }
+
     /** Compares two sides under the version they declare. An empty sample is refused and does not
      * count as a pair the comparison passed judgement on. */
     public Verdict compare(CommitLog.SchemaReplay left, CommitLog.SchemaReplay right) {
+        return compare(left, right, null);
+    }
+
+    private Verdict compare(CommitLog.SchemaReplay left, CommitLog.SchemaReplay right, Strict strict) {
         if (left == null || right == null) {
             return refuse(REFUSED_SIDE_MISSING, "");
         }
@@ -115,7 +201,12 @@ public final class ReplayComparator {
         if (left.typedSteps().isEmpty() || right.typedSteps().isEmpty()) {
             return emptySample("a version 1 side carries no typed step");
         }
-        return compareTyped(left.typedSteps(), right.typedSteps());
+        return compareTyped(left.typedSteps(), right.typedSteps(), strict);
+    }
+
+    /** The two sealed declarations a strict comparison reads its instance column from; null on the
+     * historical path, which has none and says so in its note. */
+    private record Strict(FrozenDeclarations left, FrozenDeclarations right) {
     }
 
     private Verdict comparePlain(List<CommitLog.Entry.Step> left, List<CommitLog.Entry.Step> right) {
@@ -145,15 +236,24 @@ public final class ReplayComparator {
         return decide(differences, fields, LEGACY_NOTE);
     }
 
-    private Verdict compareTyped(List<CommitLog.TypedStep> left, List<CommitLog.TypedStep> right) {
+    private Verdict compareTyped(List<CommitLog.TypedStep> left, List<CommitLog.TypedStep> right,
+                                 Strict strict) {
         Canonical leftOrdinals = new Canonical();
         Canonical rightOrdinals = new Canonical();
+        List<String> leftInstances = instanceColumn(left, strict == null ? null : strict.left(),
+            leftOrdinals);
+        List<String> rightInstances = instanceColumn(right, strict == null ? null : strict.right(),
+            rightOrdinals);
+        if (leftInstances == null || rightInstances == null) {
+            return refuse(REFUSED_ILLEGAL_IDENTITY, "the records of this side are not backed by the "
+                + "declarations its closure carries");
+        }
         int differences = Math.abs(left.size() - right.size());
         int shared = Math.min(left.size(), right.size());
         List<String> fields = new ArrayList<>();
         for (int index = 0; index < shared; index++) {
-            Map<String, String> a = columns(leftOrdinals, left.get(index));
-            Map<String, String> b = columns(rightOrdinals, right.get(index));
+            Map<String, String> a = columns(leftOrdinals, left.get(index), leftInstances.get(index));
+            Map<String, String> b = columns(rightOrdinals, right.get(index), rightInstances.get(index));
             boolean stepDiffers = false;
             for (String field : CANONICAL_FIELDS) {
                 if (!Objects.equals(a.get(field), b.get(field))) {
@@ -165,7 +265,31 @@ public final class ReplayComparator {
                 differences++;
             }
         }
-        return decide(differences, fields, "");
+        return decide(differences, fields, strict == null ? UNVERIFIED_NOTE : "");
+    }
+
+    /** The instance column of one side, in step order. A strict side reads the canonical form the
+     * sealed declarations back and answers null when any step is not backed by them; the historical
+     * side keeps the first-appearance ordinal and gives up the claim the note denies it. */
+    private static List<String> instanceColumn(List<CommitLog.TypedStep> steps,
+                                               FrozenDeclarations declarations, Canonical ordinals) {
+        List<String> column = new ArrayList<>(steps.size());
+        for (CommitLog.TypedStep step : steps) {
+            if (declarations == null) {
+                column.add(String.valueOf(ordinals.ordinal("instance/" + step.worldId() + "/"
+                    + step.domainId() + "/" + step.identity().instanceId())));
+                continue;
+            }
+            CommitLog.Resolved seat = new CommitLog.Resolved(step.planSequence(), step.position(),
+                false);
+            IdentityWitness.Verdict witness = IdentityWitness.verify(declarations, seat, step.worldId(),
+                step.domainId(), step.nodeKey(), step.identity(), null);
+            if (!witness.accepted()) {
+                return null;
+            }
+            column.add(witness.instance());
+        }
+        return column;
     }
 
     private static String integrity(CommitLog.SchemaReplay side) {
@@ -215,7 +339,8 @@ public final class ReplayComparator {
         return producer.lifecycleKey() + "|" + controller.lifecycleKey();
     }
 
-    private static Map<String, String> columns(Canonical ordinals, CommitLog.TypedStep step) {
+    private static Map<String, String> columns(Canonical ordinals, CommitLog.TypedStep step,
+                                               String instance) {
         CommitLog.Identity identity = step.identity();
         EffectStore.Recorded effect = step.effect();
         String pair = step.worldId() + "/" + step.domainId();
@@ -231,8 +356,7 @@ public final class ReplayComparator {
             + identity.worldEpoch())));
         columns.put("chunk", String.valueOf(identity.chunkPos()));
         columns.put("status", identity.targetStatus());
-        columns.put("instance", String.valueOf(ordinals.ordinal("instance/" + pair + "/"
-            + identity.instanceId())));
+        columns.put("instance", instance);
         columns.put("authorization", String.valueOf(ordinals.ordinal("authorization/" + pair + "/"
             + identity.authorizationGeneration())));
         columns.put("effect", String.valueOf(ordinals.ordinal("effect/" + identity.effectRef())));

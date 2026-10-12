@@ -37,18 +37,26 @@ class CommitLogOrderGuardTest {
         }
     }
 
+    /** The holder stand-in of this file: it declares every place the order source of a test
+     * answers for, at the artefact the identities of this file carry. */
+    private static WitnessSource declared(CommitLog.OrderSource plans) {
+        return new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, "7/0", "7/1",
+            "7/2", "7/3", "7/4", "7/5", "6/9");
+    }
+
     private static CommitLog.Batch batch(String nodeKey) {
         return new CommitLog.Batch(WORLD, DOMAIN, nodeKey, CommitLog.Batch.Kind.APPLY, 7L, 4242L, 2);
     }
 
-    private static CommitLog.Identity identity(long instance, long effectRef) {
+    private static CommitLog.Identity identity(long instance, long effectRef,
+                                               CommitNamespaces.Namespace controller) {
         return new CommitLog.Identity(CommitLog.SCHEMA_TYPED, instance, 5L, 3L, "published", 7L,
-            effectRef, new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L),
-            new CommitNamespaces.Namespace("controller", 5150L, 0L, 91L));
+            effectRef, new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L), controller);
     }
 
     private static CommitLog.TypedBatch typed(String nodeKey, long effectRef, long instance) {
-        return new CommitLog.TypedBatch(batch(nodeKey), identity(instance, effectRef),
+        return new CommitLog.TypedBatch(batch(nodeKey),
+            identity(instance, effectRef, new CommitNamespaces.Namespace("controller", 5150L, 0L, 91L)),
             new EffectStore.Effect(effectRef, "publish", "PUBLISHED", List.of("a=1", "b=2")));
     }
 
@@ -59,8 +67,8 @@ class CommitLogOrderGuardTest {
         List<String> rows = List.of("a=1", "b=2");
         EffectStore.Effect variant = new EffectStore.Effect(effectRef, "publish", "PUBLISHED", rows);
         return new CommitTicket.ReserveRequest(WORLD, DOMAIN, nodeKey, CommitLog.Batch.Kind.APPLY,
-            plan, position, plan, 4242L, rows.size(), identity(instance, effectRef), controller,
-            variant, variant, variant);
+            plan, position, plan, 4242L, rows.size(), identity(instance, effectRef, controller),
+            controller, variant, variant, variant);
     }
 
     private static CommitTicket.Outcome outcome() {
@@ -79,8 +87,9 @@ class CommitLogOrderGuardTest {
     @Test
     void aTerminalOfALaterPlaceWaitsForTheEarlierOne() {
         EffectStore store = new EffectStore(65536, 16);
-        CommitLog log = new CommitLog(() -> 4, new Places(), store);
-        CommitReservation reservations = new CommitReservation(log, store, new Places(), "owner-a",
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 4, plans, store, declared(plans));
+        CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         // The later place is taken and started first; only then does an earlier place of the pair
         // arrive, which is what a plan built around the first reservation looks like.
@@ -119,7 +128,8 @@ class CommitLogOrderGuardTest {
     @Test
     void aRefusedLineLeavesTheOrderOfItsPairWhereItWas() {
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 4, new Places(), store);
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 4, plans, store, declared(plans));
         log.beginTick(1L);
         assertNotNull(log.reserveSlot(WORLD, DOMAIN, 7L, 3), "a reservation holds place 3 of the pair");
         assertTrue(log.reach(batch("7/0")).logged(), "the place before it is free to the plain path");
@@ -152,7 +162,8 @@ class CommitLogOrderGuardTest {
     @Test
     void aRefusedLineLeavesTheRingAndTheStateWhereTheyWere() {
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 2, new Places(), store);
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 2, plans, store, declared(plans));
         log.beginTick(1L);
         CommitLog.RingSlot held = log.reserveSlot(WORLD, DOMAIN, 7L, 5);
         assertTrue(log.reach(batch("7/0")).logged(), "the remaining slot is used by a line");
@@ -175,7 +186,10 @@ class CommitLogOrderGuardTest {
     @Test
     void aVersionedLineDoesNotWritePastThePlaceAReservationHolds() {
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 4, new Places(), store);
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 4, plans, store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, "7/0", "7/1", "7/2", "7/3",
+                "7/4", "7/5", "6/9"));
         log.beginTick(1L);
         assertNotNull(log.reserveSlot(WORLD, DOMAIN, 7L, 0), "a reservation holds place 0 of the pair");
 
@@ -198,8 +212,9 @@ class CommitLogOrderGuardTest {
     @Test
     void aPlaceThePairHasPassedIsNotReserved() {
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 4, new Places(), store);
-        CommitReservation reservations = new CommitReservation(log, store, new Places(), "owner-a",
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 4, plans, store, declared(plans));
+        CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         log.beginTick(1L);
         assertTrue(log.reach(batch("7/2")).logged());
@@ -224,11 +239,13 @@ class CommitLogOrderGuardTest {
     @Test
     void aTicketWhosePlaceIsNotHeldAsAPlanEndsNothing() {
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 4, new Places(), store);
+        Places plans = new Places();
+        CommitLog log = new CommitLog(() -> 4, plans, store, declared(plans));
         log.beginTick(1L);
         CommitLog.RingSlot slot = log.reserveSlot(WORLD, DOMAIN);
         EffectStore.CapacitySlot room = store.reserveCapacity(100L, 2, 512).slot();
-        CommitTicket ticket = new CommitTicket(1L, log.logLifetime(), batch("7/0"), identity(42L, 100L),
+        CommitTicket ticket = new CommitTicket(1L, log.logLifetime(), batch("7/0"),
+            identity(42L, 100L, new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L)),
             7L, 0, slot, room, new CommitNamespaces.Namespace("controller", log.logLifetime(), 0L, -1L));
 
         CommitLog.Verdict verdict = log.recordTicket(ticket, outcome());

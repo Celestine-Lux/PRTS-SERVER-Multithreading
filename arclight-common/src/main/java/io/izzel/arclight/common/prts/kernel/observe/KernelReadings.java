@@ -15,6 +15,7 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.support.PrtsChunkFlow;
 import io.izzel.arclight.common.prts.support.PrtsChunkMaterialization;
@@ -768,6 +769,11 @@ public final class KernelReadings {
         add(lines, "jobs.meter_nanos", meter.nanos());
         add(lines, "jobs.meter_classes", meter.classes());
         add(lines, "jobs.meter_refused", meter.refusedNotes());
+        // What the pipeline producer handed over at the freeze that is running, and how much of it
+        // carries the artefact a witness needs. A count of rounds is not an artefact, so this reads
+        // the candidates it declared apart from the ones that could enter a sealed table.
+        add(lines, "jobs.candidate_declarations", module.pipelineJobCandidates());
+        add(lines, "jobs.candidates_without_artefact", module.pipelineCandidatesWithoutArtefact());
         CommitLog commits = module.commits();
         CommitLog.Replay replay = module.commitReplay();
         add(lines, "commit.observation_only", 1);
@@ -886,6 +892,22 @@ public final class KernelReadings {
         add(lines, "product.commit.binding_order_source",
             module.commitOrderSourceBound() ? 1 : 0);
         add(lines, "product.commit.controller_reset_epoch", controller == null ? 0L : controller.epoch());
+        // The freeze the module sealed: its own plan sequence, how many places it accepted, and the
+        // named state of a producer that never sealed one. A table that is not wired reads its state
+        // and not a zero entry count that could be mistaken for a verified freeze.
+        FrozenDeclarations declarations = module.declarations();
+        add(lines, "product.commit.declaration_state", declarations.state());
+        add(lines, "product.commit.declaration_plan", declarations.planSequence());
+        add(lines, "product.commit.declaration_entries", declarations.size());
+        add(lines, "product.commit.declaration_digest", Long.toHexString(declarations.digest()));
+        add(lines, "product.commit.declaration_refusal",
+            module.declarationRefusal().isEmpty() ? "-" : module.declarationRefusal());
+        add(lines, "product.commit.declarations_sealed", module.declarationsSealed());
+        add(lines, "product.commit.declaration_refusals", module.declarationRefusals());
+        add(lines, "product.commit.witness_refusals",
+            reservations == null ? 0L : reservations.witnessRefusals());
+        add(lines, "product.commit.drift_refusals",
+            reservations == null ? 0L : reservations.driftRefusals());
         add(lines, "product.commit.controller_reset_pending", module.commitResetPending() ? 1 : 0);
         add(lines, "product.commit.submits", controller == null ? 0L : controller.submits());
         add(lines, "product.commit.not_wired_refusals",

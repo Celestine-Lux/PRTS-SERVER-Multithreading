@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** A whole reset is asked for through the one request entry of the module and is answered at the
  * owner safe point: on the thread the host named it is carried out there, and from any other thread
@@ -42,9 +43,11 @@ class CommitChainResetRequestTest {
         final CommitController controller;
 
         Chain(CommitLog.OrderSource source) {
-            log = new CommitLog(() -> 4, source, store);
-            reservations = new CommitReservation(log, store,
-                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false), "owner-a", epochs);
+            CommitLog.OrderSource plans =
+                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
+            log = new CommitLog(() -> 4, source, store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, null);
         }
 

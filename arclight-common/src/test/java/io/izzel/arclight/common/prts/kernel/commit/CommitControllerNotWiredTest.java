@@ -39,7 +39,8 @@ class CommitControllerNotWiredTest {
 
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(4096, 8);
-        final CommitLog log = new CommitLog(() -> 4, plans, store);
+        final CommitLog log = new CommitLog(() -> 4, plans, store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);

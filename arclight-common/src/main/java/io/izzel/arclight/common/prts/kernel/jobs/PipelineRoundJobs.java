@@ -3,6 +3,7 @@ package io.izzel.arclight.common.prts.kernel.jobs;
 
 import io.izzel.arclight.common.prts.kernel.auth.HolderKind;
 import io.izzel.arclight.common.prts.kernel.auth.WriteLevel;
+import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.shares.ShareClass;
 import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
 
@@ -61,7 +62,10 @@ public final class PipelineRoundJobs implements PrtsPipelineRows.MailboxOwnerTap
     private final LongAdder roundsUnplaced = new LongAdder();
     private final LongAdder tasksSeen = new LongAdder();
     private volatile Map<String, Trace> last = Map.of();
+    private volatile List<FrozenDeclarations.Candidate> candidates = List.of();
     private long windows;
+    private long candidateDeclarations;
+    private long candidatesWithoutArtefact;
     private long declared;
     private long refused;
     private long coveredRounds;
@@ -100,6 +104,11 @@ public final class PipelineRoundJobs implements PrtsPipelineRows.MailboxOwnerTap
         }
         drained.sort(Comparator.comparing((Counter counter) -> counter.worldId)
             .thenComparing(counter -> counter.mailbox));
+        // The candidate declarations are handed over before the first submission of this freeze and
+        // carry no position: what this producer counts is a round, and which place the round takes
+        // is the frozen plan's to give. A round count is not an artefact of a write, so no chunk and
+        // no target state are invented for it.
+        candidates = candidatesOf(drained);
         Map<String, Trace> traces = new LinkedHashMap<>();
         long covered = 0L;
         long declaredNow = 0L;
@@ -125,6 +134,42 @@ public final class PipelineRoundJobs implements PrtsPipelineRows.MailboxOwnerTap
         lastDeclared = declaredNow;
         last = Map.copyOf(traces);
         return drained.size();
+    }
+
+    /** One candidate per round group that declared anything, in the order the drain read them. The
+     * artefact of the write is left out rather than filled in: this producer holds a count of rounds
+     * and nothing that says which chunk or which state the write reached. */
+    private List<FrozenDeclarations.Candidate> candidatesOf(List<Counter> drained) {
+        List<FrozenDeclarations.Candidate> declared = new ArrayList<>();
+        long missing = 0L;
+        for (Counter counter : drained) {
+            if (counter.rounds.sum() <= 0L) {
+                continue;
+            }
+            FrozenDeclarations.Candidate candidate = new FrozenDeclarations.Candidate(counter.worldId,
+                DOMAIN, keyOf(counter.worldId, counter.mailbox), null, "");
+            if (!candidate.artefactDeclared()) {
+                missing++;
+            }
+            declared.add(candidate);
+        }
+        candidateDeclarations = declared.size();
+        candidatesWithoutArtefact = missing;
+        return List.copyOf(declared);
+    }
+
+    /** The declarations this producer handed over at the freeze that is running, in the order they
+     * were handed over. Read-only: a caller never writes a table, and this producer has none. */
+    public List<FrozenDeclarations.Candidate> candidateDeclarations() {
+        return candidates;
+    }
+
+    public long candidateCount() {
+        return candidateDeclarations;
+    }
+
+    public long candidatesWithoutArtefact() {
+        return candidatesWithoutArtefact;
     }
 
     /** The declaration of one round group: the world and the domain of the batch, the read and write
@@ -189,6 +234,9 @@ public final class PipelineRoundJobs implements PrtsPipelineRows.MailboxOwnerTap
     public void reset() {
         open.clear();
         last = Map.of();
+        candidates = List.of();
+        candidateDeclarations = 0L;
+        candidatesWithoutArtefact = 0L;
         roundsSeen.reset();
         roundsUnplaced.reset();
         tasksSeen.reset();

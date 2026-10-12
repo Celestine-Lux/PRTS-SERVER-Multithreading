@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** The face of the commit controller: what it reads while nothing is bound, and what the module
  * does with a reset while a line is publishing. */
@@ -146,7 +147,8 @@ class CommitControllerReadingsTest {
         module.serverTick(List.of("world-a"));
         EffectStore store = new EffectStore(4096, 8);
         CommitLog.OrderSource plans = (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
-        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, "world-a", "entity", 3L, "published", 5L, 7L, "a/0"));
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         final CommitController[] holder = new CommitController[1];

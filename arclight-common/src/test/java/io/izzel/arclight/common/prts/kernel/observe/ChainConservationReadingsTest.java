@@ -19,6 +19,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** The balance of an adopted chain, read column by column instead of as one boolean: what was
  * reserved, what was finalized, what was released and what is still in flight, next to the room and
@@ -138,7 +139,8 @@ class ChainConservationReadingsTest {
         module.serverTick(List.of(WORLD));
         Plans plans = new Plans();
         EffectStore store = new EffectStore(4096, 8);
-        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         CommitController controller = new CommitController(reservations, null);

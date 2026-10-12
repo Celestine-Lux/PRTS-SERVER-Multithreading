@@ -55,11 +55,31 @@ class ReplayComparatorTest {
             step.disposition(), effect);
     }
 
+    /** A holder that sealed what this test declares, read off the reports the test is about to
+     * make: the seats come from the order source the run was built on and the artefact from the
+     * identity of the first report. */
+    private static IdentityWitness.Source witnessOf(CommitLog.OrderSource source,
+                                                    CommitLog.TypedBatch... reports) {
+        if (reports.length == 0 || reports[0].identity() == null) {
+            return IdentityWitness.NONE;
+        }
+        CommitLog.Identity identity = reports[0].identity();
+        WitnessSource witness = new WitnessSource(source, WORLD, DOMAIN, identity.chunkPos(),
+            identity.targetStatus(), identity.worldEpoch(), identity.authorizationGeneration(),
+            "a/0", "a/1", "a/2");
+        for (CommitLog.TypedBatch report : reports) {
+            witness.declare(report.batch().nodeKey(), report.identity().chunkPos(),
+                report.identity().targetStatus());
+        }
+        return witness;
+    }
+
     /** One run: the reports of one tick, driven through the log and read back as its versioned
      * projection. Every side of every test is built this way, on the real storage chain. */
     private static CommitLog.SchemaReplay run(CommitLog.OrderSource source,
                                               CommitLog.TypedBatch... reports) {
-        CommitLog log = new CommitLog(() -> 16, source, new EffectStore(1 << 20, 64));
+        CommitLog log = new CommitLog(() -> 16, source, new EffectStore(1 << 20, 64),
+            witnessOf(source, reports));
         log.beginTick(1L);
         for (CommitLog.TypedBatch report : reports) {
             assertTrue(log.reachTyped(report).logged(), "the driver stores what it reports");
@@ -228,7 +248,8 @@ class ReplayComparatorTest {
 
     @Test
     void oneGrantVersionOverTwoChunksIsNotOneProduct() {
-        CommitLog.SchemaReplay first = run(order(1L),
+        CommitLog.OrderSource source = order(1L);
+        CommitLog.SchemaReplay first = run(source,
             report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, "chunk=64", "state=full"),
             report("a/1", 2L, 5L, 65L, "full", 3L, 101L, 4242L, "chunk=65", "state=full"));
         CommitLog.SchemaReplay second = run(order(1L),
@@ -496,10 +517,11 @@ class ReplayComparatorTest {
 
     @Test
     void aTickThatCarriesBothProtocolsIsRefusedOnTheRealChain() {
-        CommitLog log = new CommitLog(() -> 8, order(1L), new EffectStore(1 << 12, 8));
+        CommitLog.TypedBatch first = report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, "chunk=64");
+        CommitLog log = new CommitLog(() -> 8, order(1L), new EffectStore(1 << 12, 8),
+            witnessOf(order(1L), first));
         log.beginTick(1L);
-        assertTrue(log.reachTyped(report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, "chunk=64"))
-            .logged());
+        assertTrue(log.reachTyped(first).logged());
         assertTrue(log.reach(new CommitLog.Batch(WORLD, DOMAIN, "a/1", CommitLog.Batch.Kind.APPLY,
             3L, 12L, 1)).logged());
         log.closeTick();
@@ -534,9 +556,11 @@ class ReplayComparatorTest {
 
     /** One run read back only through the evidence its reset kept. */
     private static CommitLog runThenReset(String... rows) {
-        CommitLog log = new CommitLog(() -> 4, order(1L), new EffectStore(1 << 12, 4));
+        CommitLog.TypedBatch only = report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, rows);
+        CommitLog log = new CommitLog(() -> 4, order(1L), new EffectStore(1 << 12, 4),
+            witnessOf(order(1L), only));
         log.beginTick(1L);
-        assertTrue(log.reachTyped(report("a/0", 1L, 5L, 64L, "full", 3L, 100L, 4242L, rows)).logged());
+        assertTrue(log.reachTyped(only).logged());
         log.reset();
         return log;
     }

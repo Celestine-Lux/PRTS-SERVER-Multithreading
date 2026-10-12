@@ -11,6 +11,7 @@ import io.izzel.arclight.common.prts.kernel.observe.KernelReadings;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /**
  * A controlled host drive: the module entries are called in the order the platform calls them, from
@@ -105,9 +106,11 @@ final class HostDriveFixture {
 
         Chain(KernelModule module, CommitController.Publisher publisher) {
             EffectStore store = new EffectStore(4096, 8);
-            log = new CommitLog(() -> 8, module.commitOrderSource(), store);
-            reservations = new CommitReservation(log, store,
-                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false), "owner-a", epochs);
+            CommitLog.OrderSource plans =
+                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
+            log = new CommitLog(() -> 8, module.commitOrderSource(), store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, publisher);
             KernelModule.CommitBinding binding = module.installCommitChain(log, controller);
             if (!binding.bound()) {

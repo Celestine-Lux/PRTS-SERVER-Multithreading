@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** Who carries out a reset of the commit lifecycle and how often: the module owns the whole request
  * and runs it at one safe point, the controller only decides whether that point may be entered, and
@@ -49,7 +50,9 @@ class KernelModuleResetOwnerTest {
         final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(65536, 64);
-        final CommitLog log = new CommitLog(() -> 8, module.commitOrderSource(), store);
+        final CommitLog log = new CommitLog(() -> 8, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
+                () -> plans.plan, NODE));
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);

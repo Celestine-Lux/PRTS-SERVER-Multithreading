@@ -18,6 +18,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** A close ends the chain the module holds and nothing else: it gives back only the reservations
  * that never started, it keeps every item whose side effect may have run readable with its room, it
@@ -39,9 +40,11 @@ class CommitChainCloseTest {
         final CommitController controller;
 
         Chain(CommitLog.OrderSource source) {
-            log = new CommitLog(() -> 4, source, store);
-            reservations = new CommitReservation(log, store,
-                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false), "owner-a", epochs);
+            CommitLog.OrderSource plans =
+                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
+            log = new CommitLog(() -> 4, source, store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, null);
         }
 

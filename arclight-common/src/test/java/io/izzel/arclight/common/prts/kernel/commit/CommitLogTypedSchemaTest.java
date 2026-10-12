@@ -37,6 +37,11 @@ class CommitLogTypedSchemaTest {
         };
     }
 
+    /** The holder stand-in of this file: the artefact every identity it builds declares. */
+    private static WitnessSource declared(CommitLog.OrderSource plans) {
+        return new WitnessSource(plans, WORLD, DOMAIN, 64L, "full", 5L, 3L, "a/0", "a/1", "a/2");
+    }
+
     private static CommitLog.Batch batch(String key, long digest) {
         return new CommitLog.Batch(WORLD, DOMAIN, key, CommitLog.Batch.Kind.APPLY, 7L, digest, 3);
     }
@@ -70,7 +75,7 @@ class CommitLogTypedSchemaTest {
     }
 
     private static CommitLog log(EffectStore effects) {
-        return new CommitLog(() -> 8, order(1L), effects);
+        return new CommitLog(() -> 8, order(1L), effects, declared(order(1L)));
     }
 
     private static CommitLog.Entry head(CommitLog log) {
@@ -211,7 +216,7 @@ class CommitLogTypedSchemaTest {
 
     @Test
     void aHeldRingSlotIsNotTakenByAPlainReport() {
-        CommitLog log = new CommitLog(() -> 2, order(1L), store());
+        CommitLog log = new CommitLog(() -> 2, order(1L), store(), declared(order(1L)));
         log.beginTick(10L);
         CommitLog.RingSlot held = log.reserveSlot(WORLD, DOMAIN);
 
@@ -233,7 +238,8 @@ class CommitLogTypedSchemaTest {
     @Test
     void aShortageOnEitherSideLeavesNeitherALineNorARecord() {
         EffectStore effects = new EffectStore(4096, 1);
-        CommitLog log = new CommitLog(() -> 8, order(1L), effects);
+        CommitLog log = new CommitLog(() -> 8, order(1L), effects, declared(order(1L))
+                .declare("a/1", 65L, "full"));
         log.beginTick(10L);
         assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
         long afterFirst = log.sequence();
@@ -249,7 +255,7 @@ class CommitLogTypedSchemaTest {
         assertEquals(0, effects.reservedBytes());
         assertEquals(0, log.reservedSlots());
 
-        CommitLog tightRing = new CommitLog(() -> 1, order(1L), new EffectStore(4096, 8));
+        CommitLog tightRing = new CommitLog(() -> 1, order(1L), new EffectStore(4096, 8), declared(order(1L)));
         tightRing.beginTick(10L);
         assertTrue(tightRing.reach(batch("a/0", 11L)).logged());
         CommitLog.Verdict noRoom = tightRing.reachTyped(typed("a/1", 100L, LIFETIME, "chunk=64"));
@@ -472,7 +478,9 @@ class CommitLogTypedSchemaTest {
     @Test
     void oneInstanceNumberUnderAnotherChunkOrStateIsRefused() {
         EffectStore effects = store();
-        CommitLog log = log(effects);
+        CommitLog log = new CommitLog(() -> 8, order(1L), effects,
+            new WitnessSource(order(1L), WORLD, DOMAIN, 64L, "full", 5L, 3L, "a/0", "a/1")
+                .declare("a/1", 65L, "full"));
         log.beginTick(10L);
         assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
 
@@ -514,7 +522,8 @@ class CommitLogTypedSchemaTest {
 
     @Test
     void twoVersionedReportsDoNotShareOneHeldSlot() {
-        CommitLog log = new CommitLog(() -> 2, order(1L), store());
+        CommitLog log = new CommitLog(() -> 2, order(1L), store(), declared(order(1L))
+                .declare("a/1", 65L, "full"));
         log.beginTick(10L);
         CommitLog.RingSlot held = log.reserveSlot(WORLD, DOMAIN);
         assertNotNull(held);

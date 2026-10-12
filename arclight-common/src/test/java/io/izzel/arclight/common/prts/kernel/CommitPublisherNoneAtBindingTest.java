@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** A build whose controller carries no publish action refuses the request where it is asked, and it
  * does so in all three states of the binding: before a chain is installed, after one is installed,
@@ -48,7 +49,8 @@ class CommitPublisherNoneAtBindingTest {
         final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(4096, 8);
-        final CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        final CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);

@@ -19,6 +19,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** What the readout says about an item whose side effect has run and whose terminal line is not
  * written: it is named as waiting, instead of reading like a publish that never came back. */
@@ -83,7 +84,8 @@ class PendingDispositionReadingsTest {
         CommitLog.OrderSource plans =
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
         KernelModule module = KernelModule.instance();
-        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         CommitController controller = new CommitController(reservations,
@@ -137,7 +139,8 @@ class PendingDispositionReadingsTest {
         CommitLog.OrderSource plans =
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
         KernelModule module = KernelModule.instance();
-        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store);
+        CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         CommitController[] holder = new CommitController[1];

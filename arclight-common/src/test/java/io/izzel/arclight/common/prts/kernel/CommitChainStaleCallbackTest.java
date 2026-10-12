@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import io.izzel.arclight.common.prts.kernel.commit.WitnessSource;
 
 /** Two callbacks that do not land where they were meant to. A callback of a generation that has
  * moved on is refused on every route and its item is carried as one waiting for a line instead of
@@ -41,9 +42,11 @@ class CommitChainStaleCallbackTest {
         final CommitController controller;
 
         Chain(CommitLog.OrderSource source) {
-            log = new CommitLog(() -> 4, source, store);
-            reservations = new CommitReservation(log, store,
-                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false), "owner-a", epochs);
+            CommitLog.OrderSource plans =
+                (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
+            log = new CommitLog(() -> 4, source, store,
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, null);
         }
 
