@@ -81,7 +81,9 @@ public final class PrtsKernelEvents {
     }
 
     /** Advances the kernel by one tick and then answers the requests queued for the owner while it ran;
-     * the safe point stands after the whole tick, so it never clears a reading this tick judged. */
+     * the safe point stands after the whole tick, so it never clears a reading this tick judged. The
+     * one chain of the process is adopted at that same boundary, after the safe point of the tick that
+     * adopted it has run: the owner is bound inside the tick and a chain is taken at most once. */
     @SubscribeEvent
     public void onServerTick(ServerTickEvent.Post event) {
         PrtsLoadProbe.tickLeft();
@@ -92,6 +94,7 @@ public final class PrtsKernelEvents {
         KernelModule module = KernelModule.instance();
         module.serverTick(worlds);
         module.markSafePoint();
+        module.adoptCommitChainOnce();
     }
 
     /** The server is stopping: the entry snapshot is written before any world is touched, every world

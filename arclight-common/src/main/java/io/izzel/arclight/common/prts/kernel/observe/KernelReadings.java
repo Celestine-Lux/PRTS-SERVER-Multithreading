@@ -875,7 +875,9 @@ public final class KernelReadings {
         add(lines, "product.commit.owner_thread_named", module.commitOwnerThreadNamed());
         add(lines, "product.commit.owner_thread_mismatches",
             module.commitOwnerThreadMismatches());
-        // What one install did: the piece that refused it, and the identity of the chain it took.
+        // What one install did: the piece that refused it, the identity of the chain it took, and how
+        // often the host asked. A chain is taken at most once, so the calls answer for the retries.
+        add(lines, "product.commit.adoption_calls", module.commitAdoptionCalls());
         add(lines, "product.commit.binding_refusal",
             module.commitBindingRefusal().isEmpty() ? "-" : module.commitBindingRefusal());
         add(lines, "product.commit.binding_log_lifetime", module.commitBindingLogLifetime());

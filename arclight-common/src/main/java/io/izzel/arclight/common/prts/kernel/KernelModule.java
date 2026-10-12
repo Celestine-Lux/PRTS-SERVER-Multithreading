@@ -13,6 +13,7 @@ import io.izzel.arclight.common.prts.kernel.codes.RejectCode;
 import io.izzel.arclight.common.prts.kernel.codes.WriteDisposition;
 import io.izzel.arclight.common.prts.kernel.commit.CommitController;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
+import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
@@ -142,6 +143,13 @@ public final class KernelModule {
      * and is ordered by its own frozen sequence. */
     private static final String INTENT_DOMAIN = "intent";
 
+    /** The piece that refuses an adoption while the declared face is off. The chain check gives the
+     * same name, so the entry that refuses before a chain is built and the check after it agree. */
+    public static final String REFUSAL_DECLARED_FACE_OFF = "declared-face-off";
+
+    /** The owner a chain adopted at the tick boundary is minted under. */
+    public static final String CHAIN_OWNER_ID = "host:commit-chain";
+
     private final OwnerRegistry owners = new OwnerRegistry();
     private final IntentQueue intents = new IntentQueue(KernelSettings::intentQueueCap,
         KernelSettings::retryBudget);
@@ -204,6 +212,8 @@ public final class KernelModule {
     /** The log in use: the module's own until a whole chain is adopted, and the log of that chain
      * afterwards. Only an install moves it, and an install moves it whole or not at all. */
     private CommitLog commits = ownCommits;
+    /** The generation holder of a chain this module adopts: the module is its lifecycle owner. */
+    private final CommitNamespaces.ResetEpochs commitChainEpochs = new CommitNamespaces.ResetEpochs();
     private long tickIndex;
     private int waitCrossStreak;
     private boolean waitSiteTapInstalled;
@@ -242,6 +252,7 @@ public final class KernelModule {
     private final List<Disposition> commitSealedIdentities = new ArrayList<>();
     private long commitSealDiscards;
     private long commitCloseCalls;
+    private long commitAdoptionCalls;
     private long commitSafePointCalls;
     private long commitOwnerThreadNamed;
     private long commitOwnerThreadMismatches;
@@ -1790,6 +1801,28 @@ public final class KernelModule {
     public record CommitBinding(boolean bound, String refusal, long logLifetime, long storeId) {
     }
 
+    /** Adopts the one chain of this process at the tick boundary: built from the declaration, taken
+     * whole or not at all, and at most once. A declaration that is not executable is refused before
+     * any piece is built, since a store with no room is refused by its own constructor. */
+    public CommitBinding adoptCommitChainOnce() {
+        commitAdoptionCalls++;
+        if (this.commitController != null) {
+            return new CommitBinding(true, "", commitBindingLogLifetime, commitBindingStoreId);
+        }
+        KernelSettings.ProductCommit declared = KernelSettings.productCommit();
+        if (!declared.executable()) {
+            commitBindingRefusal = REFUSAL_DECLARED_FACE_OFF;
+            return new CommitBinding(false, REFUSAL_DECLARED_FACE_OFF, 0L, 0L);
+        }
+        EffectStore store = new EffectStore(declared.effectCapacityBytes(),
+            declared.effectCapacityRecords());
+        CommitLog log = new CommitLog(KernelSettings::commitRingCap, commitOrderSource, store);
+        CommitReservation reservations = new CommitReservation(log, store, commitOrderSource,
+            CHAIN_OWNER_ID, commitChainEpochs);
+        // The publish action is absent by construction: an adopted chain is bound, not executable.
+        return installCommitChain(log, new CommitController(reservations, null));
+    }
+
     /** Adopts one whole chain — the log, the store that log carries and the holder that mints its
      * tickets — as the single commit chain of this module, on the owner thread of the host and only
      * while the declared face is executable. Every check runs before anything is taken, and a
@@ -1861,7 +1894,7 @@ public final class KernelModule {
             return "declared-schema-mismatch";
         }
         if (!declared.executable()) {
-            return "declared-face-off";
+            return REFUSAL_DECLARED_FACE_OFF;
         }
         if (commitController != null && commitController != controller) {
             return "already-bound";
@@ -1978,6 +2011,11 @@ public final class KernelModule {
     /** Where the newest reset request came from, or an empty string while none was made. */
     public String commitResetSource() {
         return commitResetSource;
+    }
+
+    /** How often the host asked this module to adopt a chain, one call per tick boundary. */
+    public long commitAdoptionCalls() {
+        return commitAdoptionCalls;
     }
 
     /** How often the adopted chain was asked to close through {@link #closeCommitChain()}. */
