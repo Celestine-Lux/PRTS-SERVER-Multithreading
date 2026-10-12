@@ -4,6 +4,7 @@ package io.izzel.arclight.neoforge.prts.kernel;
 import io.izzel.arclight.common.prts.kernel.KernelModule;
 import io.izzel.arclight.common.prts.config.PrtsConfigManager;
 import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
+import io.izzel.arclight.common.prts.kernel.observe.CloseSealWriter;
 import io.izzel.arclight.common.prts.kernel.wiring.KernelWiring;
 import io.izzel.arclight.common.prts.support.PrtsLoadProbe;
 import net.minecraft.server.level.ServerLevel;
@@ -93,15 +94,31 @@ public final class PrtsKernelEvents {
         module.markSafePoint();
     }
 
-    /** The server is stopping: every world it still carries is flushed through the four step set and
-     * the chain is then closed. Which of the two came first is recorded by the kernel, not assumed here,
-     * and the unload event is not delivered on this path, so the worlds are walked here or nowhere. */
+    /** The server is stopping: the entry snapshot is written before any world is touched, every world
+     * it still carries is then flushed through the four step set, the chain is closed, and the terminal
+     * snapshot is written whether those two succeeded or failed. Which of the flush and the close came
+     * first is recorded by the kernel, not assumed here, and the unload event is not delivered on this
+     * path, so the worlds are walked here or nowhere. */
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
         KernelModule module = KernelModule.instance();
+        List<String> worlds = new ArrayList<>();
         for (ServerLevel level : event.getServer().getAllLevels()) {
-            module.flushWorldAtStop(level.dimension().location().toString());
+            worlds.add(level.dimension().location().toString());
         }
-        module.closeCommitChain();
+        CloseSealWriter seal = CloseSealWriter.forRun();
+        seal.entry(worlds, module);
+        try {
+            seal.flushing();
+            for (String world : worlds) {
+                module.flushWorldAtStop(world);
+            }
+            seal.closed(module.closeCommitChain());
+        } catch (RuntimeException error) {
+            seal.errored(error);
+            throw error;
+        } finally {
+            seal.terminal(worlds, module);
+        }
     }
 }
