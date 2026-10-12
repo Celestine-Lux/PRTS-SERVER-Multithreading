@@ -286,15 +286,29 @@ public final class KernelModule {
     private TickPlanStore.Control previousControl = TickPlanStore.Control.missing();
     private CommitLog.Replay lastCommitReplay;
     private CommitController commitController;
-    private boolean resetPending;
     private String commitBindingRefusal = "";
     private long commitBindingLogLifetime;
     private long commitBindingStoreId;
-    private String commitResetSource = "";
+    /** The one monitor of the reset mailbox: every field below is read under it, and nothing that
+     * can take another lock or run a host callback is called while it is held. */
+    private final Object resetMailbox = new Object();
+    private final Deque<RequestItem> resetQueue = new ArrayDeque<>();
+    /** The one reset an owner-thread call could not carry out; held apart from the queue. */
+    private boolean resetDeferred;
+    private RequestItem resetDeferredItem;
+    /** Whether the mailbox has seen the chain closed; enqueueing is decided against it. */
+    private boolean resetMailboxClosed;
+    /** Items the owner has taken out and not answered: they still count against the capacity. */
+    private int resetInProgress;
+    private long resetRequestSequence;
+    private long resetArrivals;
     private long commitResetRequests;
     private long commitResetHandOffs;
+    private long commitResetMerges;
+    private long commitResetAdmits;
     private long commitResetQueueRefusals;
-    private final Deque<String> resetQueue = new ArrayDeque<>();
+    private long commitResetClosedRefusals;
+    private volatile ResetTrace resetTrace = ResetTrace.NONE;
     private boolean commitSealed;
     private long commitSealedTurn;
     private int commitSealedCount;
@@ -306,11 +320,6 @@ public final class KernelModule {
     private long commitOwnerThreadNamed;
     private long commitOwnerThreadMismatches;
     private long commitOwnerThreadId;
-    private long commitResetRequestThreadId;
-    private long commitResetSafePointThreadId;
-    private long commitResetCarryEpoch = NO_CARRIED_EPOCH;
-    private String commitResetResult = "";
-    private boolean resetTraceWaiting;
     private long hostEntrySequence;
     private long stopFlushLastSequence;
     private long stopCloseLastSequence;
@@ -363,7 +372,6 @@ public final class KernelModule {
             this::anyProgressMoved);
     }
 
-    /** Whether any wait point's progress signal moved in the newest reading. */
     private boolean anyProgressMoved() {
         for (WaitProgress.Reading reading : waitPoints.progress().readings()) {
             if (reading.bound() && reading.delta() > 0L) {
@@ -648,9 +656,7 @@ public final class KernelModule {
         injectLadderWalk();
     }
 
-    /** The controlled leg of the resource ladder: walks or returns the rungs an injection declared,
-     * one rung per tick, so the order is walked and never skipped. Off unless a directive names it;
-     * a rung reports its action only while the switch that would allow one is on. */
+    /** One rung per tick, so the order is walked and never skipped. */
     private void injectLadderWalk() {
         DegradeLevel[] levels = DegradeLevel.values();
         int walk = FaultInjection.ladderWalkStep();
@@ -665,10 +671,7 @@ public final class KernelModule {
         }
     }
 
-    /** The controlled leg of the wait walk: observes the waits an injection declared, taking the
-     * call-site classes in turn so one declaration covers each class. Off unless a directive names
-     * it, and the observation enters through the same call the twenty real call sites use, so the
-     * counters it moves are the counters the live path moves. */
+    /** Takes the call-site classes in turn and enters through the same call the real sites use. */
     private void injectWaits() {
         int step = FaultInjection.waitWalkStep();
         if (step <= 0) {
@@ -693,10 +696,7 @@ public final class KernelModule {
         waitPoints.noteInjectionWalkthrough(chosen.wpId(), wanted);
     }
 
-    /** One tick of the wait ladder. A tick that carried a wait over the bound enters the first rung;
-     * a run of such ticks walks it one rung further, in order, because the ladder may not skip. The
-     * ladder only counts: no rung changes the bound, the parallel degree or the order of the tick in
-     * this build, and a rung reports its action only while the switch that would allow one is on. */
+    /** A run of ticks over the bound walks the ladder one rung further, in order; it only counts. */
     private void noteWaitLadder(boolean crossed) {
         if (crossed) {
             waitCrossStreak++;
@@ -711,10 +711,7 @@ public final class KernelModule {
         waitLadder.noteTick(crossed);
     }
 
-    /** Freezes the plan of one tick. The declarations the domains handed in since the last plan are
-     * taken here, the job graph is built from them, and the plan is published with the control frame
-     * the next planning period consumes. A tick whose control frame is missing is a bootstrap tick:
-     * it is counted and no plan is built from values nobody measured. */
+    /** A tick whose control frame is missing is a bootstrap tick: no plan is built from it. */
     private void freezePlan(List<String> worldIds) {
         List<String> worlds = worldIds == null ? List.of() : worldIds;
         List<String> sorted = new ArrayList<>(worlds);
@@ -778,7 +775,6 @@ public final class KernelModule {
         plans.takeFeedback(tickIndex, planSequence);
     }
 
-    /** The lifecycle the sealed declarations belong to: the bound controller's, or the empty key. */
     private String declarationLifecycleKey() {
         CommitController bound = commitController;
         return bound == null ? "" : bound.reservations().controller().lifecycleKey();
@@ -885,10 +881,7 @@ public final class KernelModule {
         return pipelineJobs.candidatesWithoutArtefact();
     }
 
-    /** Hands the plan of this tick out through the job scheduler of this kernel: every node of the
-     * frozen graph is taken in the order the graph froze and settled, because the batch a node names
-     * was closed by the pipeline before the plan ordered it. The hand-out runs no work of its own and
-     * lands nothing; the bound of jobs in flight is the one the graph declares. */
+    /** Every node is taken in the order the graph froze and settled; the hand-out lands nothing. */
     private void dispatchFrozen(TickPlan plan) {
         JobGraph graph = plan.graph();
         if (graph == null || graph.empty()) {
@@ -906,15 +899,12 @@ public final class KernelModule {
         lastDispatchHandedOut = handed;
     }
 
-    /** Whether a declared write set is turned into a claim in this tick. */
     private boolean claimsEnabled() {
         return KernelSettings.writeControlledSlot() && KernelSettings.pipelineJobs()
             && KernelSettings.tickPlan();
     }
 
-    /** Reports one batch a claim landed to the one write entry of the tick. The log resolves the
-     * order of the batch by the node the plan assigned it, and a batch no plan ordered is counted
-     * as unplanned rather than reordered. */
+    /** A batch no plan ordered is counted as unplanned rather than reordered. */
     private void noteLandedBatch(PipelineWriteClaims.Report report) {
         if (!KernelSettings.commitLog()) {
             return;
@@ -950,9 +940,7 @@ public final class KernelModule {
         return claims;
     }
 
-    /** Grants the version slot of every write domain the frozen plan declares. The value is minted
-     * once per domain and kept until an invalidation retires it, so a write frozen in this plan
-     * names the version it was planned against. */
+    /** The value is minted once per domain and kept until an invalidation retires it. */
     private void grantVersionSlots(TickPlan plan) {
         if (plan.graph() == null) {
             return;
@@ -1048,23 +1036,19 @@ public final class KernelModule {
         return row == null ? 0.0 : row.usedMs();
     }
 
-    /** The five values of this tick as both exits read them: one sample, one set of origins. */
     private DualExits.Sample exitSample() {
         return new DualExits.Sample(tickIndex, control.minMarginMs(), control.overrunHits(),
             control.waitBoundHits(), reserveUsedMs(), control.reserveRemainingMs(),
             control.degradeState());
     }
 
-    /** The five control values of this tick, as the next planning period reads them. */
     private TickPlanStore.Control controlFrameOf(long generation) {
         return TickPlanStore.Control.of(tickIndex, planSequence, generation, control.minMarginMs(),
             control.overrunHits(), control.waitBoundHits(), control.reserveRemainingMs(),
             control.degradeState());
     }
 
-    /** The two facts the claim table cannot read from its own registries: which world a write is
-     * happening in, and which step the newest plan holds for a claim. A key no plan holds answers
-     * no step, and a claim whose step is missing is refused instead of captured. */
+    /** A key no plan holds answers no step, and a claim whose step is missing is refused. */
     private final class ClaimSource implements WriteControlledSlots.Source {
 
         @Override
@@ -1403,25 +1387,31 @@ public final class KernelModule {
         return control;
     }
 
-    /** Carries out one whole reset, once, at the owner safe point: the controller is asked first and
-     * nothing is cleared while it refuses, the counters of this module are cleared next, and the
-     * lifecycle of the commit log is ended inside that clear and nowhere else. A build with no
-     * controller bound keeps the path it always had. */
+    /** One request as the mailbox carries it: immutable, so an answer names the item it belongs to. */
+    private record RequestItem(String source, long requestId, long arrivalThreadId, long arrivalOrder) {
+    }
+
+    /** What the newest request reads back as: one read-only snapshot, published whole. */
+    private record ResetTrace(String source, long requestId, long requestThreadId, long answeredByThreadId,
+                              long carriedEpoch, String result) {
+
+        static final ResetTrace NONE = new ResetTrace("", 0L, 0L, 0L, NO_CARRIED_EPOCH, "");
+    }
+
+    /** One consistent read of the three exits and of the counters behind them; package-private, so
+     * it is not part of the announced surface. */
+    record Mailbox(int depth, List<String> sources, boolean pending, long calls, long handOffs,
+                   long merged, long admitted, long refusedFull, long refusedClosed, int inProgress) {
+    }
+
+    /** Carries out one whole reset, once, at the owner safe point. No mailbox lock is held here and
+     * no mailbox state is written: what the answer means for the queue is the caller's to decide. */
     private boolean carryOutOwningReset() {
         CommitController controller = this.commitController;
         if (controller != null && !controller.enterReset().granted()) {
-            // The controller counts why it refused. A closed lifecycle is the one refusal nothing waits for:
-            // it starts no generation after it, so a call that could not carry the reset out owes nothing.
-            // Every other refusal leaves a request the safe point keeps asking for.
-            resetPending = !controller.reservations().closed();
             return false;
         }
         clearReadings();
-        // A whole reset ran, so what this module owed is answered; what is left in the queue belongs to
-        // another safe point, which is what counts it.
-        if (resetQueue.isEmpty()) {
-            resetPending = false;
-        }
         return true;
     }
 
@@ -1486,12 +1476,36 @@ public final class KernelModule {
 
     /** How many requests the bounded queue of the owner holds right now. */
     public int resetQueueDepth() {
-        return resetQueue.size();
+        synchronized (resetMailbox) {
+            return resetQueue.size();
+        }
     }
 
 
     public List<String> resetQueueSources() {
-        return List.copyOf(resetQueue);
+        synchronized (resetMailbox) {
+            return waitingSources();
+        }
+    }
+
+    /** One consistent read of the queue's three exits: a caller that reads them one at a time can
+     * see a safe point between them, and this read cannot. */
+    Mailbox mailbox() {
+        synchronized (resetMailbox) {
+            List<String> sources = waitingSources();
+            return new Mailbox(sources.size(), sources,
+                resetDeferred || !resetQueue.isEmpty() || resetInProgress > 0,
+                commitResetRequests, commitResetHandOffs, commitResetMerges, commitResetAdmits,
+                commitResetQueueRefusals, commitResetClosedRefusals, resetInProgress);
+        }
+    }
+
+    private List<String> waitingSources() {
+        List<String> sources = new ArrayList<>(resetQueue.size());
+        for (RequestItem item : resetQueue) {
+            sources.add(item.source());
+        }
+        return List.copyOf(sources);
     }
 
 
@@ -1502,155 +1516,231 @@ public final class KernelModule {
     /** The one request entry for a whole reset, named after where it came from. A request on the thread
      * the host named is answered there; one on any other thread enters a bounded queue, refused outright
      * when that queue is full, and the caller is told to ask on the owner thread. What waits is answered
-     * by {@link #markSafePoint()}. */
+     * by {@link #markSafePoint()}, one bounded batch of it per call. */
     public ResetRequest requestReadingsReset(String source) {
         String named = source == null || source.isEmpty() ? "unnamed" : source;
-        noteResetRequest(named);
         if (!guard.serverThreadBound()) {
-            return traceReset(new ResetRequest(false, named, false, "owner-thread-unbound"));
+            return publishRequest(named, "owner-thread-unbound", false, false);
         }
         if (!guard.onServerThread()) {
-            if (!queueResetRequest(named)) {
-                return traceReset(new ResetRequest(false, named, false, "owner-thread-queue-full"));
-            }
-            return traceReset(new ResetRequest(false, named, true, "queued-for-owner-safe-point"));
+            return queueResetRequest(named);
         }
-        boolean carriedOut = carryOutOwningReset();
+        if (carryOutOwningReset()) {
+            return publishRequest(named, "reset-at-safe-point", true, false);
+        }
+        boolean closed = commitChainClosed();
+        if (!closed) {
+            deferOwningReset(named);
+        }
+        return publishRequest(named, closed ? "lifecycle-closed" : "deferred", false, false);
+    }
+
+    /** Counts one request that minted no item and publishes its own trace. */
+    private ResetRequest publishRequest(String source, String result, boolean carriedOut,
+                                        boolean handedOff) {
+        long answeredBy = 0L;
+        long epoch = NO_CARRIED_EPOCH;
         if (carriedOut) {
-            resetPending = !resetQueue.isEmpty();
-            noteResetAnswered("reset-at-safe-point");
-            return new ResetRequest(true, named, false, "reset-at-safe-point");
+            answeredBy = Thread.currentThread().threadId();
+            CommitController controller = this.commitController;
+            epoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
         }
+        synchronized (resetMailbox) {
+            commitResetRequests++;
+            resetTrace = new ResetTrace(source, ++resetRequestSequence, Thread.currentThread().threadId(),
+                answeredBy, epoch, result);
+        }
+        return new ResetRequest(carriedOut, source, handedOff, result);
+    }
+
+    /** The whole other-thread path as one atomic step: merged, refused, or enqueued. Only an item
+     * still waiting is a merge candidate, and a call that joins one does not take the trace over. */
+    private ResetRequest queueResetRequest(String source) {
+        long thread = Thread.currentThread().threadId();
+        synchronized (resetMailbox) {
+            commitResetRequests++;
+            commitResetHandOffs++;
+            if (resetMailboxClosed) {
+                commitResetClosedRefusals++;
+                resetTrace = new ResetTrace(source, ++resetRequestSequence, thread, 0L,
+                    NO_CARRIED_EPOCH, "lifecycle-closed");
+                return new ResetRequest(false, source, false, "lifecycle-closed");
+            }
+            for (RequestItem waiting : resetQueue) {
+                if (waiting.source().equals(source)) {
+                    commitResetMerges++;
+                    return new ResetRequest(false, source, true, "queued-for-owner-safe-point");
+                }
+            }
+            if (resetQueue.size() + resetInProgress >= RESET_QUEUE_CAPACITY) {
+                commitResetQueueRefusals++;
+                resetTrace = new ResetTrace(source, ++resetRequestSequence, thread, 0L,
+                    NO_CARRIED_EPOCH, "owner-thread-queue-full");
+                return new ResetRequest(false, source, false, "owner-thread-queue-full");
+            }
+            RequestItem item = new RequestItem(source, ++resetRequestSequence, thread, ++resetArrivals);
+            resetQueue.addLast(item);
+            commitResetAdmits++;
+            resetTrace = new ResetTrace(source, item.requestId(), thread, 0L, NO_CARRIED_EPOCH,
+                "queued-for-owner-safe-point");
+            return new ResetRequest(false, source, true, "queued-for-owner-safe-point");
+        }
+    }
+
+    /** Records the one reset an owner-thread call could not carry out: a second such call is the same
+     * owed reset and not a second generation. */
+    private void deferOwningReset(String source) {
+        synchronized (resetMailbox) {
+            resetDeferred = true;
+            resetDeferredItem = new RequestItem(source, ++resetRequestSequence,
+                Thread.currentThread().threadId(), ++resetArrivals);
+        }
+    }
+
+    /** Writes one answer back into the trace of the item it belongs to, and only while that trace is
+     * still the one it published, so one trace never mixes two calls. */
+    private void noteResetAnswered(RequestItem item, String result) {
+        long thread = Thread.currentThread().threadId();
         CommitController controller = this.commitController;
-        String reason = controller != null && controller.reservations().closed()
-            ? "lifecycle-closed" : "deferred";
-        return traceReset(new ResetRequest(false, named, false, reason));
-    }
-
-    /** Opens the trace of the newest request: where it came from and the thread that made it. */
-    private void noteResetRequest(String named) {
-        commitResetSource = named;
-        commitResetRequests++;
-        commitResetRequestThreadId = Thread.currentThread().threadId();
-        commitResetSafePointThreadId = 0L;
-        commitResetCarryEpoch = NO_CARRIED_EPOCH;
-        commitResetResult = "open";
-        resetTraceWaiting = true;
-    }
-
-    /** What one request became where it was made; a safe point that answers it later overwrites it. */
-    private ResetRequest traceReset(ResetRequest request) {
-        commitResetResult = request.reason();
-        return request;
-    }
-
-    /** Records that the newest request was answered here, and the generation the answer carried. */
-    private void noteResetAnswered(String result) {
-        commitResetResult = result;
-        commitResetSafePointThreadId = Thread.currentThread().threadId();
-        CommitController controller = this.commitController;
-        commitResetCarryEpoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
-        resetTraceWaiting = false;
-    }
-
-    /** Takes one request into the queue of the owner, or refuses it when the queue is full. A request
-     * from a source already waiting is the same request twice and leaves the queue the length it was. */
-    private boolean queueResetRequest(String source) {
-        commitResetHandOffs++;
-        if (resetQueue.contains(source)) {
-            resetPending = true;
-            return true;
+        long epoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
+        synchronized (resetMailbox) {
+            if (item == null) {
+                if (resetTrace.answeredByThreadId() == 0L && resetQueue.isEmpty() && !resetDeferred
+                    && resetInProgress == 0) {
+                    resetTrace = new ResetTrace(resetTrace.source(), resetTrace.requestId(),
+                        resetTrace.requestThreadId(), thread, epoch, result);
+                }
+                return;
+            }
+            if (resetTrace.requestId() != item.requestId()) {
+                return;
+            }
+            resetTrace = new ResetTrace(item.source(), item.requestId(), item.arrivalThreadId(), thread,
+                epoch, result);
         }
-        if (resetQueue.size() >= RESET_QUEUE_CAPACITY) {
-            commitResetQueueRefusals++;
-            return false;
-        }
-        resetQueue.addLast(source);
-        resetPending = true;
-        return true;
     }
 
-    /** Answers what the queue of the owner holds, at a safe point and nowhere else. One call carries out
-     * each waiting request once; one the controller refuses stays where it is and is counted as owed;
-     * one asked for under a closed lifecycle is refused and discarded. */
+    /** Answers what the queue of the owner holds, at a safe point and nowhere else. One call carries
+     * out one batch of at most the capacity: taken in one atomic step, run outside the lock, so a
+     * producer that keeps refilling the queue cannot make this call run past its budget. */
     public SafePoint markSafePoint() {
         if (!guard.serverThreadBound() || !guard.onServerThread()) {
-            return new SafePoint(0, resetQueue.size(), resetQueue.size(), false);
+            return mailboxSnapshot();
         }
-        commitSafePointCalls++;
         return drainQueuedResets();
     }
 
+    /** One consistent read of what the queue holds, for a caller that is not the owner. */
+    private SafePoint mailboxSnapshot() {
+        synchronized (resetMailbox) {
+            int depth = resetQueue.size();
+            return new SafePoint(0, depth, depth, false);
+        }
+    }
+
+    /** One batch, one pass. The deferred request is answered first and takes nothing else with it. An
+     * item refused again keeps its identity and goes back to the head of the queue; one a closed
+     * lifecycle refuses is dropped and counted, because no safe point could ever carry it out. */
     private SafePoint drainQueuedResets() {
+        List<RequestItem> batch = new ArrayList<>(RESET_QUEUE_CAPACITY);
+        RequestItem deferred;
+        boolean deferredOwed;
+        synchronized (resetMailbox) {
+            commitSafePointCalls++;
+            deferredOwed = resetDeferred;
+            deferred = resetDeferredItem;
+            resetDeferred = false;
+            resetDeferredItem = null;
+            while (batch.size() < RESET_QUEUE_CAPACITY && !resetQueue.isEmpty()) {
+                batch.add(resetQueue.removeFirst());
+            }
+            resetInProgress = batch.size();
+        }
         int carried = 0;
         int owed = 0;
+        int queued = 0;
         boolean disposition = false;
-        boolean served = false;
-        boolean debtPending = false;
-        // The request a caller made on the owner thread and could not have answered is served first: the
-        // safe point answers it, not the caller that was refused, and one the controller refuses again
-        // stays owed, so the flag is cleared only once one whole reset has run.
-        if (resetPending) {
-            resetPending = false;
-            if (carryOutOwningReset()) {
-                carried++;
-                served = true;
-                if (!resetQueue.isEmpty()) {
-                    // One request, one generation: the entry that stands for the request refusd where it
-                    // arrived goes with the generation that request was owed, instead of a second one.
-                    String stood = resetQueue.removeFirst();
-                    if (resetTraceWaiting && stood.equals(commitResetSource)) {
-                        noteResetAnswered("reset-at-safe-point");
-                    }
-                } else if (resetTraceWaiting) {
-                    noteResetAnswered("reset-at-safe-point");
-                }
-            } else {
-                CommitController refused = this.commitController;
-                if (refused != null && refused.reservations().closed()) {
-                    // A closed lifecycle starts no generation after it, so this request is dropped here
-                    // rather than owed to a chain that cannot owe.
-                    resetPending = false;
+        boolean closed = false;
+        boolean stillOwed = false;
+        List<RequestItem> retry = new ArrayList<>();
+        try {
+            if (deferredOwed) {
+                if (carryOutOwningReset()) {
+                    carried++;
+                    noteResetAnswered(deferred, "reset-at-safe-point");
+                } else if (commitChainClosed()) {
+                    closed = true;
+                    noteResetAnswered(deferred, "lifecycle-closed");
                 } else {
-                    resetPending = true;
-                    debtPending = true;
-                    owed += 1;
-                    disposition |= refused != null && refused.reservations().pendingCount() > 0;
+                    owed++;
+                    stillOwed = true;
+                    disposition |= waitingDispositions();
                 }
             }
-        }
-        while (!resetQueue.isEmpty()) {
-            String asked = resetQueue.removeFirst();
-            resetPending = true;
-            if (carryOutOwningReset()) {
-                carried++;
-                served = true;
-                if (resetTraceWaiting && asked.equals(commitResetSource)) {
-                    noteResetAnswered("reset-at-safe-point");
+            for (RequestItem item : batch) {
+                if (carryOutOwningReset()) {
+                    carried++;
+                    noteResetAnswered(item, "reset-at-safe-point");
+                    continue;
                 }
-                continue;
-            }
-            CommitController refused = this.commitController;
-            if (refused != null && refused.reservations().closed()) {
-                if (resetTraceWaiting && asked.equals(commitResetSource)) {
-                    noteResetAnswered("lifecycle-closed");
+                if (commitChainClosed()) {
+                    closed = true;
+                    noteResetAnswered(item, "lifecycle-closed");
+                    continue;
                 }
-                // A closed lifecycle starts no generation after it, so no safe point could ever carry
-                // this request out. It is refused and dropped; the closed-lifecycle refusal count says
-                // what happened to it, and the request never reads as owed to a chain that cannot owe.
-                continue;
+                owed++;
+                disposition |= waitingDispositions();
+                retry.add(item);
             }
-            debtPending = true;
-            owed += 1;
-            disposition |= refused != null && refused.reservations().pendingCount() > 0;
+        } finally {
+            synchronized (resetMailbox) {
+                resetInProgress = 0;
+                for (int index = retry.size() - 1; index >= 0; index--) {
+                    resetQueue.addFirst(retry.get(index));
+                }
+                if (stillOwed && !resetDeferred) {
+                    resetDeferred = true;
+                    resetDeferredItem = deferred;
+                }
+                if (closed) {
+                    resetMailboxClosed = true;
+                }
+                queued = resetQueue.size();
+            }
         }
-        // A whole reset that ran answers the request it was owed for; anything that came back owed is
-        // still owed, and the next safe point is where it is asked for again.
-        resetPending = debtPending || !resetQueue.isEmpty();
-        if (served && !debtPending) {
-            resetPending = false;
+        return new SafePoint(carried, owed, queued, disposition);
+    }
+
+    /** Whether the chain holds an item whose side effect ran and whose line is not written. */
+    private boolean waitingDispositions() {
+        CommitController controller = this.commitController;
+        return controller != null && controller.reservations().pendingCount() > 0;
+    }
+
+    /** Takes what the mailbox holds when the chain is closed here: one atomic step, every later
+     * arrival refused, and each item it held counted as a closed refusal rather than read as carried. */
+    private void disposeMailboxAtClose() {
+        List<RequestItem> batch = new ArrayList<>(RESET_QUEUE_CAPACITY);
+        RequestItem deferred;
+        boolean deferredOwed;
+        synchronized (resetMailbox) {
+            resetMailboxClosed = true;
+            deferredOwed = resetDeferred;
+            deferred = resetDeferredItem;
+            resetDeferred = false;
+            resetDeferredItem = null;
+            while (!resetQueue.isEmpty()) {
+                batch.add(resetQueue.removeFirst());
+            }
         }
-        return new SafePoint(carried, owed, resetQueue.size(), disposition);
+        if (deferredOwed) {
+            carryOutOwningReset();
+            noteResetAnswered(deferred, "lifecycle-closed");
+        }
+        for (RequestItem item : batch) {
+            carryOutOwningReset();
+            noteResetAnswered(item, "lifecycle-closed");
+        }
     }
 
     /** What one reset does inside a chain that has already been closed, read as one line per state. */
@@ -1676,7 +1766,7 @@ public final class KernelModule {
         return new ResetComposition(closed, !closed && dispositions == 0, dispositions,
             !closed && dispositions == 0
                 && reservations.publishing() == 0 && controller.dispositionGateReason().isEmpty(),
-            blockedBy, !resetQueue.isEmpty());
+            blockedBy, !mailbox().sources().isEmpty());
     }
 
 
@@ -1743,7 +1833,6 @@ public final class KernelModule {
         return flushed;
     }
 
-    /** Keeps one flush row for a diagnostic; the rows stay bounded when a host walks many worlds. */
     private WorldStopFlush noteStopFlush(WorldStopFlush row) {
         if (stopFlushRows.size() >= STOP_FLUSH_ROW_CAP) {
             stopFlushRows.remove(0);
@@ -1858,7 +1947,6 @@ public final class KernelModule {
         return UNKNOWN_UNLOAD_SOURCE;
     }
 
-    /** Names a generation the shared control read: absent and untracked are refusals, not zeros. */
     private static String epochName(long epoch) {
         if (epoch == WorldEpochs.UNLIVE) {
             return "UNLIVE(" + WorldEpochs.UNLIVE + ")";
@@ -1909,7 +1997,6 @@ public final class KernelModule {
         return row;
     }
 
-    /** The newest flush row of one world, or null when the shared stop control never carried it. */
     private WorldStopFlush stopFlushRowOf(String worldId) {
         for (int index = stopFlushRows.size() - 1; index >= 0; index--) {
             if (stopFlushRows.get(index).worldId().equals(worldId)) {
@@ -1919,7 +2006,6 @@ public final class KernelModule {
         return null;
     }
 
-    /** Whether this stop entry already delivered this world; a repeat is written, not merged. */
     private boolean deliveredBefore(long stopEntry, String worldId) {
         for (WorldUnloadDelivery row : unloadRows) {
             if (row.stopEntry() == stopEntry && row.worldId().equals(worldId)) {
@@ -1929,7 +2015,6 @@ public final class KernelModule {
         return false;
     }
 
-    /** Keeps one delivery row for a diagnostic; the rows stay bounded when a host walks many worlds. */
     private void keepUnloadRow(WorldUnloadDelivery row) {
         if (unloadRows.size() >= STOP_FLUSH_ROW_CAP) {
             unloadRows.remove(0);
@@ -2003,7 +2088,9 @@ public final class KernelModule {
 
     /** How often the owner safe point was entered by the thread the host named. */
     public long commitSafePointCalls() {
-        return commitSafePointCalls;
+        synchronized (resetMailbox) {
+            return commitSafePointCalls;
+        }
     }
 
     /** Reads the thread the host itself names as the one it runs the server on; a tick that arrives on
@@ -2036,19 +2123,21 @@ public final class KernelModule {
     /** What the newest request for a whole reset reads back as: where it came from, the thread that made
      * it, the thread that answered it, the generation it carried, and what came of it. */
     public String commitResetTrace() {
-        String answeredBy = commitResetSafePointThreadId == 0L ? "-"
-            : Long.toString(commitResetSafePointThreadId);
-        String epoch = commitResetCarryEpoch == NO_CARRIED_EPOCH ? "none"
-            : Long.toString(commitResetCarryEpoch);
-        String source = commitResetSource.isEmpty() ? "-" : commitResetSource;
-        String result = commitResetResult.isEmpty() ? "-" : commitResetResult;
-        return source + "|" + commitResetRequestThreadId + "|" + answeredBy + "|" + epoch + "|" + result;
+        ResetTrace trace = resetTrace;
+        String answeredBy = trace.answeredByThreadId() == 0L ? "-"
+            : Long.toString(trace.answeredByThreadId());
+        String epoch = trace.carriedEpoch() == NO_CARRIED_EPOCH ? "none"
+            : Long.toString(trace.carriedEpoch());
+        String source = trace.source().isEmpty() ? "-" : trace.source();
+        String result = trace.result().isEmpty() ? "-" : trace.result();
+        return source + "|" + trace.requestThreadId() + "|" + answeredBy + "|" + epoch + "|" + result;
     }
 
     /** Whether the newest request was made on one thread and answered on another. */
     public boolean commitResetCrossedThreads() {
-        return commitResetRequestThreadId != 0L && commitResetSafePointThreadId != 0L
-            && commitResetRequestThreadId != commitResetSafePointThreadId;
+        ResetTrace trace = resetTrace;
+        return trace.requestThreadId() != 0L && trace.answeredByThreadId() != 0L
+            && trace.requestThreadId() != trace.answeredByThreadId();
     }
 
     /** What one close of the commit chain did: the room it gave back, the items that keep theirs,
@@ -2076,6 +2165,7 @@ public final class KernelModule {
         boolean closed = controller.reservations().closed();
         if (closed) {
             sealUnrecordedItems(controller.reservations());
+            disposeMailboxAtClose();
         }
         return new CommitClose(closed, closed ? "" : "off-owner-thread", close.givenBack(),
             close.unrecorded(), close.publishing());
@@ -2173,7 +2263,17 @@ public final class KernelModule {
 
     /** How often the bounded queue refused a request because it was full. */
     public long commitResetQueueRefusals() {
-        return commitResetQueueRefusals;
+        synchronized (resetMailbox) {
+            return commitResetQueueRefusals;
+        }
+    }
+
+    /** How often the mailbox refused a request because the chain was already closed; the readout adds
+     * this to the refusals the controller counts. */
+    public long commitResetClosedRefusals() {
+        synchronized (resetMailbox) {
+            return commitResetClosedRefusals;
+        }
     }
 
     /** How often an item was sealed with no ticket left to hand it a line. */
@@ -2223,6 +2323,9 @@ public final class KernelModule {
         }
         this.commits = candidate;
         this.commitController = controller;
+        synchronized (resetMailbox) {
+            resetMailboxClosed = false;
+        }
         declarationGeneration++;
         declarationHistory.retire();
         this.commitBindingRefusal = "";
@@ -2310,6 +2413,9 @@ public final class KernelModule {
         }
         this.commitController = null;
         this.commits = ownCommits;
+        synchronized (resetMailbox) {
+            resetMailboxClosed = false;
+        }
         declarationGeneration++;
         declarationHistory.retire();
         this.commitBindingRefusal = "";
@@ -2366,9 +2472,12 @@ public final class KernelModule {
         return guard.serverSiteId();
     }
 
-    /** Whether this module owes a reset it could not carry out when it was asked for. */
+    /** Whether this module owes a reset it could not carry out when it was asked for: an item in the
+     * queue, a batch taken out and not answered, or the one owner-thread request refused. */
     public boolean commitResetPending() {
-        return resetPending;
+        synchronized (resetMailbox) {
+            return resetDeferred || !resetQueue.isEmpty() || resetInProgress > 0;
+        }
     }
 
     /** Carries out the reset this module owes, in full and once, at an owner safe point, and answers
@@ -2376,7 +2485,7 @@ public final class KernelModule {
      * neither the generation nor a count; one refused again leaves the debt for the call after it. It is
      * the boolean view of {@link #markSafePoint()}, which is what the host calls. */
     public boolean drainCommitReset() {
-        if (!resetPending) {
+        if (!commitResetPending()) {
             return false;
         }
         return markSafePoint().carried() > 0;
@@ -2387,20 +2496,25 @@ public final class KernelModule {
         return commitController == null ? "NOT_WIRED" : "BOUND";
     }
 
-    /** How often a whole reset was asked for through the one request entry of this module. */
+    /** How often a whole reset was asked for through the one request entry: a count of calls, not of
+     * items taken and not of generations produced. */
     public long commitResetRequests() {
-        return commitResetRequests;
+        synchronized (resetMailbox) {
+            return commitResetRequests;
+        }
     }
 
-    /** How often such a request was handed to the owner safe point instead of being answered where
-     * it arrived, because it arrived on a thread the chain does not own. */
+    /** How often a request took the path of a thread the chain does not own. A count of calls, taken
+     * before the merge and before the room is asked for: not the number of items to be answered. */
     public long commitResetHandOffs() {
-        return commitResetHandOffs;
+        synchronized (resetMailbox) {
+            return commitResetHandOffs;
+        }
     }
 
     /** Where the newest reset request came from, or an empty string while none was made. */
     public String commitResetSource() {
-        return commitResetSource;
+        return resetTrace.source();
     }
 
     /** How often the host asked this module to adopt a chain, one call per tick boundary. */
@@ -2432,7 +2546,7 @@ public final class KernelModule {
      * arrived at those entries, so a build whose category is off keeps reading NOT_WIRED: it is a state
      * of this process and not a constant of the code. */
     public String commitHostDriveWiring() {
-        boolean safePoint = commitSafePointCalls > 0L;
+        boolean safePoint = commitSafePointCalls() > 0L;
         boolean close = commitCloseCalls > 0L;
         if (safePoint && close) {
             return "HOST_SAFE_POINT+CLOSE";
@@ -2455,8 +2569,12 @@ public final class KernelModule {
      * no generation advances. The request is a request for the whole reset and is never carried out
      * anywhere but in {@link #carryOutOwningReset()}. */
     public void resetReadings() {
-        if (carryOutOwningReset() && resetTraceWaiting && resetQueue.isEmpty()) {
-            noteResetAnswered("reset-at-safe-point");
+        if (carryOutOwningReset()) {
+            noteResetAnswered(null, "reset-at-safe-point");
+            return;
+        }
+        if (!commitChainClosed()) {
+            deferOwningReset("");
         }
     }
 

@@ -192,13 +192,19 @@ class HostDriveSequenceTest {
         assertEquals("0", HostDriveFixture.reading("product.commit.controller_reset_pending"),
             "and it leaves no debt that could never be answered");
 
-        HostDriveFixture.requestFromAnotherThread(module, "fixture-after-the-close");
-        assertEquals("1", HostDriveFixture.reading("product.commit.reset_queued"));
+        HostDriveFixture.Asked after =
+            HostDriveFixture.requestFromAnotherThread(module, "fixture-after-the-close");
+
+        assertFalse(after.request().handedOff(),
+            "the close is what the mailbox decides an arriving request against, so it is refused there");
+        assertEquals("lifecycle-closed", after.request().reason());
+        assertEquals("0", HostDriveFixture.reading("product.commit.reset_queued"),
+            "and the queue is not a place a request can wait for a consumer that is gone");
 
         fixture.postTick(WORLDS);
 
         assertEquals("0", HostDriveFixture.reading("product.commit.reset_queued"),
-            "the safe point refuses it and drops it instead of keeping it owed");
+            "the safe point of the tick after it finds nothing to refuse and nothing to keep owed");
         assertEquals("0", HostDriveFixture.reading("product.commit.controller_reset_pending"));
         assertEquals(resets, chain.controller.resets());
         assertTrue(chain.controller.resetClosedRefusals() > 0L, "and the refusal is counted");

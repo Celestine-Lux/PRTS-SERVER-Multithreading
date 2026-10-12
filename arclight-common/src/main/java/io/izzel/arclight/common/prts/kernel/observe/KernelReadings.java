@@ -1010,19 +1010,25 @@ public final class KernelReadings {
         add(lines, "product.commit.reset_hand_offs", module.commitResetHandOffs());
         add(lines, "product.commit.reset_source",
             module.commitResetSource().isEmpty() ? "-" : module.commitResetSource());
+        // One closed refusal is counted where it happened: by the controller when it was asked at a
+        // safe point, and by the mailbox when a request arrived after the close was already visible.
         add(lines, "product.commit.reset_closed_refusals",
-            controller == null ? 0L : controller.resetClosedRefusals());
+            (controller == null ? 0L : controller.resetClosedRefusals())
+                + module.commitResetClosedRefusals());
         add(lines, "product.commit.host_drive_wiring", module.commitHostDriveWiring());
         add(lines, "product.commit.resets", controller == null ? 0L : controller.resets());
         add(lines, "product.commit.resets_deferred",
             controller == null ? 0L : controller.deferredResets());
         // What a request from another thread is: one entry in a bounded queue the owner answers at a
         // safe point, the bound that queue refuses over, and the fact that the host calls none of it.
-        add(lines, "product.commit.reset_queued", module.resetQueueDepth());
+        // The depth and the sources of one row come out of the same read of the queue: a safe point
+        // running between two reads would otherwise print a depth its own list does not account for.
+        List<String> queued = module.resetQueueSources();
+        add(lines, "product.commit.reset_queued", queued.size());
         add(lines, "product.commit.reset_queue_capacity", KernelModule.resetQueueCapacity());
         add(lines, "product.commit.reset_queue_refusals", module.commitResetQueueRefusals());
         add(lines, "product.commit.reset_queue_sources",
-            module.resetQueueSources().isEmpty() ? "-" : String.join(",", module.resetQueueSources()));
+            queued.isEmpty() ? "-" : String.join(",", queued));
         add(lines, "product.commit.safe_point_wiring", module.commitHostDriveWiring());
         add(lines, "product.commit.safe_point_entry", KernelModule.HOST_SAFE_POINT_ENTRY);
         add(lines, "product.commit.safe_point_calls", module.commitSafePointCalls());
