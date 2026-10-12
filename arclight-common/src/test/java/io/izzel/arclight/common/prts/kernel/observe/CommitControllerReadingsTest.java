@@ -55,7 +55,15 @@ class CommitControllerReadingsTest {
         "product.commit.close_unrecorded", "product.commit.close_publishing",
         "product.commit.reset_requests", "product.commit.reset_hand_offs",
         "product.commit.reset_source", "product.commit.reset_closed_refusals",
-        "product.commit.host_drive_wiring",
+        "product.commit.host_drive_wiring", "product.commit.owner_thread_source",
+        "product.commit.owner_thread_id", "product.commit.owner_thread_named",
+        "product.commit.owner_thread_mismatches", "product.commit.safe_point_calls",
+        "product.commit.reset_entry_command", "product.commit.reset_entry_reload",
+        "product.commit.reset_trace", "product.commit.reset_trace_cross_thread",
+        "product.commit.stop_flush_sessions", "product.commit.stop_flush_worlds",
+        "product.commit.stop_flush_rows", "product.commit.stop_flush_steps",
+        "product.commit.stop_flush_ordered", "product.commit.stop_flush_refusals",
+        "product.commit.stop_flush_refusal", "product.commit.stop_flush_order",
         "commit.ticket_stored", "commit.ticket_refused", "commit.hybrid_order_refusals",
         "commit.cross_log_refusals", "commit.stale_ticket_refusals", "commit.integrity_faults",
         "commit.held_plans");
@@ -114,9 +122,16 @@ class CommitControllerReadingsTest {
         // The counters of the chain outlive a clear on purpose, the way the counters of the
         // controller do, so what a leg moved is read as a delta and the key itself is asserted
         // once here: with nothing bound every column of it is present and reads zero or a dash.
-        assertEquals("product.commit.host_drive_wiring=NOT_WIRED",
-            line(export, "product.commit.host_drive_wiring"),
-            "no build of this tree drives the two host requests yet");
+        // The column reports what arrived at the two host entries, so a build whose category is off
+        // registers no listener and reads NOT_WIRED while a process that has been ticked reads the
+        // entry that arrived. The key is asserted once here and the states it can take are named.
+        String wiring = line(export, "product.commit.host_drive_wiring")
+            .substring("product.commit.host_drive_wiring=".length());
+        assertTrue(List.of("NOT_WIRED", "HOST_SAFE_POINT", "HOST_CLOSE", "HOST_SAFE_POINT+CLOSE")
+            .contains(wiring), "the wiring column reports the host entries that arrived: " + wiring);
+        assertEquals("product.commit.owner_thread_source=server.getRunningThread",
+            line(export, "product.commit.owner_thread_source"),
+            "the identity of the owner is read from the host and never from a thread name");
         assertEquals("commit.ticket_stored=0", line(export, "commit.ticket_stored"));
         assertEquals("commit.hybrid_order_refusals=0", line(export, "commit.hybrid_order_refusals"));
         assertEquals("commit.held_plans=0", line(export, "commit.held_plans"));

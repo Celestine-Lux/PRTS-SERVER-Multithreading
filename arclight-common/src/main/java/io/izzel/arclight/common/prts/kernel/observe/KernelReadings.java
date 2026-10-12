@@ -868,6 +868,13 @@ public final class KernelReadings {
         add(lines, "product.commit.owner_thread_bound", module.commitOwnerThreadBound() ? 1 : 0);
         add(lines, "product.commit.owner_thread",
             module.commitOwnerThreadBound() ? module.commitOwnerSite() : "-");
+        // Where that identity is read from, and what the host answered when it was asked: the thread
+        // it names is the owner, and a tick that arrives on another thread is counted, not accepted.
+        add(lines, "product.commit.owner_thread_source", KernelModule.HOST_OWNER_THREAD_SOURCE);
+        add(lines, "product.commit.owner_thread_id", module.commitOwnerThreadId());
+        add(lines, "product.commit.owner_thread_named", module.commitOwnerThreadNamed());
+        add(lines, "product.commit.owner_thread_mismatches",
+            module.commitOwnerThreadMismatches());
         // What one install did: the piece that refused it, and the identity of the chain it took.
         add(lines, "product.commit.binding_refusal",
             module.commitBindingRefusal().isEmpty() ? "-" : module.commitBindingRefusal());
@@ -986,6 +993,15 @@ public final class KernelReadings {
             module.resetQueueSources().isEmpty() ? "-" : String.join(",", module.resetQueueSources()));
         add(lines, "product.commit.safe_point_wiring", module.commitHostDriveWiring());
         add(lines, "product.commit.safe_point_entry", KernelModule.HOST_SAFE_POINT_ENTRY);
+        add(lines, "product.commit.safe_point_calls", module.commitSafePointCalls());
+        // The two sessions a whole reset can be asked for on a real path, each named by its own entry,
+        // and what the newest request reads back as: source, the thread it was made on, the thread the
+        // safe point answered it on, the generation that carried it, and the result.
+        add(lines, "product.commit.reset_entry_command", KernelModule.HOST_COMMAND_RESET_SOURCE);
+        add(lines, "product.commit.reset_entry_reload", KernelModule.HOST_RELOAD_RESET_SOURCE);
+        add(lines, "product.commit.reset_trace", module.commitResetTrace());
+        add(lines, "product.commit.reset_trace_cross_thread",
+            module.commitResetCrossedThreads() ? 1 : 0);
         // What a close sealed: an item whose side effect ran and whose line is not written is not a
         // cleanup at exit - it keeps its room and its identity, and the owner disposes of it or it
         // stays readable. The gate columns say whether new work is taken while one is owed.
@@ -1008,6 +1024,17 @@ public final class KernelReadings {
             controller != null && controller.acceptingNewWork() ? 1 : 0);
         add(lines, "product.commit.reset_composition", resetComposition(module));
         add(lines, "product.commit.close_entry", KernelModule.HOST_CLOSE_ENTRY);
+        // What the stopping path flushed per world through the four step set, in the order the host
+        // carried the worlds, and which of the two stop entries came first in this run.
+        add(lines, "product.commit.stop_flush_sessions", module.commitStopFlushSessions());
+        add(lines, "product.commit.stop_flush_worlds", stopFlushWorlds(module));
+        add(lines, "product.commit.stop_flush_rows", stopFlushRows(module));
+        add(lines, "product.commit.stop_flush_steps", stopFlushSteps(module));
+        add(lines, "product.commit.stop_flush_ordered", module.commitStopFlushOrdered());
+        add(lines, "product.commit.stop_flush_refusals", module.commitStopFlushRefusals());
+        add(lines, "product.commit.stop_flush_refusal",
+            module.commitStopFlushRefusal().isEmpty() ? "-" : module.commitStopFlushRefusal());
+        add(lines, "product.commit.stop_flush_order", module.commitStopFlushOrder());
         add(lines, "product.commit.terminal_ledger_entries",
             reservations == null ? 0 : reservations.terminalLedger().size());
         add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
@@ -1053,6 +1080,36 @@ public final class KernelReadings {
 
     /** The identity a diagnostic reads a sealed item back by: the ticket it must hand a line to, why
      * the line is not written, and how many items are still owed under the seal. */
+    private static String stopFlushWorlds(KernelModule module) {
+        List<String> worlds = module.commitStopFlushWorlds();
+        return worlds.isEmpty() ? "-" : String.join(",", worlds);
+    }
+
+    /** One row per world the stopping path flushed: the world, the generation it held when its
+     * dispatch stopped, what the flush landed and what the reclaim took back, and the four step
+     * stamps of that session. */
+    private static String stopFlushRows(KernelModule module) {
+        List<KernelModule.WorldStopFlush> rows = module.commitStopFlushRows();
+        if (rows.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (KernelModule.WorldStopFlush row : rows) {
+            if (builder.length() > 0) {
+                builder.append(",");
+            }
+            builder.append(row.worldId()).append(':').append(row.worldEpoch()).append(':')
+                .append(row.flushed()).append(':').append(row.reclaimed()).append(':')
+                .append(row.steps());
+        }
+        return builder.toString();
+    }
+
+    private static String stopFlushSteps(KernelModule module) {
+        List<KernelModule.WorldStopFlush> rows = module.commitStopFlushRows();
+        return rows.isEmpty() ? "-" : rows.get(rows.size() - 1).steps();
+    }
+
     private static String sealedIdentities(KernelModule module) {
         List<KernelModule.Disposition> items = module.commitSealedIdentities();
         if (items.isEmpty()) {

@@ -45,6 +45,19 @@ public final class WorldEpochs {
         live.keySet().removeIf(worldId -> !seen.contains(worldId));
     }
 
+    /** Forgets one world and returns the generation it held: the one it carried, {@link #UNLIVE} when
+     * the tracked set no longer holds it, or {@link #UNTRACKED} when no list was ever observed. */
+    public long forget(String worldId) {
+        if (worldId == null) {
+            return UNTRACKED;
+        }
+        Long gone = live.remove(worldId);
+        if (gone != null) {
+            return gone;
+        }
+        return tracking ? UNLIVE : UNTRACKED;
+    }
+
     /** Returns the generation of one world. */
     public long epochOf(String worldId) {
         if (worldId == null || !tracking) {

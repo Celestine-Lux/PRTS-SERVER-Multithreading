@@ -3,6 +3,7 @@ package io.izzel.arclight.common.prts.kernel.observe;
 
 import io.izzel.arclight.common.prts.config.PrtsCommandExtension;
 import io.izzel.arclight.common.prts.kernel.KernelModule;
+import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -14,6 +15,7 @@ public final class KernelCommandExtension implements PrtsCommandExtension {
 
     private static final String NAME = "kernel";
     private static final String SELFTEST = "selftest";
+    private static final String RESET = "reset";
     private static final String PREFIX = "[PRTS] kernel ";
 
     private KernelCommandExtension() {
@@ -30,7 +32,7 @@ public final class KernelCommandExtension implements PrtsCommandExtension {
 
     @Override
     public List<String> subcommands() {
-        return List.of(SELFTEST);
+        return List.of(RESET, SELFTEST);
     }
 
     @Override
@@ -38,16 +40,19 @@ public final class KernelCommandExtension implements PrtsCommandExtension {
         if (arguments == null || arguments.isEmpty()) {
             return export();
         }
+        if (arguments.size() == 1 && RESET.equalsIgnoreCase(arguments.get(0))) {
+            return reset();
+        }
         if (arguments.size() == 1 && SELFTEST.equalsIgnoreCase(arguments.get(0))) {
             return selftest();
         }
-        return List.of("[PRTS] kernel usage: /prts kernel [" + SELFTEST + "]");
+        return List.of("[PRTS] kernel usage: /prts kernel [" + RESET + "|" + SELFTEST + "]");
     }
 
     @Override
     public List<String> complete(List<String> arguments) {
         if (arguments == null || arguments.isEmpty()) {
-            return List.of(SELFTEST);
+            return List.of(RESET, SELFTEST);
         }
         return List.of();
     }
@@ -64,6 +69,22 @@ public final class KernelCommandExtension implements PrtsCommandExtension {
             lines.add(PREFIX + line);
         }
         return lines;
+    }
+
+    /** One session of the command face asks the kernel for a whole reset of its readings. The request
+     * is answered where it is made when the command runs on the thread the chain is owned by, and the
+     * owner answers it at the next safe point otherwise. */
+    private static List<String> reset() {
+        if (!KernelSettings.enabled()) {
+            return List.of(PREFIX + "reset: the category is off, nothing was asked for");
+        }
+        KernelModule module = KernelModule.instance();
+        KernelModule.ResetRequest request =
+            module.requestReadingsReset(KernelModule.HOST_COMMAND_RESET_SOURCE);
+        return List.of(PREFIX + "reset source=" + request.source() + " carriedOut="
+            + request.carriedOut() + " handedOff=" + request.handedOff() + " reason="
+            + request.reason() + " queueDepth=" + module.resetQueueDepth() + " trace="
+            + module.commitResetTrace());
     }
 
     private static List<String> selftest() {

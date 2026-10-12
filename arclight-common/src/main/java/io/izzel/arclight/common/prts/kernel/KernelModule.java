@@ -48,6 +48,7 @@ import io.izzel.arclight.common.prts.kernel.sites.ThreadOrigin;
 import io.izzel.arclight.common.prts.kernel.sites.WriteControlledSlots;
 import io.izzel.arclight.common.prts.kernel.sites.WritePath;
 import io.izzel.arclight.common.prts.kernel.sites.WritePathCounters;
+import io.izzel.arclight.common.prts.kernel.sites.WorldEpochs;
 import io.izzel.arclight.common.prts.kernel.sites.WorldWriteGuard;
 import io.izzel.arclight.common.prts.kernel.auth.HolderKind;
 import io.izzel.arclight.common.prts.kernel.diff.DiffProbe;
@@ -241,6 +242,24 @@ public final class KernelModule {
     private final List<Disposition> commitSealedIdentities = new ArrayList<>();
     private long commitSealDiscards;
     private long commitCloseCalls;
+    private long commitSafePointCalls;
+    private long commitOwnerThreadNamed;
+    private long commitOwnerThreadMismatches;
+    private long commitOwnerThreadId;
+    private long commitResetRequestThreadId;
+    private long commitResetSafePointThreadId;
+    private long commitResetCarryEpoch = NO_CARRIED_EPOCH;
+    private String commitResetResult = "";
+    private boolean resetTraceWaiting;
+    private long hostEntrySequence;
+    private long stopFlushLastSequence;
+    private long stopCloseLastSequence;
+    private long stopStepSequence;
+    private long commitStopFlushSessions;
+    private long commitStopFlushRefusals;
+    private String commitStopFlushRefusal = "";
+    private final List<String> stopFlushWorlds = new ArrayList<>();
+    private final List<WorldStopFlush> stopFlushRows = new ArrayList<>();
     private int commitCloseGivenBack;
     private int commitCloseUnrecorded;
     private int commitClosePublishing;
@@ -1247,6 +1266,23 @@ public final class KernelModule {
      * an entry makes that call nothing drains the queue, and the readout says NOT_WIRED for it. */
     public static final String HOST_SAFE_POINT_ENTRY = "host:tick-boundary";
 
+    /** The two sessions that ask this module for a whole reset on a real path: the command face and
+     * the configuration reload. A test and a probe are neither of them. */
+    public static final String HOST_COMMAND_RESET_SOURCE = "host:kernel-command";
+    public static final String HOST_RELOAD_RESET_SOURCE = "host:config-reload";
+
+    /** Where the identity of the owner thread is read from: the host's own answer about the thread it
+     * runs the server on, never the name of a thread. */
+    public static final String HOST_OWNER_THREAD_SOURCE = "server.getRunningThread";
+
+    /** The generation column of a request that carried no generation, because no chain was bound when
+     * it was answered. */
+    public static final long NO_CARRIED_EPOCH = -1L;
+
+    /** How many worlds one stop flush keeps rows for: the set the host carries is small, and a row per
+     * world of one stop is what a diagnostic reads back. */
+    private static final int STOP_FLUSH_ROW_CAP = 64;
+
 
     public long commitSealedTurn() {
         return commitSealedTurn;
@@ -1273,26 +1309,52 @@ public final class KernelModule {
      * by {@link #markSafePoint()}. */
     public ResetRequest requestReadingsReset(String source) {
         String named = source == null || source.isEmpty() ? "unnamed" : source;
-        commitResetSource = named;
-        commitResetRequests++;
+        noteResetRequest(named);
         if (!guard.serverThreadBound()) {
-            return new ResetRequest(false, named, false, "owner-thread-unbound");
+            return traceReset(new ResetRequest(false, named, false, "owner-thread-unbound"));
         }
         if (!guard.onServerThread()) {
             if (!queueResetRequest(named)) {
-                return new ResetRequest(false, named, false, "owner-thread-queue-full");
+                return traceReset(new ResetRequest(false, named, false, "owner-thread-queue-full"));
             }
-            return new ResetRequest(false, named, true, "queued-for-owner-safe-point");
+            return traceReset(new ResetRequest(false, named, true, "queued-for-owner-safe-point"));
         }
         boolean carriedOut = carryOutOwningReset();
         if (carriedOut) {
             resetPending = !resetQueue.isEmpty();
+            noteResetAnswered("reset-at-safe-point");
             return new ResetRequest(true, named, false, "reset-at-safe-point");
         }
         CommitController controller = this.commitController;
         String reason = controller != null && controller.reservations().closed()
             ? "lifecycle-closed" : "deferred";
-        return new ResetRequest(false, named, false, reason);
+        return traceReset(new ResetRequest(false, named, false, reason));
+    }
+
+    /** Opens the trace of the newest request: where it came from and the thread that made it. */
+    private void noteResetRequest(String named) {
+        commitResetSource = named;
+        commitResetRequests++;
+        commitResetRequestThreadId = Thread.currentThread().threadId();
+        commitResetSafePointThreadId = 0L;
+        commitResetCarryEpoch = NO_CARRIED_EPOCH;
+        commitResetResult = "open";
+        resetTraceWaiting = true;
+    }
+
+    /** What one request became where it was made; a safe point that answers it later overwrites it. */
+    private ResetRequest traceReset(ResetRequest request) {
+        commitResetResult = request.reason();
+        return request;
+    }
+
+    /** Records that the newest request was answered here, and the generation the answer carried. */
+    private void noteResetAnswered(String result) {
+        commitResetResult = result;
+        commitResetSafePointThreadId = Thread.currentThread().threadId();
+        CommitController controller = this.commitController;
+        commitResetCarryEpoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
+        resetTraceWaiting = false;
     }
 
     /** Takes one request into the queue of the owner, or refuses it when the queue is full. A request
@@ -1319,6 +1381,7 @@ public final class KernelModule {
         if (!guard.serverThreadBound() || !guard.onServerThread()) {
             return new SafePoint(0, resetQueue.size(), resetQueue.size(), false);
         }
+        commitSafePointCalls++;
         return drainQueuedResets();
     }
 
@@ -1339,26 +1402,43 @@ public final class KernelModule {
                 if (!resetQueue.isEmpty()) {
                     // One request, one generation: the entry that stands for the request refusd where it
                     // arrived goes with the generation that request was owed, instead of a second one.
-                    resetQueue.removeFirst();
+                    String stood = resetQueue.removeFirst();
+                    if (resetTraceWaiting && stood.equals(commitResetSource)) {
+                        noteResetAnswered("reset-at-safe-point");
+                    }
+                } else if (resetTraceWaiting) {
+                    noteResetAnswered("reset-at-safe-point");
                 }
             } else {
-                resetPending = true;
-                debtPending = true;
-                owed += 1;
                 CommitController refused = this.commitController;
-                disposition |= refused != null && refused.reservations().pendingCount() > 0;
+                if (refused != null && refused.reservations().closed()) {
+                    // A closed lifecycle starts no generation after it, so this request is dropped here
+                    // rather than owed to a chain that cannot owe.
+                    resetPending = false;
+                } else {
+                    resetPending = true;
+                    debtPending = true;
+                    owed += 1;
+                    disposition |= refused != null && refused.reservations().pendingCount() > 0;
+                }
             }
         }
         while (!resetQueue.isEmpty()) {
-            resetQueue.removeFirst();
+            String asked = resetQueue.removeFirst();
             resetPending = true;
             if (carryOutOwningReset()) {
                 carried++;
                 served = true;
+                if (resetTraceWaiting && asked.equals(commitResetSource)) {
+                    noteResetAnswered("reset-at-safe-point");
+                }
                 continue;
             }
             CommitController refused = this.commitController;
             if (refused != null && refused.reservations().closed()) {
+                if (resetTraceWaiting && asked.equals(commitResetSource)) {
+                    noteResetAnswered("lifecycle-closed");
+                }
                 // A closed lifecycle starts no generation after it, so no safe point could ever carry
                 // this request out. It is refused and dropped; the closed-lifecycle refusal count says
                 // what happened to it, and the request never reads as owed to a chain that cannot owe.
@@ -1403,6 +1483,178 @@ public final class KernelModule {
             blockedBy, !resetQueue.isEmpty());
     }
 
+
+    /** One world's turn in the stop flush: the four steps taken in one session on the owner thread,
+     * each stamped with the step it was taken as, so the order of a run is read and not assumed. A world
+     * whose generation is absent or was never tracked is refused whole. */
+    public record WorldStopFlush(String worldId, long worldEpoch, String refusal, long dispatchStep,
+                                 long flushStep, long unloadRowStep, long reclaimStep, int flushed,
+                                 int reclaimed) {
+
+        /** The four step stamps of this row, in the order the session took them. */
+        public String steps() {
+            return dispatchStep + ">" + flushStep + ">" + unloadRowStep + ">" + reclaimStep;
+        }
+
+        /** Whether the session took the four steps in the order the set names, which is what the row
+         * is read for: a run that reorders them shows it here. */
+        public boolean ordered() {
+            return dispatchStep < flushStep && flushStep < unloadRowStep
+                && unloadRowStep < reclaimStep;
+        }
+    }
+
+    /** Flushes one world through the four step set because the server is stopping: the unload event is
+     * not delivered on this path and this tree calls removeLevel nowhere, so a world is walked here or
+     * nowhere. The world stops taking new work, its waiting writes are handed to the payload, the row of
+     * its unload is written, and what the flush could not land goes back. */
+    public WorldStopFlush flushWorldAtStop(String worldId) {
+        stopFlushLastSequence = ++hostEntrySequence;
+        String named = worldId == null || worldId.isEmpty() ? "unnamed" : worldId;
+        long epoch = guard.worldEpochs().epochOf(named);
+        if (epoch == WorldEpochs.UNLIVE || epoch == WorldEpochs.UNTRACKED) {
+            commitStopFlushRefusals++;
+            commitStopFlushRefusal = epoch == WorldEpochs.UNLIVE ? "world-not-live" : "world-untracked";
+            return noteStopFlush(new WorldStopFlush(named, epoch, commitStopFlushRefusal, 0L, 0L, 0L,
+                0L, 0, 0));
+        }
+        long dispatchStep = ++stopStepSequence;
+        guard.worldEpochs().forget(named);
+        long flushStep = ++stopStepSequence;
+        int flushed = flushWorldIntents(named);
+        long unloadRowStep = ++stopStepSequence;
+        commitStopFlushSessions++;
+        if (stopFlushWorlds.size() < STOP_FLUSH_ROW_CAP) {
+            stopFlushWorlds.add(named);
+        }
+        long reclaimStep = ++stopStepSequence;
+        int reclaimed = intents.releaseWorld(named);
+        return noteStopFlush(new WorldStopFlush(named, epoch, "", dispatchStep, flushStep, unloadRowStep,
+            reclaimStep, flushed, reclaimed));
+    }
+
+    /** Step two of the set: the intents still waiting for one world are handed to the payload in the
+     * frozen order of its shard; what is left is what step four takes back. */
+    private int flushWorldIntents(String worldId) {
+        int flushed = 0;
+        for (long head = intents.headOrder(worldId); head >= 0L; head = intents.headOrder(worldId)) {
+            if (!intents.commit(worldId, head, tickIndex).committed()) {
+                break;
+            }
+            flushed++;
+        }
+        return flushed;
+    }
+
+    /** Keeps one flush row for a diagnostic; the rows stay bounded when a host walks many worlds. */
+    private WorldStopFlush noteStopFlush(WorldStopFlush row) {
+        if (stopFlushRows.size() >= STOP_FLUSH_ROW_CAP) {
+            stopFlushRows.remove(0);
+        }
+        stopFlushRows.add(row);
+        return row;
+    }
+
+    /** Whether every flush row took the four steps in order; a dash means no world was flushed yet. */
+    public String commitStopFlushOrdered() {
+        int served = 0;
+        for (WorldStopFlush row : stopFlushRows) {
+            if (row.refusal().isEmpty()) {
+                served++;
+                if (!row.ordered()) {
+                    return "0";
+                }
+            }
+        }
+        return served == 0 ? "-" : "1";
+    }
+
+    /** The order the newest entries of the two kinds were entered in, read from the sequence they
+     * carry: which of the flush and the close arrived first is a fact of the run, not of this code. */
+    public String commitStopFlushOrder() {
+        boolean flushed = stopFlushLastSequence != 0L;
+        boolean closed = stopCloseLastSequence != 0L;
+        if (flushed && closed) {
+            return stopCloseLastSequence > stopFlushLastSequence ? "flush-before-close"
+                : "close-before-flush";
+        }
+        if (flushed) {
+            return "flush-only";
+        }
+        return closed ? "close-only" : "NOT_WIRED";
+    }
+
+    public List<WorldStopFlush> commitStopFlushRows() {
+        return List.copyOf(stopFlushRows);
+    }
+
+    public List<String> commitStopFlushWorlds() {
+        return List.copyOf(stopFlushWorlds);
+    }
+
+    public long commitStopFlushSessions() {
+        return commitStopFlushSessions;
+    }
+
+    public long commitStopFlushRefusals() {
+        return commitStopFlushRefusals;
+    }
+
+    /** The refusal of the newest flush, or an empty string while none was refused. */
+    public String commitStopFlushRefusal() {
+        return commitStopFlushRefusal;
+    }
+
+    /** How often the owner safe point was entered by the thread the host named. */
+    public long commitSafePointCalls() {
+        return commitSafePointCalls;
+    }
+
+    /** Reads the thread the host itself names as the one it runs the server on; a tick that arrives on
+     * another thread is counted here instead of being taken for the owner. */
+    public void noteTickThread(Thread hostThread) {
+        if (hostThread == null) {
+            return;
+        }
+        commitOwnerThreadNamed++;
+        if (hostThread == Thread.currentThread()) {
+            commitOwnerThreadId = hostThread.threadId();
+        } else {
+            commitOwnerThreadMismatches++;
+        }
+    }
+
+    public long commitOwnerThreadNamed() {
+        return commitOwnerThreadNamed;
+    }
+
+    public long commitOwnerThreadMismatches() {
+        return commitOwnerThreadMismatches;
+    }
+
+    /** The identity of the thread the host named, zero while it named none. */
+    public long commitOwnerThreadId() {
+        return commitOwnerThreadId;
+    }
+
+    /** What the newest request for a whole reset reads back as: where it came from, the thread that made
+     * it, the thread that answered it, the generation it carried, and what came of it. */
+    public String commitResetTrace() {
+        String answeredBy = commitResetSafePointThreadId == 0L ? "-"
+            : Long.toString(commitResetSafePointThreadId);
+        String epoch = commitResetCarryEpoch == NO_CARRIED_EPOCH ? "none"
+            : Long.toString(commitResetCarryEpoch);
+        String source = commitResetSource.isEmpty() ? "-" : commitResetSource;
+        String result = commitResetResult.isEmpty() ? "-" : commitResetResult;
+        return source + "|" + commitResetRequestThreadId + "|" + answeredBy + "|" + epoch + "|" + result;
+    }
+
+    /** Whether the newest request was made on one thread and answered on another. */
+    public boolean commitResetCrossedThreads() {
+        return commitResetRequestThreadId != 0L && commitResetSafePointThreadId != 0L
+            && commitResetRequestThreadId != commitResetSafePointThreadId;
+    }
+
     /** What one close of the commit chain did: the room it gave back, the items that keep theirs,
      * and whether the chain is closed after the call. */
     public record CommitClose(boolean closed, String refusal, int givenBack, int unrecorded,
@@ -1415,6 +1667,7 @@ public final class KernelModule {
      * effect may have run readable with its room, and it writes no line of its own. An item whose line is
      * not written is sealed instead, with the identity a diagnostic reads back. */
     public CommitClose closeCommitChain() {
+        stopCloseLastSequence = ++hostEntrySequence;
         CommitController controller = this.commitController;
         if (controller == null) {
             return new CommitClose(false, "not-wired", 0, 0, 0);
@@ -1444,6 +1697,10 @@ public final class KernelModule {
     private void sealUnrecordedItems(CommitReservation reservations) {
         commitSealedCount = reservations.pendingCount();
         if (commitSealedCount == 0) {
+            // This close sealed nothing, and the readout is about this close.
+            commitSealed = false;
+            commitSealedTurn = 0L;
+            commitSealedIdentities.clear();
             return;
         }
         commitSealed = true;
@@ -1743,13 +2000,19 @@ public final class KernelModule {
         return commitClosePublishing;
     }
 
-    /** Where this build drives the two host-side requests of the commit chain from: asking for a
-     * whole reset at the tick boundary, and closing the chain when the server stops. The platform
-     * entry that would make those calls exists in no build of this tree, so the column reads
-     * NOT_WIRED instead of reading as if the host drove them; the evidence names the two hook points
-     * and counts their call sites. */
+    /** Where the two host-side requests of the commit chain are driven from. The column reports what
+     * arrived at those entries, so a build whose category is off keeps reading NOT_WIRED: it is a state
+     * of this process and not a constant of the code. */
     public String commitHostDriveWiring() {
-        return "NOT_WIRED";
+        boolean safePoint = commitSafePointCalls > 0L;
+        boolean close = commitCloseCalls > 0L;
+        if (safePoint && close) {
+            return "HOST_SAFE_POINT+CLOSE";
+        }
+        if (safePoint) {
+            return "HOST_SAFE_POINT";
+        }
+        return close ? "HOST_CLOSE" : "NOT_WIRED";
     }
 
     /** Whether the adopted chain has been closed: it takes nothing new and no reset follows it. */
@@ -1764,7 +2027,9 @@ public final class KernelModule {
      * no generation advances. The request is a request for the whole reset and is never carried out
      * anywhere but in {@link #carryOutOwningReset()}. */
     public void resetReadings() {
-        carryOutOwningReset();
+        if (carryOutOwningReset() && resetTraceWaiting && resetQueue.isEmpty()) {
+            noteResetAnswered("reset-at-safe-point");
+        }
     }
 
     private void clearReadings() {

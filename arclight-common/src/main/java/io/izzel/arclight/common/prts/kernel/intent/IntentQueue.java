@@ -126,6 +126,26 @@ public final class IntentQueue {
         return CommitOrder.committed(committed.incrementAndGet());
     }
 
+    /** Hands every intent still waiting for one world to the payload's release and drops its shard,
+     * so a world that goes away takes its own backlog with it and no other shard is touched. */
+    public synchronized int releaseWorld(String worldKey) {
+        String key = worldKey == null ? NO_WORLD : worldKey;
+        Shard shard = shards.remove(key);
+        if (shard == null || shard.waiting.isEmpty()) {
+            return 0;
+        }
+        IntentPayload executor = payloadExecutor;
+        int leaving = shard.waiting.size();
+        for (WriteIntent intent : shard.waiting) {
+            if (executor != null) {
+                executor.release(intent);
+            }
+        }
+        shard.waiting.clear();
+        released.addAndGet(leaving);
+        return leaving;
+    }
+
     public long nextIntentId() {
         return nextIntentId.getAndIncrement();
     }
