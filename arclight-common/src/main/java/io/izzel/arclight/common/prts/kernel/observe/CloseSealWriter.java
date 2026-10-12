@@ -34,6 +34,8 @@ public final class CloseSealWriter {
     static final long HARD_BUDGET_MILLIS = 1000L;
     static final int MAX_RUNS_KEPT = 4;
     static final int MAX_CONSOLE_LINES = 16;
+    static final int MAX_ERRORS_KEPT = 8;
+    static final int TERMINAL_SEAT_BYTES = 4096;
     static final String NOT_WIRED = "NOT_WIRED";
 
     static final String[] COLUMNS = {"schema", "runId", "writeSeq", "eventOrdinal", "stage", "source",
@@ -139,6 +141,7 @@ public final class CloseSealWriter {
     private final List<String> consoleLines = new ArrayList<>();
 
     private int writeSeq;
+    private int errorsDropped;
     private long rows;
     private long bytes;
     private long startedNanos;
@@ -185,9 +188,15 @@ public final class CloseSealWriter {
         note("AFTER_CLOSE");
     }
 
-    /** Records an exception of the stopping path without swallowing it. */
+    /** Records an exception of the stopping path without swallowing it. The list is bounded so the
+     * terminal record cannot outgrow the seat the entry record left for it; what does not fit is
+     * counted rather than dropped in silence. */
     public void errored(Throwable error) {
         flushError = error.getClass().getName();
+        if (errors.size() >= MAX_ERRORS_KEPT) {
+            errorsDropped++;
+            return;
+        }
         errors.add("phase=" + currentPhase() + "|type=" + error.getClass().getName() + "|message="
             + firstLine(error.getMessage()) + "|continued=1");
     }
@@ -408,8 +417,8 @@ public final class CloseSealWriter {
         }
         String text = (rows == 0L ? headerLine() : "")
             + render(stage, snapshot, note, rowStatus, rowReason, rowExit);
-        if (rows + 1L > limits.maxRows()
-            || bytes + text.getBytes(StandardCharsets.UTF_8).length > limits.maxBytes()) {
+        long size = text.getBytes(StandardCharsets.UTF_8).length;
+        if (!fits(size, entryStage)) {
             capReached = true;
             noteEvidence("FILE_CAP_REACHED");
             console("status=FAILED reason=FILE_CAP_REACHED exit=evidence");
@@ -424,12 +433,24 @@ public final class CloseSealWriter {
         }
         writeSeq++;
         rows++;
-        bytes += text.getBytes(StandardCharsets.UTF_8).length;
+        bytes += size;
         receipt(file, text);
         console("stage=" + stage + " writeSeq=" + writeSeq + " md5=" + md5(text).substring(0, 16)
             + " path=" + file.toAbsolutePath() + " status=" + status + " reason=" + reason
             + " fallback=" + failureReason());
         return true;
+    }
+
+    /** Whether a record fits under both caps. A record that is not the terminal one has to leave
+     * the room the terminal record needs: a cap that drops a record must not also drop the verdict
+     * that says a record was dropped, so an entry record is admitted only with one row and one row
+     * size plus a fixed allowance still to spare. */
+    private boolean fits(long size, boolean entryStage) {
+        if (entryStage) {
+            return rows + 2L <= limits.maxRows()
+                && bytes + 2L * size + TERMINAL_SEAT_BYTES <= limits.maxBytes();
+        }
+        return rows + 1L <= limits.maxRows() && bytes + size <= limits.maxBytes();
     }
 
     private Path resolve() {
@@ -466,8 +487,10 @@ public final class CloseSealWriter {
         String problem = CloseSealFiles.prepare(root, runDir);
         if (!problem.isEmpty()) {
             resolutionFailed = true;
+            String primary = fallbackReason.isEmpty() ? "-" : fallbackReason;
             fallbackReason = "no-fallback-path";
-            console("status=FAILED reason=no-fallback-path exit=evidence");
+            console("status=FAILED reason=no-fallback-path exit=evidence primary=" + primary
+                + " fallback=" + problem);
             return null;
         }
         stagingDir = runDir;
@@ -555,7 +578,7 @@ public final class CloseSealWriter {
         cells.add(unrecordedCell(snapshot));
         cells.add(cell(snapshot, G_SEALED));
         cells.add(partialCell(snapshot));
-        cells.add(errors.isEmpty() ? "-" : String.join(";", errors));
+        cells.add(errorCell());
         cells.add(cell(snapshot, G_FLUSH));
         cells.add(unloadCell(snapshot));
         cells.add(reclaimCell(snapshot));
@@ -641,6 +664,15 @@ public final class CloseSealWriter {
         }
         return parts.isEmpty() ? "-" : String.join(";", parts)
             + ";worldsExpected=" + worlds.size() + ";worldsWithRows=" + parsed.size();
+    }
+
+    /** The error cell, bounded by what the writer kept and naming what it did not. */
+    private String errorCell() {
+        if (errors.isEmpty()) {
+            return errorsDropped == 0 ? "-" : "errorsDropped=" + errorsDropped;
+        }
+        String joined = String.join(";", errors);
+        return errorsDropped == 0 ? joined : joined + ";errorsDropped=" + errorsDropped;
     }
 
     private String unloadCell(Snapshot snapshot) {

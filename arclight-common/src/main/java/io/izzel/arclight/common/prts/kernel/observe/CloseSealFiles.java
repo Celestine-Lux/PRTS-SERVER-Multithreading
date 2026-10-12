@@ -49,11 +49,22 @@ final class CloseSealFiles {
     }
 
     /** Creates the run directory and refuses one whose real path leaves the diagnostic root, which
-     * is what a symbolic link planted at the run directory would do. */
+     * is what a symbolic link planted at the run directory would do. The directory is claimed with
+     * the one call that fails when it is already there, and a directory that already holds a record
+     * is refused rather than adopted, so a run id that comes round a second time cannot replace the
+     * seal of the run that used it first. */
     static String prepare(Path diagDir, Path runDir) {
         try {
             Files.createDirectories(diagDir);
-            Files.createDirectories(runDir);
+        } catch (IOException error) {
+            return reason(error);
+        }
+        boolean claimed;
+        try {
+            Files.createDirectory(runDir);
+            claimed = true;
+        } catch (FileAlreadyExistsException exists) {
+            claimed = false;
         } catch (IOException error) {
             return reason(error);
         }
@@ -69,7 +80,11 @@ final class CloseSealFiles {
         } catch (IOException error) {
             return reason(error);
         }
-        return "";
+        if (claimed || (!Files.isRegularFile(runDir.resolve(FILE_NAME))
+            && !Files.isRegularFile(runDir.resolve(RECEIPT_NAME)))) {
+            return "";
+        }
+        return "run-dir-exists";
     }
 
     /** Whether a temporary file in one directory can be renamed onto the other in one step; a false

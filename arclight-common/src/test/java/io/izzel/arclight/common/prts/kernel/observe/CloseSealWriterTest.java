@@ -132,11 +132,12 @@ class CloseSealWriterTest {
         entryAndTerminal(missing, new KernelModule.CommitClose(true, "", 0, 0, 0));
         assertEquals("diag-dir-property-missing", missing.failureReason());
         CloseSealWriter relative = new CloseSealWriter(RUN,
-            limits(fallback, null, 1000L, List.of(1L, 1L, 1L)), "relative/close-seal");
+            limits(tmp.resolve("fb-relative"), null, 1000L, List.of(1L, 1L, 1L)),
+            "relative/close-seal");
         entryAndTerminal(relative, new KernelModule.CommitClose(true, "", 0, 0, 0));
         assertEquals("diag-dir-not-absolute", relative.failureReason());
-        String text = Files.readString(fallback.resolve(RUN).resolve("close-seal.tsv"),
-            StandardCharsets.UTF_8);
+        String text = Files.readString(tmp.resolve("fb-relative").resolve(RUN)
+            .resolve("close-seal.tsv"), StandardCharsets.UTF_8);
         assertEquals(List.of(), CloseSealChecks.fallbackMarked(text));
         assertFalse(text.contains("fallback=-"), "a degraded file has to name its reason");
     }
@@ -182,22 +183,155 @@ class CloseSealWriterTest {
     }
 
     @Test
-    void theRowCapRefusesTheNextRecordAndLeavesWhatWasWritten() throws IOException {
+    void aCapThatCannotHoldTheEntryRowWritesTheVerdictAlone() throws IOException {
         Path diag = Files.createDirectories(tmp.resolve("diag"));
         CloseSealWriter writer = new CloseSealWriter(RUN,
             new CloseSealWriter.Limits(1000L, 3, List.of(1L, 1L, 1L), 4L * 1024L * 1024L, 1, null,
                 tmp.resolve("fb")), diag.toString());
         entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
-        Path file = diag.resolve(RUN).resolve("close-seal.tsv");
-        String text = Files.readString(file, StandardCharsets.UTF_8);
-        assertEquals(1, CloseSealChecks.dataLines(text).size(), "the capped file keeps the entry row");
-        assertEquals(List.of("C1"), CloseSealChecks.stages(text));
-        assertEquals("FAILED", writer.status());
-        assertEquals("C4_WRITE_FAILED", writer.reason());
+        String text = Files.readString(diag.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of("C4"), CloseSealChecks.stages(text),
+            "the entry row has no seat, so only the verdict can be written");
+        String terminal = CloseSealChecks.dataLines(text).get(0);
+        assertEquals("NOT_EXECUTABLE", CloseSealChecks.cell(terminal, "status"));
+        assertEquals("C1_WRITE_FAILED", CloseSealChecks.field(terminal, "rowReason"));
+        assertEquals("evidence", CloseSealChecks.field(terminal, "rowExit"));
+        assertFalse(CloseSealChecks.oneEntry(text).isEmpty(),
+            "a record with no entry row must never pass the pair check");
+        assertEquals("NOT_EXECUTABLE", writer.status());
+        assertEquals("C1_WRITE_FAILED", writer.reason());
         assertEquals("evidence", writer.exit());
-        assertTrue(writer.evidenceExit().contains("FILE_CAP_REACHED"));
+        assertEquals("FILE_CAP_REACHED", writer.evidenceExit());
         assertTrue(String.join(";", writer.consoleHistory()).contains("FILE_CAP_REACHED"),
             "the console is the second path and has to carry the refusal");
+    }
+
+    @Test
+    void aCappedRecordStillLeavesTheTerminalRecordThatNamesTheLoss() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            new CloseSealWriter.Limits(1000L, 3, List.of(1L, 1L, 1L), 4L * 1024L * 1024L, 2, null,
+                tmp.resolve("fb")), diag.toString());
+        repeatEntryThenTerminal(writer);
+        String text = Files.readString(diag.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of("C1", "C4"), CloseSealChecks.stages(text),
+            "the dropped repeat must not cost the terminal record its seat");
+        String terminal = CloseSealChecks.dataLines(text).get(1);
+        assertEquals("FAILED", CloseSealChecks.cell(terminal, "status"));
+        assertEquals("FILE_CAP_REACHED", CloseSealChecks.field(terminal, "rowReason"));
+        assertEquals("REACHED", CloseSealChecks.field(terminal, "cap"));
+        assertEquals(List.of(), CloseSealChecks.columnsAndHashes(text));
+        assertEquals(List.of(), CloseSealChecks.preClosePostClose(text),
+            "the record of a capped run still has to be a readable pair");
+        assertEquals("FAILED", writer.status());
+        assertEquals("FILE_CAP_REACHED", writer.reason());
+        assertEquals("evidence", writer.exit());
+    }
+
+    @Test
+    void aByteCapThatDropsARepeatStillLeavesTheTerminalRecord() throws IOException {
+        Path probeDir = Files.createDirectories(tmp.resolve("probe"));
+        CloseSealWriter probe = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb-probe"), null, 1000L, List.of(1L)), probeDir.toString());
+        probe.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        String probeText = Files.readString(probeDir.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        long row = probeText.length() - probeText.indexOf('\n') - 1L;
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            new CloseSealWriter.Limits(1000L, 3, List.of(1L, 1L, 1L),
+                2L * probeText.length() + 4096L, 4096, null, tmp.resolve("fb")), diag.toString());
+        repeatEntryThenTerminal(writer);
+        String text = Files.readString(diag.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of("C1", "C4"), CloseSealChecks.stages(text),
+            "the byte cap dropped the repeat, not the verdict");
+        String terminal = CloseSealChecks.dataLines(text).get(1);
+        assertEquals("FAILED", CloseSealChecks.cell(terminal, "status"));
+        assertEquals("FILE_CAP_REACHED", CloseSealChecks.field(terminal, "rowReason"));
+        assertTrue(terminal.length() <= row + 4096L,
+            "the terminal record outgrew the seat the entry record left: " + terminal.length());
+    }
+
+    @Test
+    void aRecordThatLostARowIsNeverReadAsComplete() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        String text = Files.readString(diag.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of(), CloseSealChecks.preClosePostClose(text),
+            "the clean copy has to pass the pair check");
+        String[] lines = text.split("\n", -1);
+        String truncated = lines[0] + "\n" + lines[1] + "\n";
+        List<String> found = CloseSealChecks.preClosePostClose(truncated);
+        assertFalse(found.isEmpty(),
+            "a record whose terminal row is missing must never be read as complete");
+        assertTrue(String.join(";", found).contains("incomplete"), found.toString());
+    }
+
+    @Test
+    void aRunIdThatAlreadyHoldsARecordIsNeverReplaced() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = Files.createDirectories(diag.resolve(RUN));
+        Path older = runDir.resolve("close-seal.tsv");
+        Files.writeString(older, "OLD-SEAL\n", StandardCharsets.UTF_8);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        assertEquals("OLD-SEAL\n", Files.readString(older, StandardCharsets.UTF_8),
+            "one step rename replaces its target, so the directory has to be refused before it");
+        assertEquals(List.of("close-seal.tsv"), list(runDir),
+            "nothing may be added beside the record of the earlier run");
+        assertEquals("run-dir-exists", writer.failureReason());
+        assertTrue(Files.isRegularFile(tmp.resolve("fb").resolve(RUN).resolve("close-seal.tsv")),
+            "the second run has to land in the independent fallback file");
+    }
+
+    @Test
+    void aRunIdHeldInBothRootsLeavesBothRecordsUntouched() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path fallback = Files.createDirectories(tmp.resolve("fb"));
+        Path olderDiag = Files.createDirectories(diag.resolve(RUN)).resolve("close-seal.tsv");
+        Path olderFallback = Files.createDirectories(fallback.resolve(RUN)).resolve("close-seal.tsv");
+        Files.writeString(olderDiag, "OLD-DIAG\n", StandardCharsets.UTF_8);
+        Files.writeString(olderFallback, "OLD-FB\n", StandardCharsets.UTF_8);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(fallback, null, 1000L, List.of(1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        assertEquals("OLD-DIAG\n", Files.readString(olderDiag, StandardCharsets.UTF_8));
+        assertEquals("OLD-FB\n", Files.readString(olderFallback, StandardCharsets.UTF_8));
+        assertEquals("no-fallback-path", writer.failureReason());
+        assertEquals("NOT_EXECUTABLE", writer.status());
+        assertEquals("C1_WRITE_FAILED", writer.reason());
+        assertEquals("evidence", writer.exit());
+        assertTrue(writer.lastConsole().contains("run-dir-exists"),
+            "the console has to name what held both roots: " + writer.lastConsole());
+    }
+
+    @Test
+    void theErrorCellIsBoundedAndNamesWhatItDropped() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L)), diag.toString());
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        writer.flushing();
+        for (int index = 0; index < CloseSealWriter.MAX_ERRORS_KEPT + 3; index++) {
+            writer.errored(new IllegalStateException("error " + index));
+        }
+        writer.terminal(new CloseSealWriter.Snapshot("C4", WORLDS,
+            CloseSealCriteriaTest.readings(POST_FLUSH)));
+        String text = Files.readString(diag.resolve(RUN).resolve("close-seal.tsv"),
+            StandardCharsets.UTF_8);
+        String cell = CloseSealChecks.cell(CloseSealChecks.dataLines(text).get(1), "error");
+        assertTrue(cell.contains("errorsDropped=3"), cell);
+        assertEquals(CloseSealWriter.MAX_ERRORS_KEPT, cell.split("continued=1").length - 1,
+            "the cell keeps the bounded list and counts the rest");
     }
 
     @Test
@@ -438,6 +572,17 @@ class CloseSealWriterTest {
         }
         assertTrue(writer.lastConsole().contains("C4_WRITE_FAILED"));
         return new String[] {writer.status(), writer.reason(), writer.exit()};
+    }
+
+    private void repeatEntryThenTerminal(CloseSealWriter writer) {
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        writer.flushing();
+        writer.closed(new KernelModule.CommitClose(true, "", 0, 0, 0));
+        writer.terminal(new CloseSealWriter.Snapshot("C4", WORLDS,
+            CloseSealCriteriaTest.readings(POST_FLUSH)));
     }
 
     private void entryAndTerminal(CloseSealWriter writer, KernelModule.CommitClose close) {
