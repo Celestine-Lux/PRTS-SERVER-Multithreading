@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 package io.izzel.arclight.common.prts.kernel.observe;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,6 +63,55 @@ final class CloseSealChecks {
         List<String> found = new ArrayList<>();
         for (String line : dataLines(text)) {
             found.add(cell(line, "stage"));
+        }
+        return found;
+    }
+
+    /** W-10: every increment line describes the whole record file as it stood after its own
+     * stage. The digest and the length of a line are read from the same bytes there, so a line
+     * whose digest does not recompute from the prefix its own length names is a line about some
+     * other object: the entry line stays recomputable after the terminal record was appended, and
+     * the terminal line is the file that was left behind. */
+    static List<String> receiptSnapshots(String text, List<String> receipts) {
+        List<String> found = new ArrayList<>();
+        List<String> rows = dataLines(text);
+        if (receipts.size() != rows.size()) {
+            found.add("increment lines: " + receipts.size() + ", records: " + rows.size());
+        }
+        StringBuilder prefix = new StringBuilder();
+        long previous = -1L;
+        for (int index = 0; index < rows.size(); index++) {
+            prefix.append(index == 0 ? header(text) : "").append(index == 0 ? "\n" : "")
+                .append(rows.get(index)).append('\n');
+            if (index >= receipts.size()) {
+                continue;
+            }
+            String[] parts = receipts.get(index).trim().split("\\s+");
+            if (parts.length != 4) {
+                found.add("increment line " + (index + 1) + " carries " + parts.length + " fields");
+                continue;
+            }
+            long at = prefix.toString().getBytes(StandardCharsets.UTF_8).length;
+            String digest = CloseSealWriter.md5(prefix.toString());
+            if (!CloseSealFiles.FILE_NAME.equals(parts[1])) {
+                found.add("increment line " + (index + 1) + " names " + parts[1]);
+            }
+            if (!("writeSeq=" + (index + 1)).equals(parts[3])) {
+                found.add("increment line " + (index + 1) + " carries " + parts[3]);
+            }
+            long length = number(parts[2].startsWith("bytes=") ? parts[2].substring(6) : parts[2],
+                -1L);
+            if (length != at) {
+                found.add("increment line " + (index + 1) + " says " + parts[2]
+                    + " where the record file stood at " + at);
+            } else if (length <= previous) {
+                found.add("increment line " + (index + 1) + " does not move past the one before it");
+            }
+            previous = length;
+            if (!digest.equals(parts[0])) {
+                found.add("increment line " + (index + 1) + " carries " + parts[0]
+                    + " where the record file's own digest is " + digest);
+            }
         }
         return found;
     }

@@ -27,7 +27,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * second, so a diagnostic that cannot be written cannot hold a shutdown open. */
 public final class CloseSealWriter {
 
-    static final String SCHEMA = "prts-close-seal/1";
+    /** The record set of one run. Version 2 keeps the column set of version 1 and changes only
+     * what the two numbers of an increment line describe: from version 2 on, a line's digest and
+     * its length are read from the same bytes of the record file as it stood after that stage, so
+     * every line describes one object and either number recomputes from the file. A line of a
+     * version 1 file describes the text of its own stage for every line after the first, which is
+     * why a version 1 file has to be read with that rule and not this one. */
+    static final String SCHEMA = "prts-close-seal/2";
     static final String DIAG_DIR_PROPERTY = "prts.diag.dir";
     static final String SOURCE = "event:ServerStoppingEvent";
     static final String OWNER = KernelModule.HOST_OWNER_THREAD_SOURCE;
@@ -438,10 +444,11 @@ public final class CloseSealWriter {
         writeSeq++;
         rows++;
         bytes += size;
-        String refused = receipt(file, text);
-        console("stage=" + stage + " writeSeq=" + writeSeq + " md5=" + md5(text).substring(0, 16)
-            + " path=" + file.toAbsolutePath() + " status=" + status + " reason=" + reason
-            + " fallback=" + failureReason());
+        CloseSealFiles.Whole whole = CloseSealFiles.Whole.of(file);
+        String refused = receipt(file, whole);
+        console("stage=" + stage + " writeSeq=" + writeSeq + " md5=" + prefix(digestOf(whole))
+            + " bytes=" + lengthOf(whole) + " path=" + file.toAbsolutePath() + " status=" + status
+            + " reason=" + reason + " fallback=" + failureReason());
         receipted(stage, refused);
         return true;
     }
@@ -552,13 +559,36 @@ public final class CloseSealWriter {
         }
     }
 
-    /** The increment hash of one record, appended beside the record file. The reason a receipt could
-     * not be written is returned rather than dropped: a receipt that never lands is an evidence
-     * failure and has to reach the terminal classification and the console. */
-    private String receipt(Path file, String text) {
+    /** The increment hash of one record, appended beside the record file. Both numbers on the line
+     * come from one read of the file as it stands after that record became durable, so the digest
+     * and the length describe the same object and either one recomputes from the file at that
+     * stage. The reason it could not be written is returned rather than dropped: an increment that
+     * never lands, and a digest that could not be taken, are both evidence failures and have to
+     * reach the terminal classification and the console. */
+    private String receipt(Path file, CloseSealFiles.Whole whole) {
         Path fileReceipt = file.getParent().resolve(CloseSealFiles.RECEIPT_NAME);
-        return CloseSealFiles.append(fileReceipt, md5(text) + "  " + CloseSealFiles.FILE_NAME
-            + "  bytes=" + CloseSealFiles.size(file) + "  writeSeq=" + writeSeq + LF);
+        String refused = CloseSealFiles.append(fileReceipt, digestOf(whole) + "  "
+            + CloseSealFiles.FILE_NAME + "  bytes=" + lengthOf(whole) + "  writeSeq=" + writeSeq
+            + LF);
+        if (whole.read()) {
+            return refused;
+        }
+        return refused.isEmpty() ? whole.problem() : refused + '+' + whole.problem();
+    }
+
+    /** The digest of the record file as it stands, or a dash where it could not be read: the
+     * console line carries the same pair as the increment line, so neither path can be read as the
+     * digest of something that is not the file. */
+    private static String digestOf(CloseSealFiles.Whole whole) {
+        return whole.read() ? md5(whole.bytes()) : "-";
+    }
+
+    private static String lengthOf(CloseSealFiles.Whole whole) {
+        return whole.read() ? Long.toString(whole.bytes().length) : "-";
+    }
+
+    private static String prefix(String digest) {
+        return digest.length() > 16 ? digest.substring(0, 16) : digest;
     }
 
     /** What a refused receipt does to the reading: it is counted, it is named on the console beside
@@ -796,11 +826,15 @@ public final class CloseSealWriter {
     }
 
     static String md5(String text) {
+        return md5(text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String md5(byte[] bytes) {
         try {
             MessageDigest digest = MessageDigest.getInstance("MD5");
-            byte[] bytes = digest.digest(text.getBytes(StandardCharsets.UTF_8));
-            StringBuilder builder = new StringBuilder(bytes.length * 2);
-            for (byte value : bytes) {
+            byte[] sum = digest.digest(bytes);
+            StringBuilder builder = new StringBuilder(sum.length * 2);
+            for (byte value : sum) {
                 builder.append(Character.forDigit((value >> 4) & 0xf, 16));
                 builder.append(Character.forDigit(value & 0xf, 16));
             }

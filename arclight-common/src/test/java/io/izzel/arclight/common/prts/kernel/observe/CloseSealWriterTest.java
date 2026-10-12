@@ -501,8 +501,10 @@ class CloseSealWriterTest {
         assertEquals(CloseSealWriter.md5(first) + "  close-seal.tsv  bytes="
             + first.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=1", receipts.get(0),
             "the first receipt has to be recomputable after the terminal record was appended");
-        assertEquals(CloseSealWriter.md5(second) + "  close-seal.tsv  bytes="
-            + text.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=2", receipts.get(1));
+        assertEquals(CloseSealWriter.md5(text) + "  close-seal.tsv  bytes="
+            + text.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=2", receipts.get(1),
+            "the second line describes the whole file, not the text of the second record");
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
         assertEquals("0", CloseSealChecks.field(rows.get(0), "receiptFailures"));
         assertEquals("-", CloseSealChecks.field(rows.get(0), "receiptError"));
         assertEquals("0", CloseSealChecks.field(rows.get(1), "receiptFailures"));
@@ -559,6 +561,254 @@ class CloseSealWriterTest {
         assertEquals("FAILED", writer.status());
         assertEquals("C4_WRITE_FAILED", writer.reason());
         assertEquals("evidence", writer.exit());
+    }
+
+    @Test
+    void theEntryIncrementLineDescribesTheWholeRecordFileAtThatStage() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        String first = CloseSealChecks.header(text) + '\n' + CloseSealChecks.dataLines(text).get(0)
+            + '\n';
+        long length = first.getBytes(StandardCharsets.UTF_8).length;
+        assertEquals(first, text, "the entry record is the whole file at that stage");
+        assertEquals(1, receipts.size());
+        assertEquals(CloseSealWriter.md5(first) + "  close-seal.tsv  bytes=" + length
+            + "  writeSeq=1", receipts.get(0));
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        List<String> wrongDigest = new ArrayList<>(receipts);
+        wrongDigest.set(0, receipts.get(0).replace(CloseSealWriter.md5(first), "0".repeat(32)));
+        assertNotEquals(receipts.get(0), wrongDigest.get(0));
+        assertFalse(CloseSealChecks.receiptSnapshots(text, wrongDigest).isEmpty(),
+            "a digest that does not recompute has to be named");
+        List<String> shortByOne = new ArrayList<>(receipts);
+        shortByOne.set(0, receipts.get(0).replace("bytes=" + length, "bytes=" + (length - 1)));
+        assertNotEquals(receipts.get(0), shortByOne.get(0));
+        assertFalse(CloseSealChecks.receiptSnapshots(text, shortByOne).isEmpty(),
+            "a length that names a shorter prefix has to be named");
+    }
+
+    @Test
+    void theTerminalIncrementLineDescribesTheFinalFileAndKeepsTheEntryDigestRecomputable()
+        throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        assertEquals(2, receipts.size());
+        List<String> rows = CloseSealChecks.dataLines(text);
+        String entry = CloseSealChecks.header(text) + '\n' + rows.get(0) + '\n';
+        assertEquals(CloseSealWriter.md5(entry) + "  close-seal.tsv  bytes="
+            + entry.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=1", receipts.get(0),
+            "the entry digest has to stay recomputable from the prefix the file kept");
+        assertEquals(CloseSealWriter.md5(text) + "  close-seal.tsv  bytes="
+            + text.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=2", receipts.get(1),
+            "the terminal line describes the whole file, not the text of its own record");
+        String terminalText = rows.get(1) + '\n';
+        assertNotEquals(CloseSealWriter.md5(terminalText), receipts.get(1).split("\\s+")[0]);
+        List<String> asTheThirdRunWroteIt = List.of(receipts.get(0), CloseSealWriter.md5(terminalText)
+            + "  close-seal.tsv  bytes=" + text.getBytes(StandardCharsets.UTF_8).length
+            + "  writeSeq=2");
+        assertFalse(CloseSealChecks.receiptSnapshots(text, asTheThirdRunWroteIt).isEmpty(),
+            "the increment line the third run wrote has to fail the criterion that replaces it");
+    }
+
+    @Test
+    void theSecondRecordAppendsAndLeavesTheEntryIncrementLineAndItsPrefixUntouched()
+        throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        Path file = runDir.resolve("close-seal.tsv");
+        Path increment = runDir.resolve("close-seal.md5");
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        String afterEntry = Files.readString(file, StandardCharsets.UTF_8);
+        List<String> linesAfterEntry = Files.readAllLines(increment, StandardCharsets.UTF_8);
+        writer.flushing();
+        writer.closed(new KernelModule.CommitClose(true, "", 0, 0, 0));
+        writer.terminal(new CloseSealWriter.Snapshot("C4", WORLDS,
+            CloseSealCriteriaTest.readings(POST_FLUSH)));
+        String afterTerminal = Files.readString(file, StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(increment, StandardCharsets.UTF_8);
+        assertTrue(afterTerminal.startsWith(afterEntry), "the second record appends");
+        assertTrue(afterTerminal.length() > afterEntry.length());
+        assertEquals(1, linesAfterEntry.size());
+        assertEquals(linesAfterEntry.get(0), receipts.get(0),
+            "the entry increment line survives the terminal record");
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(afterTerminal, receipts));
+        assertEquals(List.of(), CloseSealChecks.entryNotReplaced(afterTerminal));
+        assertEquals(List.of(), CloseSealChecks.appendOnly(afterTerminal));
+        String replaced = CloseSealCriteriaTest.editCell(afterTerminal, 0, "stage", "C4");
+        assertFalse(CloseSealChecks.entryNotReplaced(replaced).isEmpty(),
+            "a copy whose entry record was replaced has to be named");
+        List<String> droppedEntryLine = new ArrayList<>(receipts);
+        droppedEntryLine.remove(0);
+        assertFalse(CloseSealChecks.receiptSnapshots(afterTerminal, droppedEntryLine).isEmpty(),
+            "a copy of the increment file that lost its first line has to be named");
+    }
+
+    @Test
+    void aRepeatedEntryKeepsItsStageAndWritesItsOwnIncrementSnapshot() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        repeatEntryThenTerminal(writer);
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of("C1", "C1-DUP", "C4"), CloseSealChecks.stages(text));
+        assertEquals(3, receipts.size(), "one increment line per record, the repeat included");
+        assertEquals("repeated-entry", CloseSealChecks.field(CloseSealChecks.dataLines(text).get(1),
+            "note"));
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        assertEquals(List.of(), CloseSealChecks.oneEntry(text));
+        List<String> withoutTheRepeat = List.of(receipts.get(0), receipts.get(2));
+        assertFalse(CloseSealChecks.receiptSnapshots(text, withoutTheRepeat).isEmpty(),
+            "a repeat record without its own increment line has to be named");
+        String renamed = CloseSealCriteriaTest.editCell(text, 1, "stage", "C1");
+        assertFalse(CloseSealChecks.oneEntry(renamed).isEmpty(),
+            "a second record named as the entry record is still not allowed");
+        String unreasoned = CloseSealCriteriaTest.editField(text, 1, "note", "-");
+        assertFalse(CloseSealChecks.oneEntry(unreasoned).isEmpty(),
+            "a repeat without a reason is still not allowed");
+    }
+
+    @Test
+    void aTerminalRecordThatCannotBeAppendedIsNamedAndLeavesAnIncrementAboutTheFileThatRemains()
+        throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        Path file = runDir.resolve("close-seal.tsv");
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L)), diag.toString());
+        writer.entry(new CloseSealWriter.Snapshot("C1", WORLDS,
+            CloseSealCriteriaTest.readings(PRE_FLUSH)));
+        String before = Files.readString(file, StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("r--------"));
+        Assumptions.assumeFalse(Files.isWritable(file),
+            "this process may write a read-only file, so the refusal cannot be shown");
+        try {
+            writer.flushing();
+            writer.terminal(new CloseSealWriter.Snapshot("C4", WORLDS,
+                CloseSealCriteriaTest.readings(POST_FLUSH)));
+        } finally {
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        }
+        String text = Files.readString(file, StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(before, text, "a refused terminal record must not touch the entry record");
+        assertEquals(1, receipts.size(), "a record that was refused has no increment line");
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        assertEquals("FAILED", writer.status());
+        assertEquals("C4_WRITE_FAILED", writer.reason());
+        assertEquals("evidence", writer.exit());
+        assertTrue(writer.lastConsole().contains("C4_WRITE_FAILED"), writer.lastConsole());
+    }
+
+    @Test
+    void aCappedRunWritesOneIncrementLinePerRecordItKeptAndNamesTheLoss() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            new CloseSealWriter.Limits(1000L, 3, List.of(1L, 1L, 1L), 4L * 1024L * 1024L, 2, null,
+                tmp.resolve("fb")), diag.toString());
+        repeatEntryThenTerminal(writer);
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of("C1", "C4"), CloseSealChecks.stages(text),
+            "the row cap drops the repeat and keeps the verdict");
+        assertEquals(2, receipts.size(), "a record that was never written has no increment line");
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        String terminal = CloseSealChecks.dataLines(text).get(1);
+        assertEquals("FAILED", CloseSealChecks.cell(terminal, "status"));
+        assertEquals("FILE_CAP_REACHED", CloseSealChecks.field(terminal, "rowReason"));
+        assertEquals("REACHED", CloseSealChecks.field(terminal, "cap"));
+        List<String> withAPhantomLine = new ArrayList<>(receipts);
+        withAPhantomLine.add(receipts.get(1));
+        assertFalse(CloseSealChecks.receiptSnapshots(text, withAPhantomLine).isEmpty(),
+            "an increment line for a record the file does not carry has to be named");
+        String lostRow = CloseSealCriteriaTest.dropRow(text, 1);
+        assertFalse(CloseSealChecks.receiptSnapshots(lostRow, receipts).isEmpty(),
+            "a file that lost its terminal row can no longer carry two increment lines");
+        assertFalse(CloseSealChecks.preClosePostClose(lostRow).isEmpty());
+    }
+
+    @Test
+    void aRunLeavesNoStagedFileInTheLandingDirectoryOrInTheStagingStore() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        assertEquals(List.of("close-seal.md5", "close-seal.tsv"), list(runDir));
+        assertEquals(List.of(RUN), list(diag), "no staged file may survive beside the run directory");
+        assertEquals(List.of(), staged(diag));
+        Path foreign = foreignStore(diag);
+        Assumptions.assumeTrue(foreign != null, "no second file system to stage across");
+        Path fallback = tmp.resolve("fb-residue");
+        CloseSealWriter crossed = new CloseSealWriter(RUN,
+            limits(fallback, foreign, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        entryAndTerminal(crossed, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        assertEquals(List.of("close-seal.md5", "close-seal.tsv"), list(fallback.resolve(RUN)));
+        assertEquals(List.of(), staged(foreign), "the staging store may not keep a staged file");
+    }
+
+    @Test
+    void aCrossFileSystemRunLandsItsRecordAndItsIncrementInTheIndependentFile() throws IOException {
+        Assumptions.assumeTrue(CloseSealFiles.sameFileStore(tmp, Paths.get("/tmp")),
+            "the temporary root is not /tmp on this machine, so this is not that pair");
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path foreign = foreignStore(diag);
+        Assumptions.assumeTrue(foreign != null, "no second file system to stage across");
+        Path fallback = tmp.resolve("fb");
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(fallback, foreign, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        Path runDir = fallback.resolve(RUN);
+        assertEquals(List.of(), list(diag.resolve(RUN)),
+            "the diagnostic side holds no file when the atomic promise is refused");
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(List.of(), CloseSealChecks.receiptSnapshots(text, receipts));
+        assertEquals(2, receipts.size());
+        assertEquals("refused", CloseSealChecks.field(CloseSealChecks.dataLines(text).get(0),
+            "primaryAtomic"));
+        assertEquals("cross-filesystem", CloseSealChecks.field(CloseSealChecks.dataLines(text).get(0),
+            "fallback"));
+        assertEquals(CloseSealWriter.md5(text) + "  close-seal.tsv  bytes="
+            + text.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=2", receipts.get(1));
+        assertEquals(List.of(), staged(foreign));
+        System.out.println("CROSS_FILE_SYSTEM\t" + foreign + "\t" + Files.getFileStore(foreign)
+            + "\tlanded=" + runDir);
+    }
+
+    @Test
+    void aRecordFileThatCannotBeReadIsNamedInsteadOfAnsweredWithANumber() throws IOException {
+        Path dir = Files.createDirectories(tmp.resolve("unreadable"));
+        Path asDirectory = Files.createDirectories(dir.resolve("close-seal.tsv"));
+        CloseSealFiles.Whole whole = CloseSealFiles.Whole.of(asDirectory);
+        assertFalse(whole.read(), "a directory is not a record file");
+        assertEquals(0, whole.bytes().length);
+        assertNotEquals("", whole.problem());
+        assertFalse(CloseSealFiles.Whole.of(dir.resolve("missing.tsv")).read());
+        assertNotEquals("", CloseSealFiles.Whole.of(dir.resolve("missing.tsv")).problem());
     }
 
     private String[] c1WriteFailed() throws IOException {
@@ -690,6 +940,25 @@ class CloseSealWriterTest {
         List<String> names = new ArrayList<>();
         try (var stream = Files.list(dir)) {
             stream.forEach(path -> names.add(path.getFileName().toString()));
+        }
+        names.sort(String::compareTo);
+        return names;
+    }
+
+    /** The staged neighbours the atomic replace writes through, so a rename that did not finish
+     * is a reading and never something a later look has to guess at. */
+    private static List<String> staged(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        try (var stream = Files.list(dir)) {
+            stream.forEach(path -> {
+                String name = path.getFileName().toString();
+                if (name.startsWith(".close-seal-")) {
+                    names.add(name);
+                }
+            });
         }
         names.sort(String::compareTo);
         return names;

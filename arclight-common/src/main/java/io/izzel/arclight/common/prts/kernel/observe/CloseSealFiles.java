@@ -170,11 +170,21 @@ final class CloseSealFiles {
         }
     }
 
-    static long size(Path file) {
-        try {
-            return Files.size(file);
-        } catch (IOException error) {
-            return -1L;
+    /** The whole file as one read. A digest and a length taken from this read describe the same
+     * bytes, which is what lets one record say which object its two numbers are about; a read that
+     * fails is returned as its own name instead of a number that would look like a reading. */
+    record Whole(byte[] bytes, String problem) {
+
+        static Whole of(Path file) {
+            try {
+                return new Whole(Files.readAllBytes(file), "");
+            } catch (IOException error) {
+                return new Whole(new byte[0], reason(error));
+            }
+        }
+
+        boolean read() {
+            return problem.isEmpty();
         }
     }
 
