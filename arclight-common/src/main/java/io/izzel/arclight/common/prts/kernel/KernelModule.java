@@ -227,6 +227,11 @@ public final class KernelModule {
         }
 
         @Override
+        public IdentityWitness.Obligation oblige(FrozenDeclarations declarations) {
+            return declarationHistory.oblige(declarations);
+        }
+
+        @Override
         public long liveWorldEpoch(String worldId) {
             return guard.worldEpochs().epochOf(worldId);
         }
@@ -821,8 +826,16 @@ public final class KernelModule {
         return freeze.lifecycleKey() + "#" + freeze.generation();
     }
 
-    /** The read-only snapshot of a replaced freeze: how a ticket that outlived its freeze still
-     * names the declarations its records were judged under. */
+    /** The read-only snapshot of one named freeze: the export path, which knows the freeze its records
+     * were judged under. The freeze is named whole, because a reset hands the plan counter back. */
+    public FrozenDeclarations declarationSnapshot(FrozenDeclarations.FreezeKey freeze,
+                                                  long planSequence) {
+        return declarationHistory.snapshot(freeze, planSequence);
+    }
+
+    /** The newest replaced freeze with this plan number, for a reader that did not name its freeze.
+     * A diagnostic convenience only: it must not pick the table of an export, because two lifecycles
+     * can carry the same plan number and this answer cannot tell them apart. */
     public FrozenDeclarations declarationSnapshot(long planSequence) {
         return declarationHistory.newestSnapshot(planSequence);
     }
@@ -838,6 +851,16 @@ public final class KernelModule {
     /** How many replaced freezes the bounded retention had to give up: counted, never quiet. */
     public long declarationSnapshotsEvicted() {
         return declarationHistory.evicted();
+    }
+
+    /** How many evictions an obligation did not allow: the bound passed a freeze it still owes. */
+    public long declarationSnapshotsWithheld() {
+        return declarationHistory.withheld();
+    }
+
+    /** The generation of the freeze this holder is in: it only rises, one step per lifecycle boundary. */
+    public long declarationGeneration() {
+        return declarationGeneration;
     }
 
     /** The piece that refused the last seal, or an empty string. */

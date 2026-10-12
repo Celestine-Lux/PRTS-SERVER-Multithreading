@@ -907,9 +907,11 @@ public final class KernelReadings {
         // The freeze the table belongs to: its lifecycle key and its own generation, which is not
         // the plan counter, plus what the bounded retention kept and had to give up.
         add(lines, "product.commit.declaration_freeze", module.declarationFreeze());
+        add(lines, "product.commit.declaration_generation", module.declarationGeneration());
         add(lines, "product.commit.declaration_snapshots", module.declarationSnapshotsRetained());
         add(lines, "product.commit.declaration_snapshots_retired", module.declarationSnapshotsRetired());
         add(lines, "product.commit.declaration_snapshots_evicted", module.declarationSnapshotsEvicted());
+        add(lines, "product.commit.declaration_snapshots_withheld", module.declarationSnapshotsWithheld());
         add(lines, "product.commit.witness_refusals",
             reservations == null ? 0L : reservations.witnessRefusals());
         add(lines, "product.commit.drift_refusals",

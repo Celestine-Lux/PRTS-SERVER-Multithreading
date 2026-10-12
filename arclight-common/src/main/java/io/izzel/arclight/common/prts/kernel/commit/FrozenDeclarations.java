@@ -5,6 +5,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -96,10 +98,10 @@ public final class FrozenDeclarations {
                 && !targetStatus.isEmpty();
         }
 
-        /** Whether the handle also carries the mapping a line of this freeze is identified by: the
-         * instance this side authorizes and the world generation it was frozen at. */
+        /** Whether the handle also carries the mapping a line is identified by: the instance this
+         * side authorizes, read through the one positive-domain check the write side shares. */
         public boolean bindingDeclared() {
-            return instanceId != CommitLog.NO_INSTANCE && CommitLog.liveWorldEpoch(worldEpoch);
+            return CommitLog.liveInstance(instanceId) && CommitLog.liveWorldEpoch(worldEpoch);
         }
     }
 
@@ -127,9 +129,9 @@ public final class FrozenDeclarations {
     public record Entry(Seat seat, String nodeKey, int role, long packedChunkPos, String targetStatus,
                         long instanceId, long worldEpoch) {
 
-        /** Whether this entry carries the mapping a line has to wear to be the line it declares. */
+        /** Whether this entry carries the mapping a line has to wear: the positive domain of a seal. */
         public boolean bindingDeclared() {
-            return instanceId != CommitLog.NO_INSTANCE && CommitLog.liveWorldEpoch(worldEpoch);
+            return CommitLog.liveInstance(instanceId) && CommitLog.liveWorldEpoch(worldEpoch);
         }
     }
 
@@ -235,7 +237,8 @@ public final class FrozenDeclarations {
             }
             Seat seat = entry.seat();
             NodeKey node = keyOf(seat.worldId(), seat.domainId(), entry.nodeKey());
-            if (!node.declared() || entry.targetStatus().isEmpty()) {
+            if (!node.declared() || entry.targetStatus() == null || entry.targetStatus().isEmpty()) {
+                // A null state is a field this table does not carry, not a fault of the reader.
                 return new Sealed(null, "declaration-field-missing");
             }
             if (seat.planSequence() != planSequence) {
@@ -325,15 +328,20 @@ public final class FrozenDeclarations {
 
     /** The freezes one holder has replaced, kept whole as read-only snapshots so a ticket, a log or
      * an export that outlived its freeze still names the declarations its records were judged under.
-     * The retention is bounded and an eviction is counted: an obligation is never dropped quietly.
-     * The current table is the only one that authorizes; a snapshot answers evidence and nothing else. */
+     * The retention is bounded, an eviction is counted, and a table an obligation still names is not
+     * evicted at all: the bound is applied to the tables nothing owes. The current table is the only
+     * one that authorizes; a snapshot answers evidence and nothing else. */
     public static final class History {
 
         private final int cap;
         private FrozenDeclarations current = FrozenDeclarations.none();
         private final Deque<FrozenDeclarations> retained = new ArrayDeque<>();
+        /** What still owes a freeze: a ticket before its terminal, an unread line or a pending item,
+         * keyed by the table itself and not by a plan number two lifecycles may share. */
+        private final Map<FrozenDeclarations, Integer> owed = new IdentityHashMap<>();
         private long retired;
         private long evicted;
+        private long withheld;
 
         public History(int cap) {
             this.cap = Math.max(1, cap);
@@ -371,6 +379,41 @@ public final class FrozenDeclarations {
             return found;
         }
 
+        /** Keeps the table of one verified freeze readable while an obligation still names it: the
+         * ticket taken under it, the line its terminal writes, an unread line or a pending item. It
+         * holds the read-only table itself, and a table that sealed nothing backs no seat to keep. */
+        public synchronized IdentityWitness.Obligation oblige(FrozenDeclarations table) {
+            if (table == null || table.size() <= 0) {
+                return IdentityWitness.Obligation.NONE;
+            }
+            owed.merge(table, 1, Integer::sum);
+            return new IdentityWitness.Obligation() {
+
+                private boolean settled;
+
+                @Override
+                public synchronized void settle() {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    History.this.settle(table);
+                }
+            };
+        }
+
+        private synchronized void settle(FrozenDeclarations table) {
+            Integer held = owed.get(table);
+            if (held == null) {
+                return;
+            }
+            if (held <= 1) {
+                owed.remove(table);
+                return;
+            }
+            owed.put(table, held - 1);
+        }
+
         /** Takes a sealed table as the current one and retires the freeze it replaces. */
         public synchronized void seal(FrozenDeclarations table) {
             retire();
@@ -387,8 +430,21 @@ public final class FrozenDeclarations {
             }
             retained.addLast(held);
             retired++;
-            while (retained.size() > cap) {
-                retained.removeFirst();
+            trim();
+        }
+
+        /** Applies the bound from the oldest table on: what nothing owes is given up, and a table an
+         * obligation still names is left and counted instead. The bound runs when the next freeze
+         * replaces one, so the freeze of a terminal line is still there to be exported after it. */
+        private void trim() {
+            Iterator<FrozenDeclarations> walk = retained.iterator();
+            while (retained.size() > cap && walk.hasNext()) {
+                FrozenDeclarations candidate = walk.next();
+                if (owed.containsKey(candidate)) {
+                    withheld++;
+                    continue;
+                }
+                walk.remove();
                 evicted++;
             }
         }
@@ -403,6 +459,11 @@ public final class FrozenDeclarations {
 
         public synchronized long evicted() {
             return evicted;
+        }
+
+        /** How many evictions an obligation did not allow: "given up" and "still owed" differ. */
+        public synchronized long withheld() {
+            return withheld;
         }
     }
 }

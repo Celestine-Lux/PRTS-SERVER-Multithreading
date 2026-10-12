@@ -83,6 +83,14 @@ public final class CommitLog {
         return worldEpoch > NO_WORLD_EPOCH;
     }
 
+    /** Whether an instance column names one of the numbers a producer mints: the domain is positive,
+     * so zero and every negative value declare no instance. It is the one reading of that domain and
+     * a domain check only: what identifies a line is the mapping its own declaration sealed. A chunk
+     * position is not read here, because a packed chunk is signed and a negative one is legal. */
+    public static boolean liveInstance(long instanceId) {
+        return instanceId > NO_INSTANCE;
+    }
+
     /** The typed columns of one line. A line of the plain path carries {@link Identity#NONE}, which
      * declares nothing: no schema, no instance, no effect. */
     public record Identity(int schemaVersion, long instanceId, long worldEpoch, long chunkPos,
@@ -103,7 +111,7 @@ public final class CommitLog {
         /** Whether every column a versioned line has to declare is there. A missing column is a
          * refusal, not a default that reads as a value: both namespaces are read. */
         public boolean declaredTyped() {
-            return schemaVersion == SCHEMA_TYPED && instanceId != NO_INSTANCE
+            return schemaVersion == SCHEMA_TYPED && liveInstance(instanceId)
                 && liveWorldEpoch(worldEpoch) && !targetStatus.isEmpty()
                 && authorizationGeneration != NO_AUTHORIZATION_GENERATION && effectRef != NO_EFFECT
                 && producer.declared() && controller.declared();
@@ -333,6 +341,8 @@ public final class CommitLog {
     private final IdentityWitness.Source identitySource;
     private final long lifetime = CommitNamespaces.Lifetimes.mint();
     private final Object ringKey = new Object();
+    /** What the rings still owe: a stored typed line holds the freeze it was judged against until read. */
+    private final List<IdentityWitness.Obligation> unread = new ArrayList<>();
     private final Map<Long, RingSlot> heldSlots = new LinkedHashMap<>();
     private final Map<Long, long[]> heldPlans = new LinkedHashMap<>();
     private final Map<String, long[]> reservedFloors = new LinkedHashMap<>();
@@ -498,6 +508,7 @@ public final class CommitLog {
         last = replay;
         lastSchema = new SchemaReplay(typed.isEmpty() ? SCHEMA_UNDECLARED : SCHEMA_TYPED, plain, typed,
             unresolvedOf(typed));
+        settleUnread();
         return replay;
     }
 
@@ -593,10 +604,10 @@ public final class CommitLog {
             identityCollisions++;
             return typedRefusal(RejectCode.VERSION_MISMATCH, position);
         }
-        IdentityWitness.Verdict witness = IdentityWitness.verify(
-            identitySource.declarations(batch.worldId(), batch.domainId(), resolved.planSequence()),
-            resolved, batch.worldId(), batch.domainId(), batch.nodeKey(), identity,
-            identitySource.currentController());
+        FrozenDeclarations sealed = identitySource.declarations(batch.worldId(), batch.domainId(),
+            resolved.planSequence());
+        IdentityWitness.Verdict witness = IdentityWitness.verify(sealed, resolved, batch.worldId(),
+            batch.domainId(), batch.nodeKey(), identity, identitySource.currentController());
         if (!witness.accepted()) {
             return typedRefusal(RejectCode.VERSION_MISMATCH, position);
         }
@@ -634,6 +645,7 @@ public final class CommitLog {
             return typedRefusal(push.code(), position);
         }
         consumeSlot(slot);
+        owe(sealed);
         lastPlanOfRing.put(key(batch.worldId(), batch.domainId()), resolved.planSequence());
         lastPositionOfRing.put(key(batch.worldId(), batch.domainId()), position);
         instanceNamespaces.put(instanceKey, instance);
@@ -741,6 +753,31 @@ public final class CommitLog {
 
     private static String instanceKeyOf(String worldId, String domainId, long instanceId) {
         return key(worldId, domainId) + "/" + instanceId;
+    }
+
+    /** Holds the freeze a stored line was judged against: it is not given up while it waits unread. */
+    private void owe(FrozenDeclarations sealed) {
+        IdentityWitness.Obligation held = identitySource.oblige(sealed);
+        if (held != null && held != IdentityWitness.Obligation.NONE) {
+            unread.add(held);
+        }
+    }
+
+    void holdUnread(IdentityWitness.Obligation held) {
+        if (held != null && held != IdentityWitness.Obligation.NONE) {
+            unread.add(held);
+        }
+    }
+
+    private void settleUnread() {
+        for (IdentityWitness.Obligation held : unread) {
+            held.settle();
+        }
+        unread.clear();
+    }
+
+    public int unreadObligations() {
+        return unread.size();
     }
 
     private Verdict ticketRefusal(RejectCode code, int position) {
@@ -1035,6 +1072,7 @@ public final class CommitLog {
                 }
             }
         }
+        settleUnread();
         return new SchemaReplay(typed.isEmpty() ? SCHEMA_UNDECLARED : SCHEMA_TYPED, plain, typed,
             unresolvedOf(typed));
     }

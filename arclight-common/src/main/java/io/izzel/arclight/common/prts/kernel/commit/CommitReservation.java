@@ -74,6 +74,15 @@ public final class CommitReservation {
     private record Refusal(RejectCode code, String diagnostic) {
     }
 
+    /** What one request was judged against: the piece that refused it, or the freeze the seat it
+     * claims was verified in. The table is carried out of the check so the ticket can hold it. */
+    private record Judged(Refusal refusal, FrozenDeclarations declarations) {
+
+        static Judged refused(Refusal refusal) {
+            return new Judged(refusal, FrozenDeclarations.none());
+        }
+    }
+
     private static final int LEDGER_LIMIT = 64;
 
     private final CommitLog log;
@@ -84,6 +93,9 @@ public final class CommitReservation {
     private final Map<Long, CommitTicket> tickets = new LinkedHashMap<>();
     private final Map<Long, Phase> phases = new LinkedHashMap<>();
     private final Map<Long, Pending> pendings = new LinkedHashMap<>();
+    /** What every ticket in flight owes: the freeze its seat was verified in. It is handed to the log
+     * when the terminal line is stored and given up when the ticket is given back. */
+    private final Map<Long, IdentityWitness.Obligation> obligations = new LinkedHashMap<>();
     private final Deque<TerminalEntry> ledger = new ArrayDeque<>();
     private final Deque<Long> finished = new ArrayDeque<>();
     private Thread ownerThread = Thread.currentThread();
@@ -179,10 +191,10 @@ public final class CommitReservation {
             requestRefusals++;
             return new ReserveResult(false, RejectCode.QUEUE_CAP_EXCEEDED, "lifecycle-closed", null);
         }
-        Refusal refusal = validate(request);
-        if (refusal != null) {
+        Judged judged = validate(request);
+        if (judged.refusal() != null) {
             requestRefusals++;
-            return new ReserveResult(false, refusal.code(), refusal.diagnostic(), null);
+            return new ReserveResult(false, judged.refusal().code(), judged.refusal().diagnostic(), null);
         }
         if (!log.placeAscending(request.worldId(), request.domainId(), request.planSequence(),
             request.position())) {
@@ -213,69 +225,70 @@ public final class CommitReservation {
             controller());
         tickets.put(ticket.ticketId(), ticket);
         phases.put(ticket.ticketId(), Phase.RESERVED);
+        obligations.put(ticket.ticketId(), log.identitySource().oblige(judged.declarations()));
         reserveSuccess++;
         return new ReserveResult(true, null, "reserved", ticket);
     }
 
-    private Refusal validate(CommitTicket.ReserveRequest request) {
+    private Judged validate(CommitTicket.ReserveRequest request) {
         if (request == null || request.identity() == null || request.worldId() == null
             || request.domainId() == null || request.worldId().isEmpty() || request.domainId().isEmpty()
             || request.nodeKey() == null || request.nodeKey().isEmpty() || request.kind() == null) {
-            return new Refusal(RejectCode.COUNTER_MISSING, "request-incomplete");
+            return Judged.refused(new Refusal(RejectCode.COUNTER_MISSING, "request-incomplete"));
         }
         if (store.halted()) {
-            return new Refusal(RejectCode.QUEUE_CAP_EXCEEDED, "log-integrity-fault");
+            return Judged.refused(new Refusal(RejectCode.QUEUE_CAP_EXCEEDED, "log-integrity-fault"));
         }
         CommitLog.Identity identity = request.identity();
         if (!identity.declaredTyped() || !CommitLog.supportedSchema(identity.schemaVersion())) {
-            return new Refusal(RejectCode.VERSION_MISMATCH, "identity-undeclared");
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "identity-undeclared"));
         }
         if (!CommitLog.liveWorldEpoch(identity.worldEpoch())) {
-            return new Refusal(RejectCode.VERSION_MISMATCH, "world-epoch-not-live");
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "world-epoch-not-live"));
         }
         if (identity.authorizationGeneration() != request.expectedVersion()
             || identity.authorizationGeneration() == CommitLog.NO_AUTHORIZATION_GENERATION) {
-            return new Refusal(RejectCode.VERSION_MISMATCH, "authorization-mismatch");
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "authorization-mismatch"));
         }
         if (request.controller() == null
             || !request.controller().lifecycleKey().equals(controller().lifecycleKey())) {
             // The request names the lifecycle it is taken under. Whether the producer and the world
             // are really the ones this line writes to is a question only a bound host can answer, and
             // it is not asked here.
-            return new Refusal(RejectCode.VERSION_MISMATCH, "controller-namespace-mismatch");
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "controller-namespace-mismatch"));
         }
         CommitLog.Resolved resolved = plans == null ? null
             : plans.resolve(request.worldId(), request.domainId(), request.nodeKey());
         if (resolved == null || resolved.planSequence() != request.planSequence()
             || resolved.position() != request.position()) {
-            return new Refusal(RejectCode.COMMIT_ORDER_VIOLATION, "plan-ref-mismatch");
+            return Judged.refused(new Refusal(RejectCode.COMMIT_ORDER_VIOLATION, "plan-ref-mismatch"));
         }
         // The seat the plan resolved is what the sealed declarations are looked up by, so this runs
         // after the plan reference was checked and before a ring slot or a room is taken. The
         // namespace agreement is asked of the holder's current controller, not of the request.
-        IdentityWitness.Verdict witness = IdentityWitness.verify(
-            log.identitySource().declarations(request.worldId(), request.domainId(),
-                resolved.planSequence()), resolved, request.worldId(), request.domainId(),
-            request.nodeKey(), identity, controller());
+        FrozenDeclarations sealed = log.identitySource().declarations(request.worldId(),
+            request.domainId(), resolved.planSequence());
+        IdentityWitness.Verdict witness = IdentityWitness.verify(sealed, resolved, request.worldId(),
+            request.domainId(), request.nodeKey(), identity, controller());
         if (!witness.accepted()) {
             witnessRefusals++;
-            return new Refusal(RejectCode.VERSION_MISMATCH, witness.reason());
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, witness.reason()));
         }
         if (log.instanceCollision(request.worldId(), request.domainId(), identity)) {
-            return new Refusal(RejectCode.VERSION_MISMATCH, "instance-collision");
+            return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "instance-collision"));
         }
         if (placeHeld(request.worldId(), request.domainId(), request.planSequence(),
             request.position())) {
-            return new Refusal(RejectCode.COMMIT_ORDER_VIOLATION, "duplicate-place");
+            return Judged.refused(new Refusal(RejectCode.COMMIT_ORDER_VIOLATION, "duplicate-place"));
         }
         for (CommitTicket.Terminal terminal : CommitTicket.Terminal.values()) {
             EffectStore.Effect variant = request.variantOf(terminal);
             if (variant == null || variant.effectRef() != identity.effectRef()
                 || EffectStore.normalizedRows(variant.rows()).size() != request.rows()) {
-                return new Refusal(RejectCode.VERSION_MISMATCH, "terminal-payload-mismatch");
+                return Judged.refused(new Refusal(RejectCode.VERSION_MISMATCH, "terminal-payload-mismatch"));
             }
         }
-        return null;
+        return new Judged(null, sealed);
     }
 
     /** Whether a reservation in flight already holds this place of this pair. */
@@ -434,6 +447,7 @@ public final class CommitReservation {
         tickets.remove(ticket.ticketId());
         pendings.remove(ticket.ticketId());
         remember(ticket.ticketId());
+        handOver(ticket.ticketId());
         finalized++;
         int successBatch = outcome.terminal() == CommitTicket.Terminal.PUBLISHED ? 1 : 0;
         switch (outcome.terminal()) {
@@ -515,6 +529,24 @@ public final class CommitReservation {
         phases.remove(ticket.ticketId());
         tickets.remove(ticket.ticketId());
         pendings.remove(ticket.ticketId());
+        // A reservation that wrote no line owes no freeze: the obligation ends with the ticket.
+        settle(ticket.ticketId());
+    }
+
+    /** Gives the obligation of one ticket to the log once its terminal line is stored: from there the
+     * unread line is what keeps the freeze readable, and the log settles it when it reads it. */
+    private void handOver(long ticketId) {
+        IdentityWitness.Obligation held = obligations.remove(ticketId);
+        if (held != null) {
+            log.holdUnread(held);
+        }
+    }
+
+    private void settle(long ticketId) {
+        IdentityWitness.Obligation held = obligations.remove(ticketId);
+        if (held != null) {
+            held.settle();
+        }
     }
 
     private void pend(CommitTicket ticket, RejectCode code, String diagnostic) {

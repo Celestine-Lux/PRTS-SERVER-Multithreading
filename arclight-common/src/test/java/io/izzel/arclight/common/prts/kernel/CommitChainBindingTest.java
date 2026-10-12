@@ -7,6 +7,7 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
+import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import io.izzel.arclight.common.prts.kernel.observe.KernelReadings;
 import org.junit.jupiter.api.AfterEach;
@@ -129,6 +130,36 @@ class CommitChainBindingTest {
             + c.store.capacityFinalized() + " records=" + c.store.records() + " pins="
             + c.store.pins() + "]"
             + " epoch=" + c.epochs.current();
+    }
+
+    /** A controlled fixture and nothing more: this tick's plan carries no artefact, so what it shows
+     * is the generation boundary of the holder and not a product declaration. It is not a CAP-41
+     * input, no real supplier takes part, and no instance is run. */
+    @Test
+    void aPlanWithoutArtefactsSealsNoTableAndEveryLifecycleBoundaryMovesTheGeneration() {
+        KernelModule module = KernelModule.instance();
+        Chain c = new Chain(module.commitOrderSource());
+
+        assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state(),
+            "the plan of this tick declared no artefact, so no entry was sealed");
+        assertEquals(0, module.declarations().size(), "and an empty plan is not read as a table");
+        assertEquals(0L, module.declarationSnapshotsRetired(), "there was nothing to keep");
+        assertEquals(0L, module.declarationSnapshotsWithheld(), "and nothing was owed");
+        long generation = module.declarationGeneration();
+
+        module.resetReadings();
+        assertEquals(generation + 1L, module.declarationGeneration(),
+            "reading a reset takes the holder one generation on");
+        assertTrue(module.installCommitChain(c.log, c.controller).bound());
+        assertEquals(generation + 2L, module.declarationGeneration(), "so does an install");
+        assertTrue(module.rollbackCommitChain());
+        assertEquals(generation + 3L, module.declarationGeneration(), "and so does a rollback");
+        assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state(),
+            "no boundary makes a table out of a plan that carried no artefact");
+        assertEquals(generation + 3L, module.declarationGeneration(),
+            "and none of them hands a number back");
+        assertEquals("0", reading("product.commit.declaration_snapshots_withheld"),
+            "the retention owed nothing, so nothing was withheld");
     }
 
     @Test

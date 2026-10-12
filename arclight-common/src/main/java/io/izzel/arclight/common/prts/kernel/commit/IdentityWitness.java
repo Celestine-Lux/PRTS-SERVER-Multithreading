@@ -32,8 +32,25 @@ public final class IdentityWitness {
         }
     }
 
+    /** One live obligation on a freeze that outlived its replacement: the ticket taken under it, the
+     * terminal line that ticket writes, an unread line or a pending item. While it stands the holder
+     * keeps the table the line was judged against, so a lawful terminal still exports its closure. */
+    public interface Obligation {
+
+        Obligation NONE = () -> {
+        };
+
+        void settle();
+    }
+
     /** Where a holder reads the declarations it sealed and the generations that are live now. */
     public interface Source {
+
+        /** Keeps the freeze of one verified seat readable while the obligation that outlived it still
+         * names it; a holder that keeps no bounded history answers with a lease that holds nothing. */
+        default Obligation oblige(FrozenDeclarations declarations) {
+            return Obligation.NONE;
+        }
 
         /** The table of the freeze this seat belongs to, or a table that answers nothing: a holder
          * that answered the newest table to every question would authorize the interval between a
