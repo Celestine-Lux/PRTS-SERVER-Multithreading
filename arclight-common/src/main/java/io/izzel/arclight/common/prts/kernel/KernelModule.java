@@ -279,6 +279,8 @@ public final class KernelModule {
     private long unloadDuplicateCount;
     private long unloadEpochAdvances;
     private long unloadTokenReclaims;
+    private long unloadPlatformPosts;
+    private long unloadHostRemovePosts;
     private boolean unloadDeliveryInstalled;
     private int commitCloseGivenBack;
     private int commitCloseUnrecorded;
@@ -1299,8 +1301,12 @@ public final class KernelModule {
      * it was answered. */
     public static final long NO_CARRIED_EPOCH = -1L;
 
-    /** The source every unload delivery names: raised by this tree at its stopping injection. */
-    public static final String HOST_UNLOAD_SOURCE = "host:stop-unload-walk";
+    /** The two sources a delivery can name, read from the path that raised it: the platform posts while
+     * the world is still in the level map, this tree posts after the removal path took it out. Neither
+     * fact readable names the refusal below, which is never a guess. */
+    public static final String PLATFORM_UNLOAD_SOURCE = "platform:stop-unload-post";
+    public static final String HOST_UNLOAD_SOURCE = "host:world-remove";
+    public static final String UNKNOWN_UNLOAD_SOURCE = "UNKNOWN_POST_PATH";
 
     /** The owner that takes a world's tokens back: the stop flush, never the delivery itself. */
     public static final String HOST_STOP_FLUSH_OWNER = "host:stop-flush";
@@ -1639,14 +1645,14 @@ public final class KernelModule {
         return commitStopFlushRefusal;
     }
 
-    /** One world's unload delivery: the entry this tree raised the event from, the generation the
-     * shared control held, the flush entry and step stamps of that session, what the shared flush took
-     * back and what the delivery took back, and the reading an old generation still gets. A cell this
-     * delivery cannot fill reads NEVER_RUN or NOT_EXECUTABLE and is never a zero. */
-    public record WorldUnloadDelivery(String worldId, long worldEpoch, long flushEntry, String steps,
-                                      String flushRefusal, long stopEntry, long epochAtDelivery,
-                                      int reclaimedByFlush, int reclaimedByDelivery, long tokenReleases,
-                                      long tokensWaiting, boolean duplicate) {
+    /** One world's unload delivery: the path that raised it, the generation and flush entry the shared
+     * control held, what the shared flush took back and what this delivery took back. A cell it cannot
+     * fill reads NEVER_RUN or NOT_EXECUTABLE and is never a zero. */
+    public record WorldUnloadDelivery(String worldId, String source, long worldEpoch,
+                                      long flushEntry, String steps, String flushRefusal,
+                                      long stopEntry, long epochAtDelivery, int reclaimedByFlush,
+                                      int reclaimedByDelivery, long tokenReleases, long tokensWaiting,
+                                      boolean duplicate) {
 
         /** Whether this row is the one delivery of its world in its stop entry. */
         public boolean delivered() {
@@ -1677,13 +1683,22 @@ public final class KernelModule {
         /** One line per delivery: the form the console copy, the reading cell and the evidence hold. */
         public String row() {
             return "world=" + worldId + "|worldEpoch=" + worldEpochCell()
-                + "|source=" + HOST_UNLOAD_SOURCE
+                + "|source=" + source
                 + "|stopEntry=" + (stopEntry == 0L ? NEVER_RUN_CELL : Long.toString(stopEntry))
                 + "|flushEntry=" + (flushEntry == 0L ? NEVER_RUN_CELL : Long.toString(flushEntry))
                 + "|flushSteps=" + steps + "|reclaim=" + reclaimCell()
                 + "|oldGeneration=" + oldGenerationCell() + "|delivery="
                 + (duplicate ? UNLOAD_DUPLICATE : "TRIGGERED");
         }
+    }
+
+    /** Keeps the source of a delivery inside the closed set: anything else is the named refusal, so a
+     * delivery cannot be labelled by a literal its caller made up. */
+    public static String closedSource(String source) {
+        if (PLATFORM_UNLOAD_SOURCE.equals(source) || HOST_UNLOAD_SOURCE.equals(source)) {
+            return source;
+        }
+        return UNKNOWN_UNLOAD_SOURCE;
     }
 
     /** Names a generation the shared control read: absent and untracked are refusals, not zeros. */
@@ -1697,12 +1712,13 @@ public final class KernelModule {
         return Long.toString(epoch);
     }
 
-    /** Records one world's unload delivery. The generation, the flush entry and the tokens come from
-     * the lifecycle control the tick, the stop flush and the close already share: this method reads
-     * them and advances none of them, and it takes no token back. A second delivery of the same world
-     * in the same stop entry is counted and written as a repeat. */
-    public WorldUnloadDelivery noteWorldUnload(String worldId) {
+    /** Records one world's unload delivery, under the source the path that raised it reported. The
+     * generation, the flush entry and the tokens come from the lifecycle control the tick, the stop
+     * flush and the close already share, and are read only. A second delivery of the same world in the
+     * same stop entry is counted and written as a repeat. */
+    public WorldUnloadDelivery noteWorldUnload(String worldId, String source) {
         String named = worldId == null || worldId.isEmpty() ? "unnamed" : worldId;
+        String namedSource = closedSource(source);
         long stopEntry = stopCloseLastSequence;
         long tokensBefore = intents.releasedCount();
         long epochsBefore = guard.worldEpochs().epochChanges();
@@ -1710,7 +1726,12 @@ public final class KernelModule {
         long epochAtDelivery = guard.worldEpochs().epochOf(named);
         boolean duplicate = deliveredBefore(stopEntry, named);
         long tokensAfter = intents.releasedCount();
-        WorldUnloadDelivery row = new WorldUnloadDelivery(named,
+        if (PLATFORM_UNLOAD_SOURCE.equals(namedSource)) {
+            unloadPlatformPosts++;
+        } else if (HOST_UNLOAD_SOURCE.equals(namedSource)) {
+            unloadHostRemovePosts++;
+        }
+        WorldUnloadDelivery row = new WorldUnloadDelivery(named, namedSource,
             flush == null ? epochAtDelivery : flush.worldEpoch(),
             stopFlushEntries.getOrDefault(named, 0L), flush == null ? "-" : flush.steps(),
             flush == null ? NEVER_RUN_CELL : flush.refusal(), stopEntry, epochAtDelivery,
@@ -1759,7 +1780,6 @@ public final class KernelModule {
         unloadRows.add(row);
     }
 
-    /** Installs the recording of unload deliveries; the platform subscription does this once. */
     public void installUnloadDelivery() {
         unloadDeliveryInstalled = true;
     }
@@ -1777,6 +1797,16 @@ public final class KernelModule {
     /** Every delivery of this process in the order it was recorded. */
     public List<WorldUnloadDelivery> unloadDeliveries() {
         return List.copyOf(unloadRows);
+    }
+
+    /** How many deliveries the platform raised in its own stopping walk. */
+    public long unloadPlatformPosts() {
+        return unloadPlatformPosts;
+    }
+
+    /** How many deliveries this tree raised on its world removal path. */
+    public long unloadHostRemovePosts() {
+        return unloadHostRemovePosts;
     }
 
     /** How many deliveries repeated a world their stop entry had already delivered. */

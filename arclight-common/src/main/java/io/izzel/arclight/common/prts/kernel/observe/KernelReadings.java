@@ -1037,12 +1037,16 @@ public final class KernelReadings {
         add(lines, "product.commit.stop_flush_refusal",
             module.commitStopFlushRefusal().isEmpty() ? "-" : module.commitStopFlushRefusal());
         add(lines, "product.commit.stop_flush_order", module.commitStopFlushOrder());
-        // What this tree delivered when its host unloaded a world at the stopping injection: the
-        // wiring that records the deliveries, the source they name, one cell per world of the stop,
-        // and what the delivery took back. The close record carries no delivery bit; this is the
-        // family that does, and a world nothing reached reads NEVER_RUN rather than a zero.
+        // What the host delivered when it unloaded a world: the wiring that records the deliveries, the
+        // sources that actually appeared (the path that raised each one, never a constant), the two
+        // paths counted apart, one cell per world of the stop, and what the delivery took back. The
+        // close record carries no delivery bit; this is the family that does, and a world nothing
+        // reached reads NEVER_RUN rather than a zero.
         add(lines, "product.unload.wiring", module.unloadWiring());
-        add(lines, "product.unload.source", KernelModule.HOST_UNLOAD_SOURCE);
+        add(lines, "product.unload.source", unloadSources(module));
+        add(lines, "product.unload.posts.platform", module.unloadPlatformPosts());
+        add(lines, "product.unload.posts.host_remove", module.unloadHostRemovePosts());
+        add(lines, "product.unload.walk_calls", "NOT_EXECUTABLE");
         add(lines, "product.unload.stop_entry", module.unloadStopEntry() == 0L ? "NEVER_RUN"
             : Long.toString(module.unloadStopEntry()));
         add(lines, "product.unload.deliveries", module.unloadDeliveries().size());
@@ -1156,6 +1160,18 @@ public final class KernelReadings {
 
     /** The most rows one world carries in one stop entry: at most one is the criterion, so a repeat
      * moves this column and the run that produced it is the run that failed. */
+    /** The sources of the deliveries recorded so far: the closed set that appeared, in the order the
+     * rows name them, or NEVER_RUN while no delivery named any. */
+    private static String unloadSources(KernelModule module) {
+        List<String> seen = new ArrayList<>();
+        for (KernelModule.WorldUnloadDelivery row : module.unloadDeliveries()) {
+            if (!seen.contains(row.source())) {
+                seen.add(row.source());
+            }
+        }
+        return seen.isEmpty() ? "NEVER_RUN" : String.join(",", seen);
+    }
+
     private static String unloadMaxPerWorld(KernelModule module) {
         return module.unloadDeliveries().isEmpty() ? "-" : Long.toString(module.unloadMaxPerWorld());
     }

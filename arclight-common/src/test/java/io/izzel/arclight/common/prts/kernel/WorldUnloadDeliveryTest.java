@@ -67,8 +67,10 @@ class WorldUnloadDeliveryTest {
         int rowsBefore = module.unloadDeliveries().size();
         long duplicatesBefore = module.unloadDuplicates();
 
-        KernelModule.WorldUnloadDelivery first = module.noteWorldUnload("case-delivery-a");
-        KernelModule.WorldUnloadDelivery second = module.noteWorldUnload("case-delivery-b");
+        KernelModule.WorldUnloadDelivery first =
+            module.noteWorldUnload("case-delivery-a", KernelModule.PLATFORM_UNLOAD_SOURCE);
+        KernelModule.WorldUnloadDelivery second =
+            module.noteWorldUnload("case-delivery-b", KernelModule.PLATFORM_UNLOAD_SOURCE);
 
         assertEquals(rowsBefore + 2, module.unloadDeliveries().size());
         assertEquals(duplicatesBefore, module.unloadDuplicates(),
@@ -84,8 +86,8 @@ class WorldUnloadDeliveryTest {
 
         String row = first.row();
         assertTrue(row.startsWith("world=case-delivery-a|worldEpoch=" + first.worldEpoch() + "|"));
-        assertTrue(row.contains("|source=" + KernelModule.HOST_UNLOAD_SOURCE + "|"),
-            "the trigger source is the stopping walk of this tree and not a platform delivery");
+        assertTrue(row.contains("|source=" + KernelModule.PLATFORM_UNLOAD_SOURCE + "|"),
+            "the source is the path that raised the event, read from the map the platform walks");
         assertTrue(row.contains("|flushSteps=" + first.steps() + "|"));
         assertTrue(row.contains("|reclaim=owner:" + KernelModule.HOST_STOP_FLUSH_OWNER + "|byFlush:"));
         assertTrue(row.contains("|byDelivery:0|"), "the delivery itself takes nothing back");
@@ -96,7 +98,56 @@ class WorldUnloadDeliveryTest {
         assertTrue(HostDriveFixture.reading("product.unload.rows").contains("world=case-delivery-a|"));
         assertTrue(HostDriveFixture.reading("product.unload.counts").contains("case-delivery-a=1"));
         assertEquals("WIRED", HostDriveFixture.reading("product.unload.wiring"));
-        assertEquals(KernelModule.HOST_UNLOAD_SOURCE, HostDriveFixture.reading("product.unload.source"));
+        assertEquals(KernelModule.PLATFORM_UNLOAD_SOURCE, HostDriveFixture.reading("product.unload.source"));
+        assertEquals("NOT_EXECUTABLE", HostDriveFixture.reading("product.unload.walk_calls"),
+            "the stopping walk of this tree calls no delivery helper any more");
+    }
+
+    @Test
+    void theTwoPostingPathsAreRecordedAndCountedApart() {
+        List<String> worlds = List.of("case-path-platform", "case-path-removal");
+        fixture.tick(worlds);
+        fixture.stop(worlds);
+        long platformBefore = module.unloadPlatformPosts();
+        long removalBefore = module.unloadHostRemovePosts();
+
+        KernelModule.WorldUnloadDelivery platform =
+            module.noteWorldUnload("case-path-platform", KernelModule.PLATFORM_UNLOAD_SOURCE);
+        KernelModule.WorldUnloadDelivery removal =
+            module.noteWorldUnload("case-path-removal", KernelModule.HOST_UNLOAD_SOURCE);
+
+        assertTrue(platform.row().contains("|source=" + KernelModule.PLATFORM_UNLOAD_SOURCE + "|"));
+        assertTrue(removal.row().contains("|source=" + KernelModule.HOST_UNLOAD_SOURCE + "|"));
+        assertTrue(platform.delivered() && removal.delivered(),
+            "two worlds of one stop, one delivery each, one on each posting path");
+        assertEquals(platformBefore + 1L, module.unloadPlatformPosts(),
+            "the platform path counts its own deliveries");
+        assertEquals(removalBefore + 1L, module.unloadHostRemovePosts(),
+            "the removal path counts its own deliveries");
+        assertEquals(platformBefore + 1L, HostDriveFixture.counter("product.unload.posts.platform"));
+        assertEquals(removalBefore + 1L, HostDriveFixture.counter("product.unload.posts.host_remove"));
+        String sources = HostDriveFixture.reading("product.unload.source");
+        assertTrue(sources.contains(KernelModule.PLATFORM_UNLOAD_SOURCE)
+            && sources.contains(KernelModule.HOST_UNLOAD_SOURCE),
+            "the reading names the closed set that appeared and not one constant: " + sources);
+    }
+
+    @Test
+    void aSourceOutsideTheClosedSetIsNamedAsTheRefusalAndCountsOnNeitherPath() {
+        List<String> worlds = List.of("case-path-refused");
+        fixture.tick(worlds);
+        fixture.stop(worlds);
+        long platformBefore = module.unloadPlatformPosts();
+        long removalBefore = module.unloadHostRemovePosts();
+
+        KernelModule.WorldUnloadDelivery refused =
+            module.noteWorldUnload("case-path-refused", "host:stop-unload-walk");
+
+        assertEquals(KernelModule.UNKNOWN_UNLOAD_SOURCE, refused.source(),
+            "a label neither posting path produces is refused by name instead of being written");
+        assertTrue(refused.row().contains("|source=" + KernelModule.UNKNOWN_UNLOAD_SOURCE + "|"));
+        assertEquals(platformBefore, module.unloadPlatformPosts());
+        assertEquals(removalBefore, module.unloadHostRemovePosts());
     }
 
     @Test
@@ -106,8 +157,10 @@ class WorldUnloadDeliveryTest {
         fixture.stop(worlds);
         long duplicatesBefore = module.unloadDuplicates();
 
-        KernelModule.WorldUnloadDelivery once = module.noteWorldUnload("case-repeat");
-        KernelModule.WorldUnloadDelivery twice = module.noteWorldUnload("case-repeat");
+        KernelModule.WorldUnloadDelivery once =
+            module.noteWorldUnload("case-repeat", KernelModule.PLATFORM_UNLOAD_SOURCE);
+        KernelModule.WorldUnloadDelivery twice =
+            module.noteWorldUnload("case-repeat", KernelModule.PLATFORM_UNLOAD_SOURCE);
 
         assertTrue(once.delivered(), "the first delivery of the world is the one delivery");
         assertFalse(twice.delivered(), "the second one is not, and the row says so");
@@ -127,7 +180,7 @@ class WorldUnloadDeliveryTest {
         fixture.tick(worlds);
         fixture.stop(worlds);
 
-        module.noteWorldUnload("case-silent-a");
+        module.noteWorldUnload("case-silent-a", KernelModule.PLATFORM_UNLOAD_SOURCE);
 
         String rows = HostDriveFixture.reading("product.unload.rows");
         assertTrue(rows.contains("world=case-silent-b|delivery=NEVER_RUN"),
@@ -150,8 +203,10 @@ class WorldUnloadDeliveryTest {
         long advancesBefore = module.unloadEpochAdvances();
         long reclaimsBefore = module.unloadTokenReclaims();
 
-        KernelModule.WorldUnloadDelivery first = module.noteWorldUnload("case-shared-a");
-        KernelModule.WorldUnloadDelivery second = module.noteWorldUnload("case-shared-b");
+        KernelModule.WorldUnloadDelivery first =
+            module.noteWorldUnload("case-shared-a", KernelModule.PLATFORM_UNLOAD_SOURCE);
+        KernelModule.WorldUnloadDelivery second =
+            module.noteWorldUnload("case-shared-b", KernelModule.PLATFORM_UNLOAD_SOURCE);
 
         assertEquals(epochsBefore, HostDriveFixture.counter("write.world_epochs_changes"),
             "the delivery opened no generation: the shared source has one writer and it is not this one");
@@ -173,7 +228,8 @@ class WorldUnloadDeliveryTest {
         fixture.tick(worlds);
         fixture.stop(worlds);
 
-        KernelModule.WorldUnloadDelivery absent = module.noteWorldUnload("case-never-observed");
+        KernelModule.WorldUnloadDelivery absent =
+            module.noteWorldUnload("case-never-observed", KernelModule.PLATFORM_UNLOAD_SOURCE);
 
         assertEquals("UNLIVE(-1)", absent.oldGenerationCell(),
             "a world the tracked set does not carry is absent, and absent is a refusal of its own name");

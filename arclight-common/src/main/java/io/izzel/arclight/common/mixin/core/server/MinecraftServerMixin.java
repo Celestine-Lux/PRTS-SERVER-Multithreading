@@ -458,11 +458,7 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
 
     @Inject(method = "stopServer", at = @At(value = "INVOKE", shift = At.Shift.AFTER, target = "Lnet/minecraft/server/MinecraftServer;saveAllChunks(ZZZ)Z"))
     private void arclight$unloadLevel(CallbackInfo ci) {
-        // This path does not go through removeLevel, so the world would be dropped without its unload
-        // event ever being posted. The same helper is called here - the post site stays the single one -
-        // and it is called before the world is dropped, the order removeLevel takes.
         for (var serverLevel : this.getAllLevels()) {
-            this.arclight$onServerUnload(serverLevel);
             ((CraftServerBridge) Bukkit.getServer()).bridge$removeWorld(serverLevel);
         }
     }

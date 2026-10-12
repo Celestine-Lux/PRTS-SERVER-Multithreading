@@ -7,6 +7,7 @@ import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.kernel.observe.CloseSealWriter;
 import io.izzel.arclight.common.prts.kernel.wiring.KernelWiring;
 import io.izzel.arclight.common.prts.support.PrtsLoadProbe;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -100,17 +101,35 @@ public final class PrtsKernelEvents {
         module.adoptCommitChainOnce();
     }
 
+    /** A world the host unloaded hands the kernel its id, under the source the path that raised the
+     * event reads as: nothing here names a source by hand. */
+    @SubscribeEvent
+    public void onLevelUnload(LevelEvent.Unload event) {
+        ServerLevel level = (ServerLevel) event.getLevel();
+        KernelModule.instance().noteWorldUnload(level.dimension().location().toString(),
+            unloadSourceOf(level.getServer(), level));
+    }
+
+    /** The source of one delivery, read from what the two paths that post the event differ in: the
+     * platform walks its level map and the world is still in it, while the removal path has already
+     * taken the world out before it posts. Neither fact readable names the refusal. */
+    private static String unloadSourceOf(MinecraftServer server, ServerLevel level) {
+        if (server == null) {
+            return KernelModule.UNKNOWN_UNLOAD_SOURCE;
+        }
+        for (ServerLevel stillListed : server.getAllLevels()) {
+            if (stillListed == level) {
+                return KernelModule.PLATFORM_UNLOAD_SOURCE;
+            }
+        }
+        return KernelModule.HOST_UNLOAD_SOURCE;
+    }
+
     /** The server is stopping: the entry snapshot is written before any world is touched, every world
      * it still carries is then flushed through the four step set, the chain is closed, and the terminal
      * snapshot is written whether those two succeeded or failed. Which of the flush and the close came
-     * first is recorded by the kernel, not assumed here, and the unload the tree raises afterwards
+     * first is recorded by the kernel, not assumed here, and the unload the platform raises afterwards
      * leaves this record untouched, so the worlds are walked here. */
-    /** A world this tree unloaded hands the kernel its id: raised here, not by the platform. */
-    @SubscribeEvent
-    public void onLevelUnload(LevelEvent.Unload event) {
-        KernelModule.instance().noteWorldUnload(((ServerLevel) event.getLevel()).dimension().location().toString());
-    }
-
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
         KernelModule module = KernelModule.instance();
