@@ -47,15 +47,19 @@ class CommitControllerLifecycleTest {
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations;
 
+        final WitnessSource witness;
+
         Fixture(int ringCap, int storeBytes, int storeRecords) {
             store = new EffectStore(storeBytes, storeRecords);
-            log = new CommitLog(() -> ringCap, plans, store,
-                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
-                    () -> plans.plan, NODE));
+            witness = new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
+                () -> plans.plan, NODE);
+            log = new CommitLog(() -> ringCap, plans, store, witness);
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         }
 
+        /** The declaration of this fixture mints the mapping of the line it is about to report. */
         CommitTicket.ReserveRequest request(long effectRef, long instance) {
+            witness.bindNode(NODE, instance);
             CommitNamespaces.Namespace controller = reservations.controller();
             CommitNamespaces.Namespace producer =
                 new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L);
@@ -179,7 +183,7 @@ class CommitControllerLifecycleTest {
                 "a terminal at round " + round);
             assertBalance(f.reservations, "after a terminal at round " + round);
 
-            assertTrue(f.reservations.reserve(f.request(2000L + round, 900L + round)).admitted(),
+            assertTrue(f.reservations.reserve(f.request(2000L + round, 500L + round)).admitted(),
                 "a reservation that never publishes at round " + round);
             assertBalance(f.reservations, "with one item in flight at round " + round);
 

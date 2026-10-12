@@ -140,7 +140,7 @@ class ChainConservationReadingsTest {
         Plans plans = new Plans();
         EffectStore store = new EffectStore(4096, 8);
         CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
-            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE).bind(11L));
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         CommitController controller = new CommitController(reservations, null);

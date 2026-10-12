@@ -85,7 +85,7 @@ class PendingDispositionReadingsTest {
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
         KernelModule module = KernelModule.instance();
         CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
-            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE).bind(41L));
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a",
             new CommitNamespaces.ResetEpochs());
         CommitController controller = new CommitController(reservations,
@@ -140,7 +140,7 @@ class PendingDispositionReadingsTest {
             (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
         KernelModule module = KernelModule.instance();
         CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
-            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE).bind(41L));
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         CommitController[] holder = new CommitController[1];

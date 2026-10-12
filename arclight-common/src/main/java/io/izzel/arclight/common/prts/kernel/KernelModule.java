@@ -216,7 +216,11 @@ public final class KernelModule {
 
         @Override
         public FrozenDeclarations declarations(String worldId, String domainId, long planSequence) {
-            FrozenDeclarations held = frozenDeclarations;
+            FrozenDeclarations held = declarationHistory.current();
+            if (!held.freeze().lifecycleKey().equals(declarationLifecycleKey())) {
+                // A table of a lifecycle this module has left authorizes nothing, whatever its plan.
+                return FrozenDeclarations.none();
+            }
             // The freeze it holds is the only one it can answer for: a seat of another plan is
             // answered with nothing, which is what makes the interval around a publish inert.
             return held.planSequence() == planSequence ? held : FrozenDeclarations.none();
@@ -238,8 +242,11 @@ public final class KernelModule {
             return bound == null ? null : bound.reservations().controller();
         }
     };
-    /** The declarations of the freeze that is published, replaced whole by the next freeze. */
-    private volatile FrozenDeclarations frozenDeclarations = FrozenDeclarations.none();
+    /** The declaration tables: the freeze in force authorizes and the replaced ones stay as bounded
+     * snapshots. */
+    private final FrozenDeclarations.History declarationHistory =
+        new FrozenDeclarations.History(KernelSettings.planHistoryCap());
+    private long declarationGeneration;
     private String declarationRefusal = "";
     private long declarationRefusals;
     private long declarationsSealed;
@@ -766,10 +773,19 @@ public final class KernelModule {
         plans.takeFeedback(tickIndex, planSequence);
     }
 
+    /** The lifecycle the sealed declarations belong to: the bound controller's, or the empty key. */
+    private String declarationLifecycleKey() {
+        CommitController bound = commitController;
+        return bound == null ? "" : bound.reservations().controller().lifecycleKey();
+    }
+
     /** Seals the declarations this freeze accepted against the places the plan's own commit order
-     * gave them. A seal that refuses writes no table, so a refusal leaves nothing authorizable. */
+     * gave them; the boundary is read against the freeze and not the plan counter. */
     private void sealDeclarations(TickPlan plan) {
-        if (plan.planSequence() <= frozenDeclarations.planSequence()) {
+        FrozenDeclarations.FreezeKey live =
+            new FrozenDeclarations.FreezeKey(declarationLifecycleKey(), declarationGeneration);
+        FrozenDeclarations held = declarationHistory.current();
+        if (live.sameLifecycle(held.freeze()) && plan.planSequence() <= held.planSequence()) {
             declarationRefusal = "declaration-not-newer";
             declarationRefusals++;
             return;
@@ -779,23 +795,49 @@ public final class KernelModule {
             places.add(new FrozenDeclarations.Assignment(step.worldId(), step.domainId(),
                 step.nodeKey(), step.position()));
         }
-        FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(plan.planSequence(),
+        FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(live.next(), plan.planSequence(),
             pipelineJobs.candidateDeclarations(), places);
         if (!sealed.sealed()) {
             declarationRefusal = sealed.refusal();
             declarationRefusals++;
-            frozenDeclarations = FrozenDeclarations.none();
+            declarationHistory.retire();
             return;
         }
         declarationRefusal = "";
-        frozenDeclarations = sealed.declarations();
+        declarationGeneration = sealed.declarations().freeze().generation();
+        declarationHistory.seal(sealed.declarations());
         declarationsSealed++;
     }
 
     /** The declarations of the freeze that is published, as the readings and the commit chain read
      * them. A table that was never sealed reads a named state, not a zero. */
     public FrozenDeclarations declarations() {
-        return frozenDeclarations;
+        return declarationHistory.current();
+    }
+
+    /** The freeze the current declarations belong to: its lifecycle key and its own generation. */
+    public String declarationFreeze() {
+        FrozenDeclarations.FreezeKey freeze = declarations().freeze();
+        return freeze.lifecycleKey() + "#" + freeze.generation();
+    }
+
+    /** The read-only snapshot of a replaced freeze: how a ticket that outlived its freeze still
+     * names the declarations its records were judged under. */
+    public FrozenDeclarations declarationSnapshot(long planSequence) {
+        return declarationHistory.newestSnapshot(planSequence);
+    }
+
+    public int declarationSnapshotsRetained() {
+        return declarationHistory.retained();
+    }
+
+    public long declarationSnapshotsRetired() {
+        return declarationHistory.retired();
+    }
+
+    /** How many replaced freezes the bounded retention had to give up: counted, never quiet. */
+    public long declarationSnapshotsEvicted() {
+        return declarationHistory.evicted();
     }
 
     /** The piece that refused the last seal, or an empty string. */
@@ -2158,6 +2200,8 @@ public final class KernelModule {
         }
         this.commits = candidate;
         this.commitController = controller;
+        declarationGeneration++;
+        declarationHistory.retire();
         this.commitBindingRefusal = "";
         this.commitBindingLogLifetime = candidate.logLifetime();
         this.commitBindingStoreId = reservations.store().storeId();
@@ -2243,6 +2287,8 @@ public final class KernelModule {
         }
         this.commitController = null;
         this.commits = ownCommits;
+        declarationGeneration++;
+        declarationHistory.retire();
         this.commitBindingRefusal = "";
         this.commitBindingLogLifetime = 0L;
         this.commitBindingStoreId = 0L;
@@ -2444,6 +2490,9 @@ public final class KernelModule {
         ownerGrants.reset();
         controlledSlots.reset();
         commitBindingRefusal = "";
+        declarationGeneration++;
+        declarationHistory.retire();
+        declarationRefusal = "";
         commits.reset();
         safety.reset();
         zeroEffect.reset();

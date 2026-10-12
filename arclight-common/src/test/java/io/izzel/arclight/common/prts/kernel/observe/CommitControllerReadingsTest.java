@@ -148,7 +148,7 @@ class CommitControllerReadingsTest {
         EffectStore store = new EffectStore(4096, 8);
         CommitLog.OrderSource plans = (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
         CommitLog log = new CommitLog(() -> 4, module.commitOrderSource(), store,
-            new WitnessSource(plans, "world-a", "entity", 3L, "published", 5L, 7L, "a/0"));
+            new WitnessSource(plans, "world-a", "entity", 3L, "published", 5L, 7L, "a/0").bind(11L));
         CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         CommitReservation reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         final CommitController[] holder = new CommitController[1];

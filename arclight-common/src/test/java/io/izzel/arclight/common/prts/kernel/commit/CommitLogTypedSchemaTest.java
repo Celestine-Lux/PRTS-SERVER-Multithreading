@@ -239,7 +239,7 @@ class CommitLogTypedSchemaTest {
     void aShortageOnEitherSideLeavesNeitherALineNorARecord() {
         EffectStore effects = new EffectStore(4096, 1);
         CommitLog log = new CommitLog(() -> 8, order(1L), effects, declared(order(1L))
-                .declare("a/1", 65L, "full"));
+                .declare("a/1", 65L, "full").bindNode("a/1", 2L));
         log.beginTick(10L);
         assertTrue(log.reachTyped(typed("a/0", 100L, LIFETIME, "chunk=64")).logged());
         long afterFirst = log.sequence();
@@ -416,7 +416,7 @@ class CommitLogTypedSchemaTest {
         for (long cycle = 1L; cycle <= 6L; cycle++) {
             log.beginTick(cycle);
             CommitLog.Verdict verdict = log.reachTyped(new CommitLog.TypedBatch(
-                versionedBatch("a/0", 11L, 1), identity(cycle, 64L, "full", 3L, 100L + cycle, LIFETIME),
+                versionedBatch("a/0", 11L, 1), identity(1L, 64L, "full", 3L, 100L + cycle, LIFETIME),
                 new EffectStore.Effect(100L + cycle, "chunk-materialize", "full",
                     List.of("chunk=" + cycle))));
 
@@ -523,7 +523,7 @@ class CommitLogTypedSchemaTest {
     @Test
     void twoVersionedReportsDoNotShareOneHeldSlot() {
         CommitLog log = new CommitLog(() -> 2, order(1L), store(), declared(order(1L))
-                .declare("a/1", 65L, "full"));
+                .declare("a/1", 65L, "full").bindNode("a/1", 2L));
         log.beginTick(10L);
         CommitLog.RingSlot held = log.reserveSlot(WORLD, DOMAIN);
         assertNotNull(held);

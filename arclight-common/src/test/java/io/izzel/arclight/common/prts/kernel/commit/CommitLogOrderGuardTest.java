@@ -41,7 +41,8 @@ class CommitLogOrderGuardTest {
      * answers for, at the artefact the identities of this file carry. */
     private static WitnessSource declared(CommitLog.OrderSource plans) {
         return new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, "7/0", "7/1",
-            "7/2", "7/3", "7/4", "7/5", "6/9");
+            "7/2", "7/3", "7/4", "7/5", "6/9").bindNode("7/0", 41L).bindNode("7/1", 42L)
+            .bindNode("6/9", 43L);
     }
 
     private static CommitLog.Batch batch(String nodeKey) {
@@ -187,9 +188,7 @@ class CommitLogOrderGuardTest {
     void aVersionedLineDoesNotWritePastThePlaceAReservationHolds() {
         EffectStore store = new EffectStore(4096, 8);
         Places plans = new Places();
-        CommitLog log = new CommitLog(() -> 4, plans, store,
-            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, "7/0", "7/1", "7/2", "7/3",
-                "7/4", "7/5", "6/9"));
+        CommitLog log = new CommitLog(() -> 4, plans, store, declared(plans));
         log.beginTick(1L);
         assertNotNull(log.reserveSlot(WORLD, DOMAIN, 7L, 0), "a reservation holds place 0 of the pair");
 

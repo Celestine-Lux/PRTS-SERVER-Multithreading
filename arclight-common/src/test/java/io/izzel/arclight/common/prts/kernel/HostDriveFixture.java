@@ -100,6 +100,7 @@ final class HostDriveFixture {
     static final class Chain {
 
         final CommitLog log;
+        final WitnessSource witness;
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations;
         final CommitController controller;
@@ -108,8 +109,8 @@ final class HostDriveFixture {
             EffectStore store = new EffectStore(4096, 8);
             CommitLog.OrderSource plans =
                 (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
-            log = new CommitLog(() -> 8, module.commitOrderSource(), store,
-                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+            witness = new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE);
+            log = new CommitLog(() -> 8, module.commitOrderSource(), store, witness);
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, publisher);
             KernelModule.CommitBinding binding = module.installCommitChain(log, controller);
@@ -120,6 +121,7 @@ final class HostDriveFixture {
         }
 
         CommitTicket.ReserveRequest request(long instance) {
+            witness.bindNode(NODE, instance);
             CommitNamespaces.Namespace producer = new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L);
             CommitNamespaces.Namespace namespace = reservations.controller();
             CommitLog.Identity identity = new CommitLog.Identity(CommitLog.SCHEMA_TYPED, instance, 5L, 3L,

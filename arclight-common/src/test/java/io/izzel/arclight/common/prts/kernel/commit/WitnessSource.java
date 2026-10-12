@@ -12,8 +12,8 @@ import java.util.function.LongSupplier;
  * source of the test resolves for the nodes the test declares, so what is exercised is still the
  * verification core and not a table written by the caller of the reservation.
  *
- * <p>The live generations it reports are the ones the test froze its identities at: it is a host
- * stand-in, and a test that wants drift changes the number it reports. */
+ * <p>The live generations it reports are the ones the test froze its identities at, and the mapping
+ * it seals is its own declaration: a report that wears another one of its own is refused here. */
 public final class WitnessSource implements IdentityWitness.Source {
 
     private final CommitLog.OrderSource plans;
@@ -26,6 +26,9 @@ public final class WitnessSource implements IdentityWitness.Source {
     private final List<String> nodes = new ArrayList<>();
     private final Map<String, FrozenDeclarations.DeclaredChunk> chunks = new LinkedHashMap<>();
     private final Map<String, String> statuses = new LinkedHashMap<>();
+    private final Map<String, Long> instances = new LinkedHashMap<>();
+    private FrozenDeclarations.FreezeKey freeze = new FrozenDeclarations.FreezeKey("", 1L);
+    private long instanceId = 1L;
 
     public WitnessSource(CommitLog.OrderSource plans, String worldId, String domainId, long chunkPos,
                          String status, long worldEpoch, long authorization, String... nodes) {
@@ -57,8 +60,38 @@ public final class WitnessSource implements IdentityWitness.Source {
         return this;
     }
 
+    /** The same, with the instance number this declaration authorizes for that node. */
+    public WitnessSource declare(String nodeKey, long chunkPos, String status, long instanceId) {
+        declare(nodeKey, chunkPos, status);
+        instances.put(nodeKey, instanceId);
+        return this;
+    }
+
+    /** The instance number every node this source declares carries until one is named for it. */
+    public WitnessSource bind(long instanceId) {
+        this.instanceId = instanceId;
+        return this;
+    }
+
+    /** The instance number this declaration authorizes for one node, named before it is judged. */
+    public WitnessSource bindNode(String nodeKey, long instanceId) {
+        instances.put(nodeKey, instanceId);
+        return this;
+    }
+
+    /** The freeze this stand-in seals under: its own key, so a test can drive two lifecycles. */
+    public WitnessSource freeze(String lifecycleKey, long generation) {
+        this.freeze = new FrozenDeclarations.FreezeKey(lifecycleKey, generation);
+        return this;
+    }
+
     @Override
     public FrozenDeclarations declarations(String worldId, String domainId, long planSequence) {
+        return of(planSequence).declarations();
+    }
+
+    /** The table this source seals for one plan as its own seal answers it, refusal and all. */
+    public FrozenDeclarations.Sealed of(long planSequence) {
         List<FrozenDeclarations.Entry> entries = new ArrayList<>();
         for (String node : nodes) {
             CommitLog.Resolved resolved = plans.resolve(worldId, domainId, node);
@@ -70,9 +103,12 @@ public final class WitnessSource implements IdentityWitness.Source {
             FrozenDeclarations.DeclaredChunk chunk = chunks.get(node);
             entries.add(new FrozenDeclarations.Entry(seat, node, entries.size() + 1,
                 chunk == null ? chunkPos : chunk.packedPos(),
-                statuses.getOrDefault(node, status)));
+                statuses.getOrDefault(node, status), instances.getOrDefault(node, instanceId),
+                worldEpoch));
         }
-        return FrozenDeclarations.of(planSequence, entries);
+        FrozenDeclarations.Sealed sealed = FrozenDeclarations.of(freeze, planSequence, entries);
+        return sealed.sealed() ? sealed : new FrozenDeclarations.Sealed(FrozenDeclarations.none(),
+            sealed.refusal());
     }
 
     @Override

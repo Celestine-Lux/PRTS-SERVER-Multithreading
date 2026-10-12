@@ -45,7 +45,7 @@ class CommitChainStaleCallbackTest {
             CommitLog.OrderSource plans =
                 (worldId, domainId, nodeKey) -> new CommitLog.Resolved(7L, 0, false);
             log = new CommitLog(() -> 4, source, store,
-                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE));
+                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L, 7L, NODE).bind(11L));
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
             controller = new CommitController(reservations, null);
         }

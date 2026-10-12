@@ -50,9 +50,9 @@ class KernelModuleResetOwnerTest {
         final KernelModule module = KernelModule.instance();
         final Plans plans = new Plans();
         final EffectStore store = new EffectStore(65536, 64);
-        final CommitLog log = new CommitLog(() -> 8, module.commitOrderSource(), store,
-            new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
-                () -> plans.plan, NODE));
+        final WitnessSource witness = new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
+            () -> plans.plan, NODE);
+        final CommitLog log = new CommitLog(() -> 8, module.commitOrderSource(), store, witness);
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
         final CommitReservation reservations =
             new CommitReservation(log, store, plans, "owner-a", epochs);
@@ -65,6 +65,7 @@ class KernelModuleResetOwnerTest {
         }
 
         CommitTicket.ReserveRequest request(long instance) {
+            witness.bindNode(NODE, instance);
             CommitNamespaces.Namespace producer =
                 new CommitNamespaces.Namespace("producer", 5150L, 0L, 77L);
             CommitNamespaces.Namespace controller = reservations.controller();

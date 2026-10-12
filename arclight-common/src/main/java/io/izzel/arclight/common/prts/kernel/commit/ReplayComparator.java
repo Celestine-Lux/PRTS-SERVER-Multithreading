@@ -67,14 +67,25 @@ public final class ReplayComparator {
     private static final long OFFSET_BASIS = 0xcbf29ce484222325L;
     private static final long PRIME = 0x100000001b3L;
 
-    /** What one side of a strict comparison is read through: the commit the records were taken from,
-     * the integrity summary of those records, and the declarations sealed for the freeze that
-     * ordered them. All four have to agree before a conclusion is drawn; a closure carrying a table
-     * of another freeze, or a summary that does not match its own records, is refused instead of
-     * being read as the weaker historical comparison. */
+    /** What one side of a strict comparison is read through: the commit label the records were taken
+     * from, the integrity summary of those records, and the declarations sealed for the freeze that
+     * ordered them. The closure is the receipt that ties the four together inside this library: the
+     * summary has to be the one these records produce, the table has to name the plan these records
+     * were ordered by, and every record has to carry the content its own digest and names say it
+     * does. A closure that fails any of those is refused instead of being read as the weaker
+     * historical comparison. The commit label is carried and not verified against a real artifact,
+     * so what a strict reading proves is consistency among these four and not provenance: see
+     * {@link #EVIDENCE_TIER}. */
     public record Evidence(String sourceCommit, String recordDigest,
                            FrozenDeclarations declarations, CommitLog.SchemaReplay replay) {
     }
+
+    /** What a strict closure proves and what it does not. The records, their summary, the sealed
+     * table and the commit label are consistent with each other inside this library; the label is
+     * not bound to a real artifact, so a strict EQUAL is evidence of this consistency and is not a
+     * release gate. */
+    public static final String EVIDENCE_TIER = "records, summary, table and label agree inside this "
+        + "library; the label is not bound to a real artifact, so this is not a release gate";
 
     private final Map<String, Long> refusals = new LinkedHashMap<>();
     private long compared;
@@ -127,7 +138,8 @@ public final class ReplayComparator {
                 + step.rows() + "/" + step.expectedVersion() + "/" + step.disposition());
             EffectStore.Recorded effect = step.effect();
             hash = fold(hash, effect == null ? "e/-" : "e/" + effect.effectRef() + "/"
-                + effect.contentDigest() + "/" + effect.operationKind() + "/" + effect.outcome());
+                + effect.contentDigest() + "/" + effect.operationKind() + "/" + effect.outcome() + "/"
+                + String.join(",", effect.declared()) + "/" + String.join("\n", effect.content()));
             CommitLog.Identity identity = step.identity();
             hash = fold(hash, "i/" + identity.schemaVersion() + "/" + identity.instanceId() + "/"
                 + identity.worldEpoch() + "/" + identity.chunkPos() + "/" + identity.targetStatus()
@@ -142,8 +154,30 @@ public final class ReplayComparator {
             || evidence.declarations() == null || evidence.recordDigest() == null) {
             return REFUSED_ILLEGAL_IDENTITY;
         }
+        if (evidence.declarations().size() == 0) {
+            // A table that sealed nothing is no closure: it backs no seat, so no record can be read
+            // as one of its freeze however well the summary matches.
+            return REFUSED_ILLEGAL_IDENTITY;
+        }
         if (!recordsDigest(evidence.replay()).equals(evidence.recordDigest())) {
             return REFUSED_ILLEGAL_IDENTITY;
+        }
+        return recordsOf(evidence);
+    }
+
+    /** Whether the records are the ones the table and the summary were taken from: every step was
+     * ordered by the plan the table names, and every record carries the rows, the field names and
+     * the digest its own content produces. A record whose rows were replaced while the digest that
+     * came with it was kept is refused here instead of being compared as the run it claims to be. */
+    private static String recordsOf(Evidence evidence) {
+        FrozenDeclarations table = evidence.declarations();
+        for (CommitLog.TypedStep step : evidence.replay().typedSteps()) {
+            EffectStore.Recorded effect = step.effect();
+            if (step.planSequence() != table.planSequence() || effect == null
+                || !EffectStore.contentDigest(effect.content()).equals(effect.contentDigest())
+                || !EffectStore.declaredRows(effect.content()).equals(effect.declared())) {
+                return REFUSED_ILLEGAL_IDENTITY;
+            }
         }
         return null;
     }

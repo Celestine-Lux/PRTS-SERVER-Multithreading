@@ -69,7 +69,7 @@ class ReplayComparatorTest {
             "a/0", "a/1", "a/2");
         for (CommitLog.TypedBatch report : reports) {
             witness.declare(report.batch().nodeKey(), report.identity().chunkPos(),
-                report.identity().targetStatus());
+                report.identity().targetStatus(), report.identity().instanceId());
         }
         return witness;
     }

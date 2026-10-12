@@ -2,9 +2,9 @@
 package io.izzel.arclight.common.prts.kernel.commit;
 
 /** The one place a line's identity is judged against the declarations its freeze accepted, shared by
- * the write side, the typed entry and a versioned replay. What is proved is provenance: the seat
- * comes from the frozen plan's order and the artefact from the sealed declaration of that seat. The
- * comparison key is derived from the declaration and never from a number a run assigned. */
+ * the write side, the typed entry and a versioned replay. What is proved is provenance: the seat,
+ * the artefact, the instance number and the world generation all come from the declaration its own
+ * freeze sealed, and the comparison key is derived from that declaration and from no counter. */
 public final class IdentityWitness {
 
     /** Why a line was admitted or refused, and the comparison key when it was admitted. */
@@ -104,8 +104,9 @@ public final class IdentityWitness {
         };
     }
 
-    /** Judges one line against the freeze that ordered it. A table of another plan, a seat the seal
-     * wrote nothing for and a declaration naming another node are three different refusals. */
+    /** Judges one line against the freeze that ordered it: another plan, a seat the seal wrote nothing
+     * for, another node, an instance or generation its own freeze did not authorize and a table of a
+     * lifecycle the holder has left are different refusals, every one read from the declaration. */
     public static Verdict verify(FrozenDeclarations declarations, CommitLog.Resolved resolved,
                                  String worldId, String domainId, String nodeKey,
                                  CommitLog.Identity identity, CommitNamespaces.Namespace current) {
@@ -139,11 +140,23 @@ public final class IdentityWitness {
         if (current != null && !worn.lifecycleKey().equals(current.lifecycleKey())) {
             return refuse("controller-namespace-mismatch");
         }
+        if (current != null && !declarations.freeze().lifecycleKey().isEmpty()
+            && !declarations.freeze().lifecycleKey().equals(current.lifecycleKey())) {
+            // A table of a lifecycle the holder has left is evidence at most, not a declaration.
+            return refuse("declaration-lifecycle-mismatch");
+        }
         if (identity.chunkPos() != entry.packedChunkPos()) {
             return refuse("chunk-witness-mismatch");
         }
         if (!identity.targetStatus().equals(entry.targetStatus())) {
             return refuse("declaration-status-mismatch");
+        }
+        if (identity.instanceId() != entry.instanceId()) {
+            // The declaration handle mints the identity: a positive number of its own is no proof.
+            return refuse("declaration-instance-mismatch");
+        }
+        if (identity.worldEpoch() != entry.worldEpoch()) {
+            return refuse("declaration-epoch-mismatch");
         }
         LogicalKey declared = new LogicalKey(entry.seat().worldId(), entry.seat().domainId(),
             entry.nodeKey(), entry.role(), entry.packedChunkPos(), entry.targetStatus());

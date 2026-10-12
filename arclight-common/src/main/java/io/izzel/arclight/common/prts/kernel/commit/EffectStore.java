@@ -366,6 +366,18 @@ public final class EffectStore {
         return normalize(rows == null ? List.of() : rows);
     }
 
+    /** The digest of these rows, computed from the rows themselves: a reader that is handed a stored
+     * record recomputes it instead of trusting the digest that came along with it. */
+    public static String contentDigest(List<String> rows) {
+        return digestOf(normalize(rows == null ? List.of() : rows));
+    }
+
+    /** The field names these rows declare, computed from the rows themselves, in the order the store
+     * writes them. */
+    public static List<String> declaredRows(List<String> rows) {
+        return declaredOf(normalize(rows == null ? List.of() : rows));
+    }
+
     public static long chargeOf(String operationKind, String outcome, List<String> rows) {
         return chargedBytes(operationKind == null ? "" : operationKind,
             outcome == null ? "" : outcome, normalize(rows == null ? List.of() : rows));

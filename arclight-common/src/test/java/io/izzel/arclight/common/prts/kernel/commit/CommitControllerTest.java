@@ -57,18 +57,24 @@ class CommitControllerTest {
         final EffectStore store;
         final CommitLog log;
         final CommitNamespaces.ResetEpochs epochs = new CommitNamespaces.ResetEpochs();
+        final WitnessSource witness;
         final CommitReservation reservations;
 
         Fixture(int ringCap, int storeBytes, int storeRecords) {
             store = new EffectStore(storeBytes, storeRecords);
-            log = new CommitLog(() -> ringCap, plans, store,
-                new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
-                    () -> plans.plan, NODE, "a/1", "a/2"));
+            witness = new WitnessSource(plans, WORLD, DOMAIN, 3L, "published", 5L,
+                () -> plans.plan, NODE, "a/1", "a/2");
+            log = new CommitLog(() -> ringCap, plans, store, witness);
             reservations = new CommitReservation(log, store, plans, "owner-a", epochs);
         }
 
+        /** One line this fixture's handle declares and reports: the declaration names the instance
+         * it mints for that node before the line is judged, which is what the handle of a domain
+         * does. The cases where a line wears a mapping its declaration does not carry are the
+         * negative cases of the witness suite and not this fixture. */
         CommitTicket.ReserveRequest request(String node, long plan, int position, int rows,
                                             long effectRef, long instance) {
+            witness.bindNode(node, instance);
             CommitNamespaces.Namespace producer = new CommitNamespaces.Namespace("producer",
                 OTHER_LIFETIME, 0L, 77L);
             CommitNamespaces.Namespace controller = new CommitNamespaces.Namespace("owner-a",
