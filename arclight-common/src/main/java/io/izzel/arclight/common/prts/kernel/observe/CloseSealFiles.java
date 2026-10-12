@@ -145,8 +145,9 @@ final class CloseSealFiles {
         }
     }
 
-    /** Adds one record to a file that is already in place; every later stage appends, so nothing an
-     * earlier stage wrote can be replaced by a later one. */
+    /** Adds one record to a file that is already in place, and starts it when it is not: every later
+     * stage appends, so nothing an earlier stage wrote can be replaced by a later one, and starting a
+     * missing file never truncates a file that is already there. */
     static String append(Path target, String text) {
         try {
             write(target, text, true);
@@ -158,7 +159,8 @@ final class CloseSealFiles {
 
     private static void write(Path file, String text, boolean append) throws IOException {
         StandardOpenOption[] options = append
-            ? new StandardOpenOption[] {StandardOpenOption.WRITE, StandardOpenOption.APPEND}
+            ? new StandardOpenOption[] {StandardOpenOption.WRITE, StandardOpenOption.APPEND,
+                StandardOpenOption.CREATE}
             : new StandardOpenOption[] {StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING};
         byte[] bytes = text.getBytes(StandardCharsets.UTF_8);

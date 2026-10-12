@@ -141,6 +141,8 @@ public final class CloseSealWriter {
     private final List<String> consoleLines = new ArrayList<>();
 
     private int writeSeq;
+    private int receiptFailures;
+    private String receiptError = "";
     private int errorsDropped;
     private long rows;
     private long bytes;
@@ -363,6 +365,8 @@ public final class CloseSealWriter {
             result = "PARTIAL|UNRECORDED_ITEMS|core";
         } else if (partialFlush(snapshot)) {
             result = "PARTIAL|PARTIAL_FLUSH|core";
+        } else if (receiptFailures > 0) {
+            result = "FAILED|C4_WRITE_FAILED|evidence";
         } else if (capReached) {
             result = "FAILED|FILE_CAP_REACHED|evidence";
         } else {
@@ -434,10 +438,11 @@ public final class CloseSealWriter {
         writeSeq++;
         rows++;
         bytes += size;
-        receipt(file, text);
+        String refused = receipt(file, text);
         console("stage=" + stage + " writeSeq=" + writeSeq + " md5=" + md5(text).substring(0, 16)
             + " path=" + file.toAbsolutePath() + " status=" + status + " reason=" + reason
             + " fallback=" + failureReason());
+        receipted(stage, refused);
         return true;
     }
 
@@ -547,10 +552,33 @@ public final class CloseSealWriter {
         }
     }
 
-    private void receipt(Path file, String text) {
+    /** The increment hash of one record, appended beside the record file. The reason a receipt could
+     * not be written is returned rather than dropped: a receipt that never lands is an evidence
+     * failure and has to reach the terminal classification and the console. */
+    private String receipt(Path file, String text) {
         Path fileReceipt = file.getParent().resolve(CloseSealFiles.RECEIPT_NAME);
-        CloseSealFiles.append(fileReceipt, md5(text) + "  " + CloseSealFiles.FILE_NAME + "  bytes="
-            + CloseSealFiles.size(file) + "  writeSeq=" + writeSeq + LF);
+        return CloseSealFiles.append(fileReceipt, md5(text) + "  " + CloseSealFiles.FILE_NAME
+            + "  bytes=" + CloseSealFiles.size(file) + "  writeSeq=" + writeSeq + LF);
+    }
+
+    /** What a refused receipt does to the reading: it is counted, it is named on the console beside
+     * the record line, and the terminal record books it as the evidence failure it is. The record
+     * itself is already durable, so a receipt that cannot be written never takes a record with it
+     * and is never dropped in silence. */
+    private void receipted(String stage, String problem) {
+        if (problem.isEmpty()) {
+            return;
+        }
+        receiptFailures++;
+        if (receiptError.isEmpty()) {
+            receiptError = problem;
+        }
+        noteEvidence("C4_WRITE_FAILED");
+        status = "FAILED";
+        reason = "C4_WRITE_FAILED";
+        exit = "evidence";
+        console("status=FAILED reason=C4_WRITE_FAILED exit=evidence receipt=" + problem
+            + " stage=" + stage + " writeSeq=" + writeSeq + " receiptFailures=" + receiptFailures);
     }
 
     private void console(String text) {
@@ -713,7 +741,9 @@ public final class CloseSealWriter {
             + "|evidenceExit=" + evidenceExit + "|statusScale=" + String.join(",", STATUSES)
             + "|reasonScale=" + String.join(",", REASONS) + "|evidenceExitScale="
             + String.join(",", EVIDENCE_EXITS) + "|note=" + (note.isEmpty() ? "-" : note)
-            + "|rowStatus=" + rowStatus + "|rowReason=" + rowReason + "|rowExit=" + rowExit;
+            + "|rowStatus=" + rowStatus + "|rowReason=" + rowReason + "|rowExit=" + rowExit
+            + "|receiptFailures=" + receiptFailures + "|receiptError="
+            + (receiptError.isEmpty() ? "-" : receiptError);
     }
 
     private static String worldSet(List<String> worlds) {

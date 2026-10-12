@@ -12,10 +12,13 @@ import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,6 +30,7 @@ import java.util.concurrent.CyclicBarrier;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The write path of the close seal against the real surroundings: where the file lands, what is
@@ -473,6 +477,88 @@ class CloseSealWriterTest {
         assertEquals("NONE", writer.reason());
         assertEquals("core", writer.exit());
         assertEquals(2, writer.writeSeq());
+    }
+
+    @Test
+    void theFirstRecordOfANewRunDirectoryAlsoWritesItsIncrementHash() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = diag.resolve(RUN);
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L, 1L, 1L)), diag.toString());
+        assertFalse(Files.exists(runDir), "this test is only about a run directory that is not there yet");
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> rows = CloseSealChecks.dataLines(text);
+        assertEquals(List.of("C1", "C4"), CloseSealChecks.stages(text));
+        assertEquals(List.of("close-seal.md5", "close-seal.tsv"), list(runDir),
+            "the run directory holds the record and its increment hash, and no staged file");
+        String first = CloseSealChecks.header(text) + '\n' + rows.get(0) + '\n';
+        String second = rows.get(1) + '\n';
+        assertEquals(first + second, text, "the record file is exactly the two written records");
+        List<String> receipts = Files.readAllLines(runDir.resolve("close-seal.md5"),
+            StandardCharsets.UTF_8);
+        assertEquals(2, receipts.size(), "one receipt line per record");
+        assertEquals(CloseSealWriter.md5(first) + "  close-seal.tsv  bytes="
+            + first.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=1", receipts.get(0),
+            "the first receipt has to be recomputable after the terminal record was appended");
+        assertEquals(CloseSealWriter.md5(second) + "  close-seal.tsv  bytes="
+            + text.getBytes(StandardCharsets.UTF_8).length + "  writeSeq=2", receipts.get(1));
+        assertEquals("0", CloseSealChecks.field(rows.get(0), "receiptFailures"));
+        assertEquals("-", CloseSealChecks.field(rows.get(0), "receiptError"));
+        assertEquals("0", CloseSealChecks.field(rows.get(1), "receiptFailures"));
+        assertEquals(List.of(), CloseSealChecks.columnsAndHashes(text));
+        assertEquals("OK", writer.status());
+        assertEquals("NONE", writer.reason());
+        assertEquals("core", writer.exit());
+    }
+
+    @Test
+    void aFreshReceiptFileIsRefusedByTheOldOpenOptionsAndStartedByTheShippedOnes() throws IOException {
+        Path dir = Files.createDirectories(tmp.resolve("historical"));
+        Path fresh = dir.resolve("close-seal.md5");
+        assertThrows(NoSuchFileException.class, () -> FileChannel.open(fresh,
+            StandardOpenOption.WRITE, StandardOpenOption.APPEND),
+            "write and append without create is what left the increment hash unwritten");
+        assertEquals("", CloseSealFiles.append(fresh,
+            "aaaa  close-seal.tsv  bytes=1  writeSeq=1\n"));
+        assertTrue(Files.isRegularFile(fresh), "the shipped path has to start the file itself");
+        assertEquals("", CloseSealFiles.append(fresh,
+            "bbbb  close-seal.tsv  bytes=2  writeSeq=2\n"));
+        assertEquals(List.of("aaaa  close-seal.tsv  bytes=1  writeSeq=1",
+            "bbbb  close-seal.tsv  bytes=2  writeSeq=2"),
+            Files.readAllLines(fresh, StandardCharsets.UTF_8),
+            "the second append must not replace what the first one wrote");
+    }
+
+    @Test
+    void aReceiptThatCannotBeWrittenIsNamedOnTheTerminalRecordAndNeverDropped() throws IOException {
+        Path diag = Files.createDirectories(tmp.resolve("diag"));
+        Path runDir = Files.createDirectories(diag.resolve(RUN));
+        Files.createDirectories(runDir.resolve("close-seal.md5"));
+        CloseSealWriter writer = new CloseSealWriter(RUN,
+            limits(tmp.resolve("fb"), null, 1000L, List.of(1L)), diag.toString());
+        entryAndTerminal(writer, new KernelModule.CommitClose(true, "", 0, 0, 0));
+        String text = Files.readString(runDir.resolve("close-seal.tsv"), StandardCharsets.UTF_8);
+        List<String> rows = CloseSealChecks.dataLines(text);
+        assertEquals(List.of("C1", "C4"), CloseSealChecks.stages(text),
+            "a refused receipt must not cost the terminal record that names it");
+        String terminal = rows.get(1);
+        assertEquals("FAILED", CloseSealChecks.cell(terminal, "status"));
+        assertEquals("C4_WRITE_FAILED", CloseSealChecks.field(terminal, "rowReason"));
+        assertEquals("evidence", CloseSealChecks.field(terminal, "rowExit"));
+        assertEquals("1", CloseSealChecks.field(terminal, "receiptFailures"));
+        assertEquals("io-error", CloseSealChecks.field(terminal, "receiptError"),
+            "the receipt target is a directory, and the reason scale has no name of its own for it");
+        assertTrue(CloseSealChecks.field(terminal, "evidenceExit").contains("C4_WRITE_FAILED"));
+        assertEquals(List.of(), CloseSealChecks.columnsAndHashes(text));
+        assertEquals(List.of(), CloseSealChecks.terminals(text),
+            "the terminal still has to be inside the closed sets, not a name of its own");
+        String console = String.join(";", writer.consoleHistory());
+        assertTrue(console.contains("receipt=io-error"), console);
+        assertTrue(console.contains("reason=C4_WRITE_FAILED"), console);
+        assertEquals("FAILED", writer.status());
+        assertEquals("C4_WRITE_FAILED", writer.reason());
+        assertEquals("evidence", writer.exit());
     }
 
     private String[] c1WriteFailed() throws IOException {
