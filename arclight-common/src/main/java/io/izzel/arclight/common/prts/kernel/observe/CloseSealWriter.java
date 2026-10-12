@@ -58,6 +58,12 @@ public final class CloseSealWriter {
     static final String[] EVIDENCE_EXITS = {"NONE", "C1_WRITE_FAILED", "C4_WRITE_FAILED",
         "FILE_CAP_REACHED"};
 
+    /** The key the delivery family answers on, and the value that says this process records the
+     * unload deliveries of the worlds its host unloads. The cell below reads it and claims no
+     * delivery of its own. */
+    private static final String UNLOAD_WIRING_KEY = "product.unload.wiring";
+    private static final String UNLOAD_WIRED = "WIRED";
+
     private static final String[] G_EPOCH = {"write.world_epochs_tracked", "write.world_epochs_live",
         "write.world_epochs_changes"};
     private static final String[] G_IN_FLIGHT = {"product.commit.chain_reserved",
@@ -733,12 +739,19 @@ public final class CloseSealWriter {
         return errorsDropped == 0 ? joined : joined + ";errorsDropped=" + errorsDropped;
     }
 
+    /** The unload cell of this record. The record is copied before any world is unloaded and the
+     * delivery the stopping injection raises comes after it, so this cell can never carry a delivery:
+     * a process that records deliveries declares itself frozen before them and names the other family
+     * as the one that carries the delivered bits, and a process that records none keeps the default.
+     * Nothing in this cell is written by a delivery. */
     private String unloadCell(Snapshot snapshot) {
+        boolean recorded = UNLOAD_WIRED.equals(snapshot.at(UNLOAD_WIRING_KEY));
         List<String> parts = new ArrayList<>();
         for (String world : snapshot.worlds()) {
-            parts.add(world + "=NEVER_RUN");
+            parts.add(world + "=" + (recorded ? "PENDING_AFTER_RECORD" : "NEVER_RUN"));
         }
-        return "unloadSource=default-never-run|" + (parts.isEmpty() ? "-" : String.join(",", parts));
+        return "unloadSource=" + (recorded ? "record-frozen-before-delivery" : "default-never-run")
+            + "|" + (parts.isEmpty() ? "-" : String.join(",", parts));
     }
 
     private String reclaimCell(Snapshot snapshot) {

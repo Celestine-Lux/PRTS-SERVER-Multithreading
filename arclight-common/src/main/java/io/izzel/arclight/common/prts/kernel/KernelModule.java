@@ -64,6 +64,7 @@ import io.izzel.arclight.common.prts.kernel.observe.ArrivalDigestObserver;
 import io.izzel.arclight.common.prts.kernel.observe.ChunkDemandObserver;
 import io.izzel.arclight.common.prts.kernel.observe.ChunkFlowObserver;
 import io.izzel.arclight.common.prts.kernel.observe.ChunkMaterializationObserver;
+import io.izzel.arclight.common.prts.kernel.observe.CloseSealWriter;
 import io.izzel.arclight.common.prts.kernel.observe.LoadThreadObserver;
 import io.izzel.arclight.common.prts.kernel.observe.PipelineRowObserver;
 import io.izzel.arclight.common.prts.kernel.observe.RegionIdentityObserver;
@@ -84,6 +85,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -271,6 +273,13 @@ public final class KernelModule {
     private String commitStopFlushRefusal = "";
     private final List<String> stopFlushWorlds = new ArrayList<>();
     private final List<WorldStopFlush> stopFlushRows = new ArrayList<>();
+    private final List<WorldUnloadDelivery> unloadRows = new ArrayList<>();
+    private final Map<String, Long> stopFlushEntries = new HashMap<>();
+    private long unloadStopEntry;
+    private long unloadDuplicateCount;
+    private long unloadEpochAdvances;
+    private long unloadTokenReclaims;
+    private boolean unloadDeliveryInstalled;
     private int commitCloseGivenBack;
     private int commitCloseUnrecorded;
     private int commitClosePublishing;
@@ -1290,6 +1299,19 @@ public final class KernelModule {
      * it was answered. */
     public static final long NO_CARRIED_EPOCH = -1L;
 
+    /** The source every unload delivery names: raised by this tree at its stopping injection. */
+    public static final String HOST_UNLOAD_SOURCE = "host:stop-unload-walk";
+
+    /** The owner that takes a world's tokens back: the stop flush, never the delivery itself. */
+    public static final String HOST_STOP_FLUSH_OWNER = "host:stop-flush";
+
+    /** What a second delivery of one world in one stop entry is written as. */
+    public static final String UNLOAD_DUPLICATE = "duplicate-delivery";
+
+    /** What a missing cell reads, so that it is never the zero a count would be. */
+    private static final String NEVER_RUN_CELL = "NEVER_RUN";
+    private static final String NOT_EXECUTABLE_CELL = "NOT_EXECUTABLE";
+
     /** How many worlds one stop flush keeps rows for: the set the host carries is small, and a row per
      * world of one stop is what a diagnostic reads back. */
     private static final int STOP_FLUSH_ROW_CAP = 64;
@@ -1522,6 +1544,7 @@ public final class KernelModule {
     public WorldStopFlush flushWorldAtStop(String worldId) {
         stopFlushLastSequence = ++hostEntrySequence;
         String named = worldId == null || worldId.isEmpty() ? "unnamed" : worldId;
+        stopFlushEntries.put(named, stopFlushLastSequence);
         long epoch = guard.worldEpochs().epochOf(named);
         if (epoch == WorldEpochs.UNLIVE || epoch == WorldEpochs.UNTRACKED) {
             commitStopFlushRefusals++;
@@ -1614,6 +1637,181 @@ public final class KernelModule {
     /** The refusal of the newest flush, or an empty string while none was refused. */
     public String commitStopFlushRefusal() {
         return commitStopFlushRefusal;
+    }
+
+    /** One world's unload delivery: the entry this tree raised the event from, the generation the
+     * shared control held, the flush entry and step stamps of that session, what the shared flush took
+     * back and what the delivery took back, and the reading an old generation still gets. A cell this
+     * delivery cannot fill reads NEVER_RUN or NOT_EXECUTABLE and is never a zero. */
+    public record WorldUnloadDelivery(String worldId, long worldEpoch, long flushEntry, String steps,
+                                      String flushRefusal, long stopEntry, long epochAtDelivery,
+                                      int reclaimedByFlush, int reclaimedByDelivery, long tokenReleases,
+                                      long tokensWaiting, boolean duplicate) {
+
+        /** Whether this row is the one delivery of its world in its stop entry. */
+        public boolean delivered() {
+            return !duplicate;
+        }
+
+        /** The generation the shared flush took off the world, or the refusal it read as. */
+        public String worldEpochCell() {
+            return flushEntry == 0L ? NEVER_RUN_CELL : epochName(worldEpoch);
+        }
+
+        /** The reading a delayed write carrying the old generation gets: a refusal, never a zero. */
+        public String oldGenerationCell() {
+            return epochName(epochAtDelivery);
+        }
+
+        /** Who took what back: the shared flush, never this delivery. The arena and the reservation
+         * groups are not per world and are named here rather than given a number of their own. */
+        public String reclaimCell() {
+            boolean served = flushRefusal.isEmpty();
+            return "owner:" + (served ? HOST_STOP_FLUSH_OWNER : NOT_EXECUTABLE_CELL)
+                + "|byFlush:" + (served ? Integer.toString(reclaimedByFlush) : NOT_EXECUTABLE_CELL)
+                + "|byDelivery:" + reclaimedByDelivery + "|arena:NOT_PER_WORLD"
+                + "|reservation:NOT_PER_WORLD|intent.released:" + tokenReleases
+                + "|intent.queue_depth:" + tokensWaiting;
+        }
+
+        /** One line per delivery: the form the console copy, the reading cell and the evidence hold. */
+        public String row() {
+            return "world=" + worldId + "|worldEpoch=" + worldEpochCell()
+                + "|source=" + HOST_UNLOAD_SOURCE
+                + "|stopEntry=" + (stopEntry == 0L ? NEVER_RUN_CELL : Long.toString(stopEntry))
+                + "|flushEntry=" + (flushEntry == 0L ? NEVER_RUN_CELL : Long.toString(flushEntry))
+                + "|flushSteps=" + steps + "|reclaim=" + reclaimCell()
+                + "|oldGeneration=" + oldGenerationCell() + "|delivery="
+                + (duplicate ? UNLOAD_DUPLICATE : "TRIGGERED");
+        }
+    }
+
+    /** Names a generation the shared control read: absent and untracked are refusals, not zeros. */
+    private static String epochName(long epoch) {
+        if (epoch == WorldEpochs.UNLIVE) {
+            return "UNLIVE(" + WorldEpochs.UNLIVE + ")";
+        }
+        if (epoch == WorldEpochs.UNTRACKED) {
+            return "UNTRACKED(" + WorldEpochs.UNTRACKED + ")";
+        }
+        return Long.toString(epoch);
+    }
+
+    /** Records one world's unload delivery. The generation, the flush entry and the tokens come from
+     * the lifecycle control the tick, the stop flush and the close already share: this method reads
+     * them and advances none of them, and it takes no token back. A second delivery of the same world
+     * in the same stop entry is counted and written as a repeat. */
+    public WorldUnloadDelivery noteWorldUnload(String worldId) {
+        String named = worldId == null || worldId.isEmpty() ? "unnamed" : worldId;
+        long stopEntry = stopCloseLastSequence;
+        long tokensBefore = intents.releasedCount();
+        long epochsBefore = guard.worldEpochs().epochChanges();
+        WorldStopFlush flush = stopFlushRowOf(named);
+        long epochAtDelivery = guard.worldEpochs().epochOf(named);
+        boolean duplicate = deliveredBefore(stopEntry, named);
+        long tokensAfter = intents.releasedCount();
+        WorldUnloadDelivery row = new WorldUnloadDelivery(named,
+            flush == null ? epochAtDelivery : flush.worldEpoch(),
+            stopFlushEntries.getOrDefault(named, 0L), flush == null ? "-" : flush.steps(),
+            flush == null ? NEVER_RUN_CELL : flush.refusal(), stopEntry, epochAtDelivery,
+            flush == null ? 0 : flush.reclaimed(), (int) (tokensAfter - tokensBefore), tokensAfter,
+            intents.depth(named), duplicate);
+        if (guard.worldEpochs().epochChanges() != epochsBefore) {
+            unloadEpochAdvances++;
+        }
+        if (tokensAfter != tokensBefore) {
+            unloadTokenReclaims++;
+        }
+        if (duplicate) {
+            unloadDuplicateCount++;
+        }
+        unloadStopEntry = stopEntry;
+        keepUnloadRow(row);
+        System.out.println("[PRTS] unload delivery run=" + CloseSealWriter.forRun().runId() + " " + row.row());
+        return row;
+    }
+
+    /** The newest flush row of one world, or null when the shared stop control never carried it. */
+    private WorldStopFlush stopFlushRowOf(String worldId) {
+        for (int index = stopFlushRows.size() - 1; index >= 0; index--) {
+            if (stopFlushRows.get(index).worldId().equals(worldId)) {
+                return stopFlushRows.get(index);
+            }
+        }
+        return null;
+    }
+
+    /** Whether this stop entry already delivered this world; a repeat is written, not merged. */
+    private boolean deliveredBefore(long stopEntry, String worldId) {
+        for (WorldUnloadDelivery row : unloadRows) {
+            if (row.stopEntry() == stopEntry && row.worldId().equals(worldId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Keeps one delivery row for a diagnostic; the rows stay bounded when a host walks many worlds. */
+    private void keepUnloadRow(WorldUnloadDelivery row) {
+        if (unloadRows.size() >= STOP_FLUSH_ROW_CAP) {
+            unloadRows.remove(0);
+        }
+        unloadRows.add(row);
+    }
+
+    /** Installs the recording of unload deliveries; the platform subscription does this once. */
+    public void installUnloadDelivery() {
+        unloadDeliveryInstalled = true;
+    }
+
+    /** Removes the recording again, so a rollback claims no delivery behind it. */
+    public void removeUnloadDelivery() {
+        unloadDeliveryInstalled = false;
+    }
+
+    /** Whether this process records the unload deliveries of the worlds its host unloads. */
+    public String unloadWiring() {
+        return unloadDeliveryInstalled ? "WIRED" : "NOT_WIRED";
+    }
+
+    /** Every delivery of this process in the order it was recorded. */
+    public List<WorldUnloadDelivery> unloadDeliveries() {
+        return List.copyOf(unloadRows);
+    }
+
+    /** How many deliveries repeated a world their stop entry had already delivered. */
+    public long unloadDuplicates() {
+        return unloadDuplicateCount;
+    }
+
+    /** How many deliveries found the shared generation moved while they ran; must stay 0. */
+    public long unloadEpochAdvances() {
+        return unloadEpochAdvances;
+    }
+
+    /** How many deliveries found the shared token count moved while they ran; must stay 0. */
+    public long unloadTokenReclaims() {
+        return unloadTokenReclaims;
+    }
+
+    /** The stop entry the recorded deliveries belong to, or zero while no close entry has run. */
+    public long unloadStopEntry() {
+        return unloadStopEntry;
+    }
+
+    /** The most rows one world carries in one stop entry: the criterion is at most one. */
+    public long unloadMaxPerWorld() {
+        long most = 0L;
+        for (WorldUnloadDelivery row : unloadRows) {
+            long count = 0L;
+            for (WorldUnloadDelivery other : unloadRows) {
+                if (other.stopEntry() == row.stopEntry() && other.worldId().equals(row.worldId())) {
+                    count++;
+                }
+            }
+            most = Math.max(most, count);
+        }
+        return most;
     }
 
     /** How often the owner safe point was entered by the thread the host named. */

@@ -1037,6 +1037,21 @@ public final class KernelReadings {
         add(lines, "product.commit.stop_flush_refusal",
             module.commitStopFlushRefusal().isEmpty() ? "-" : module.commitStopFlushRefusal());
         add(lines, "product.commit.stop_flush_order", module.commitStopFlushOrder());
+        // What this tree delivered when its host unloaded a world at the stopping injection: the
+        // wiring that records the deliveries, the source they name, one cell per world of the stop,
+        // and what the delivery took back. The close record carries no delivery bit; this is the
+        // family that does, and a world nothing reached reads NEVER_RUN rather than a zero.
+        add(lines, "product.unload.wiring", module.unloadWiring());
+        add(lines, "product.unload.source", KernelModule.HOST_UNLOAD_SOURCE);
+        add(lines, "product.unload.stop_entry", module.unloadStopEntry() == 0L ? "NEVER_RUN"
+            : Long.toString(module.unloadStopEntry()));
+        add(lines, "product.unload.deliveries", module.unloadDeliveries().size());
+        add(lines, "product.unload.duplicates", module.unloadDuplicates());
+        add(lines, "product.unload.epoch_advances", module.unloadEpochAdvances());
+        add(lines, "product.unload.token_reclaims", module.unloadTokenReclaims());
+        add(lines, "product.unload.max_per_world", unloadMaxPerWorld(module));
+        add(lines, "product.unload.counts", unloadCounts(module));
+        add(lines, "product.unload.rows", unloadWorldCells(module));
         add(lines, "product.commit.terminal_ledger_entries",
             reservations == null ? 0 : reservations.terminalLedger().size());
         add(lines, "product.commit.terminal_ledger", terminalLedger(reservations));
@@ -1085,6 +1100,64 @@ public final class KernelReadings {
     private static String stopFlushWorlds(KernelModule module) {
         List<String> worlds = module.commitStopFlushWorlds();
         return worlds.isEmpty() ? "-" : String.join(",", worlds);
+    }
+
+    /** One cell per world the stopping path carried: the row of a world a delivery reached, and
+     * NEVER_RUN for a world of that set nothing reached. Every world the stopping entry walked has a
+     * flush row, the refused ones included, so this set is the set the entry named. */
+    private static String unloadWorldCells(KernelModule module) {
+        List<KernelModule.WorldUnloadDelivery> rows = module.unloadDeliveries();
+        List<String> cells = new ArrayList<>();
+        List<String> named = new ArrayList<>();
+        for (KernelModule.WorldUnloadDelivery row : rows) {
+            named.add(row.worldId());
+            cells.add(row.row());
+        }
+        for (KernelModule.WorldStopFlush flush : module.commitStopFlushRows()) {
+            if (!named.contains(flush.worldId())) {
+                named.add(flush.worldId());
+                cells.add("world=" + flush.worldId() + "|delivery=NEVER_RUN");
+            }
+        }
+        return cells.isEmpty() ? "-" : String.join(";", cells);
+    }
+
+    /** How many deliveries each world of the stop took. A world that took none is carried with a zero
+     * count of deliveries: that is the count of an event, which the criterion asks for, and not one of
+     * the cells that must be named when they cannot be filled. */
+    private static String unloadCounts(KernelModule module) {
+        List<KernelModule.WorldUnloadDelivery> rows = module.unloadDeliveries();
+        List<String> counted = new ArrayList<>();
+        List<String> parts = new ArrayList<>();
+        for (KernelModule.WorldUnloadDelivery row : rows) {
+            if (!counted.contains(row.worldId())) {
+                counted.add(row.worldId());
+                parts.add(row.worldId() + '=' + deliveriesOf(rows, row.worldId()));
+            }
+        }
+        for (KernelModule.WorldStopFlush flush : module.commitStopFlushRows()) {
+            if (!counted.contains(flush.worldId())) {
+                counted.add(flush.worldId());
+                parts.add(flush.worldId() + "=0");
+            }
+        }
+        return parts.isEmpty() ? "-" : String.join(",", parts);
+    }
+
+    private static int deliveriesOf(List<KernelModule.WorldUnloadDelivery> rows, String worldId) {
+        int count = 0;
+        for (KernelModule.WorldUnloadDelivery row : rows) {
+            if (row.worldId().equals(worldId)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** The most rows one world carries in one stop entry: at most one is the criterion, so a repeat
+     * moves this column and the run that produced it is the run that failed. */
+    private static String unloadMaxPerWorld(KernelModule module) {
+        return module.unloadDeliveries().isEmpty() ? "-" : Long.toString(module.unloadMaxPerWorld());
     }
 
     /** One row per world the stopping path flushed: the world, the generation it held when its

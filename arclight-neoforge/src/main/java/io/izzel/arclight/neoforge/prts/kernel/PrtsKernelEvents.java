@@ -10,6 +10,7 @@ import io.izzel.arclight.common.prts.support.PrtsLoadProbe;
 import net.minecraft.server.level.ServerLevel;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.level.LevelEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
@@ -52,6 +53,7 @@ public final class PrtsKernelEvents {
             module.installWritePathTap();
             module.installWaitSiteTap();
             module.installLoadProbe();
+            module.installUnloadDelivery();
             NeoForge.EVENT_BUS.register(INSTANCE);
             subscribed = true;
             return;
@@ -59,6 +61,7 @@ public final class PrtsKernelEvents {
         module.removeWritePathTap();
         module.removeWaitSiteTap();
         module.removeLoadProbe();
+        module.removeUnloadDelivery();
         NeoForge.EVENT_BUS.unregister(INSTANCE);
         subscribed = false;
     }
@@ -100,8 +103,14 @@ public final class PrtsKernelEvents {
     /** The server is stopping: the entry snapshot is written before any world is touched, every world
      * it still carries is then flushed through the four step set, the chain is closed, and the terminal
      * snapshot is written whether those two succeeded or failed. Which of the flush and the close came
-     * first is recorded by the kernel, not assumed here, and the unload event is not delivered on this
-     * path, so the worlds are walked here or nowhere. */
+     * first is recorded by the kernel, not assumed here, and the unload the tree raises afterwards
+     * leaves this record untouched, so the worlds are walked here. */
+    /** A world this tree unloaded hands the kernel its id: raised here, not by the platform. */
+    @SubscribeEvent
+    public void onLevelUnload(LevelEvent.Unload event) {
+        KernelModule.instance().noteWorldUnload(((ServerLevel) event.getLevel()).dimension().location().toString());
+    }
+
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
         KernelModule module = KernelModule.instance();
