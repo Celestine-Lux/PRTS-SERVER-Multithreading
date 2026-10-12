@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The reset mailbox driven by several threads at once: many producers and the owner run together,
@@ -109,14 +111,16 @@ class KernelResetMailboxConcurrencyTest {
     private static KernelModule.ResetRequest fromOwnThread(KernelModule module, String source,
                                                            AtomicReference<Long> threadId)
         throws InterruptedException {
+        List<Throwable> failures = workerFailures();
         AtomicReference<KernelModule.ResetRequest> answer = new AtomicReference<>();
-        Thread thread = new Thread(() -> {
+        Thread thread = worker(failures, () -> {
             threadId.set(Thread.currentThread().threadId());
             answer.set(module.requestReadingsReset(source));
         });
         thread.start();
         thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
         assertFalse(thread.isAlive(), "a request from another thread returns within its timeout");
+        assertNoWorkerFailed(failures);
         return answer.get();
     }
 
@@ -132,6 +136,27 @@ class KernelResetMailboxConcurrencyTest {
         }
     }
 
+    /** Where the throw of a worker is kept: a case fails for what a worker hit instead of passing
+     * because the throw died with the thread that ran it, and the main thread asserts the list after
+     * it joined every worker. */
+    private static List<Throwable> workerFailures() {
+        return Collections.synchronizedList(new ArrayList<>());
+    }
+
+    private static Thread worker(List<Throwable> failures, Runnable body) {
+        return new Thread(() -> {
+            try {
+                body.run();
+            } catch (Throwable failure) {
+                failures.add(failure);
+            }
+        });
+    }
+
+    private static void assertNoWorkerFailed(List<Throwable> failures) {
+        assertTrue(failures.isEmpty(), "no worker of this case failed: " + failures);
+    }
+
     @Test
     void manyProducersAndTheOwnerRunAtTheSameTime() throws Exception {
         install();
@@ -141,10 +166,11 @@ class KernelResetMailboxConcurrencyTest {
         CyclicBarrier barrier = new CyclicBarrier(producers + 1);
         AtomicInteger finished = new AtomicInteger();
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[producers];
+        List<Throwable> failures = workerFailures();
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < producers; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(failures, () -> {
                 try {
                     barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                     answers[slot] = module.requestReadingsReset("host:console-" + slot);
@@ -164,6 +190,7 @@ class KernelResetMailboxConcurrencyTest {
             module.markSafePoint();
         }
         joinAll(threads);
+        assertNoWorkerFailed(failures);
         module.markSafePoint();
 
         for (int index = 0; index < producers; index++) {
@@ -189,10 +216,11 @@ class KernelResetMailboxConcurrencyTest {
         long refusalsBefore = counter("product.commit.reset_queue_refusals");
         CyclicBarrier barrier = new CyclicBarrier(attempts + 1);
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[attempts];
+        List<Throwable> failures = workerFailures();
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < attempts; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(failures, () -> {
                 try {
                     barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                     answers[slot] = module.requestReadingsReset("host:console-" + slot);
@@ -205,6 +233,7 @@ class KernelResetMailboxConcurrencyTest {
         }
         barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         joinAll(threads);
+        assertNoWorkerFailed(failures);
 
         assertEquals(KernelModule.resetQueueCapacity(), module.resetQueueDepth(),
             "the capacity, the merge and the enqueue are one step, so the bound holds under contention");
@@ -339,7 +368,8 @@ class KernelResetMailboxConcurrencyTest {
 
             CyclicBarrier barrier = new CyclicBarrier(2);
             AtomicReference<KernelModule.ResetRequest> answer = new AtomicReference<>();
-            Thread producer = new Thread(() -> {
+            List<Throwable> failures = workerFailures();
+            Thread producer = worker(failures, () -> {
                 try {
                     barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                     answer.set(module.requestReadingsReset("host:console"));
@@ -352,6 +382,7 @@ class KernelResetMailboxConcurrencyTest {
             module.markSafePoint();
             producer.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
             assertFalse(producer.isAlive(), "the producer returns within its timeout");
+            assertNoWorkerFailed(failures);
             assertTrue(answer.get().handedOff(), "the queue had room, so the request waits for the owner");
         } finally {
             releaseTheLine();
@@ -408,7 +439,8 @@ class KernelResetMailboxConcurrencyTest {
         long closed = counter("product.commit.reset_closed_refusals");
         CyclicBarrier barrier = new CyclicBarrier(2);
         AtomicReference<KernelModule.ResetRequest> answer = new AtomicReference<>();
-        Thread producer = new Thread(() -> {
+        List<Throwable> failures = workerFailures();
+        Thread producer = worker(failures, () -> {
             try {
                 barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 answer.set(module.requestReadingsReset("host:console-racing"));
@@ -421,6 +453,7 @@ class KernelResetMailboxConcurrencyTest {
         fixture.stop(WORLDS);
         producer.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
         assertFalse(producer.isAlive(), "the producer returns within its timeout");
+        assertNoWorkerFailed(failures);
 
         assertEquals(0, module.resetQueueDepth(),
             "which side of the close the call landed on, nothing is left waiting");
@@ -447,10 +480,12 @@ class KernelResetMailboxConcurrencyTest {
         long requests = counter("product.commit.reset_requests");
 
         AtomicReference<KernelModule.SafePoint> elsewhere = new AtomicReference<>();
-        Thread other = new Thread(() -> elsewhere.set(module.markSafePoint()));
+        List<Throwable> failures = workerFailures();
+        Thread other = worker(failures, () -> elsewhere.set(module.markSafePoint()));
         other.start();
         other.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
         assertFalse(other.isAlive(), "the off-thread call returns within its timeout");
+        assertNoWorkerFailed(failures);
 
         assertEquals(0, elsewhere.get().carried(),
             "the safe point is owner-only: from another thread it carries nothing out");
@@ -472,10 +507,11 @@ class KernelResetMailboxConcurrencyTest {
         int producers = 4;
         AtomicBoolean stop = new AtomicBoolean();
         CyclicBarrier barrier = new CyclicBarrier(producers + 1);
+        List<Throwable> failures = workerFailures();
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < producers; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(failures, () -> {
                 try {
                     barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 } catch (Exception failure) {
@@ -498,12 +534,17 @@ class KernelResetMailboxConcurrencyTest {
 
         long startedAt = System.nanoTime();
         int most = 0;
-        for (int round = 0; round < 64; round++) {
-            most = Math.max(most, module.markSafePoint().carried());
+        long elapsedMs = 0L;
+        try {
+            for (int round = 0; round < 64; round++) {
+                most = Math.max(most, module.markSafePoint().carried());
+            }
+        } finally {
+            elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+            stop.set(true);
+            joinAll(threads);
         }
-        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
-        stop.set(true);
-        joinAll(threads);
+        assertNoWorkerFailed(failures);
 
         assertTrue(most <= KernelModule.resetQueueCapacity(),
             "one safe point carries a bounded batch, whatever the producers keep adding: carried=" + most);
@@ -524,10 +565,11 @@ class KernelResetMailboxConcurrencyTest {
     void theQueueExitsStayReadableAndBoundedWhileTheMailboxIsBusy() throws Exception {
         install();
         AtomicBoolean stop = new AtomicBoolean();
+        List<Throwable> workers = workerFailures();
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < 4; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(workers, () -> {
                 for (int round = 0; round < 2000 && !stop.get(); round++) {
                     module.requestReadingsReset("host:console-" + slot + "-" + round);
                 }
@@ -535,25 +577,63 @@ class KernelResetMailboxConcurrencyTest {
             threads.add(thread);
             thread.start();
         }
-        List<String> failures = new ArrayList<>();
-        for (int round = 0; round < 2000; round++) {
-            try {
-                List<String> sources = module.resetQueueSources();
-                int depth = module.resetQueueDepth();
-                assertTrue(sources.size() <= KernelModule.resetQueueCapacity(), "the list never exceeds the bound");
-                assertTrue(depth <= KernelModule.resetQueueCapacity(), "and neither does the depth");
-            } catch (RuntimeException failure) {
-                failures.add(failure.getClass().getSimpleName() + ": " + failure.getMessage());
-                break;
+        List<String> torn = new ArrayList<>();
+        try {
+            for (int round = 0; round < 2000; round++) {
+                try {
+                    List<String> sources = module.resetQueueSources();
+                    int depth = module.resetQueueDepth();
+                    assertTrue(sources.size() <= KernelModule.resetQueueCapacity(),
+                        "the list never exceeds the bound");
+                    assertTrue(depth <= KernelModule.resetQueueCapacity(), "and neither does the depth");
+                } catch (RuntimeException failure) {
+                    torn.add(failure.getClass().getSimpleName() + ": " + failure.getMessage());
+                    break;
+                }
             }
+        } finally {
+            stop.set(true);
+            joinAll(threads);
         }
-        stop.set(true);
-        joinAll(threads);
+        assertNoWorkerFailed(workers);
 
-        assertTrue(failures.isEmpty(), "a read of the queue never fails while it is being filled: " + failures);
+        assertTrue(torn.isEmpty(), "a read of the queue never fails while it is being filled: " + torn);
         for (int round = 0; round < 64 && module.commitResetPending(); round++) {
             module.markSafePoint();
         }
         assertEquals(0, module.resetQueueDepth());
+    }
+
+    @Test
+    void aWorkerThatThrowsIsCarriedToTheMainThreadAndFailsTheCase() throws Exception {
+        List<Throwable> failures = workerFailures();
+        CyclicBarrier barrier = new CyclicBarrier(3);
+        List<Thread> threads = new ArrayList<>();
+        threads.add(worker(failures, () -> {
+            try {
+                barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (Exception failure) {
+                throw new AssertionError(failure);
+            }
+        }));
+        threads.add(worker(failures, () -> {
+            try {
+                barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (Exception failure) {
+                throw new AssertionError(failure);
+            }
+            throw new IllegalStateException("this worker was told to fail");
+        }));
+        for (Thread thread : threads) {
+            thread.start();
+        }
+        barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        joinAll(threads);
+
+        assertEquals(1, failures.size(),
+            "the throw of a worker is carried to the main thread instead of dying with it: " + failures);
+        assertEquals("this worker was told to fail", failures.get(0).getMessage());
+        assertThrows(AssertionError.class, () -> assertNoWorkerFailed(failures),
+            "and a worker that threw fails the case rather than leaving it green");
     }
 }

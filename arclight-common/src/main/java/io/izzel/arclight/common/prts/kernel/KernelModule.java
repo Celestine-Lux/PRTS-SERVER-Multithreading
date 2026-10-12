@@ -143,6 +143,9 @@ public final class KernelModule {
      * bound would turn a repeated request into a memory leak: the one that finds it full is refused. */
     private static final int RESET_QUEUE_CAPACITY = 8;
 
+    /** What the trace of a request whose reset threw says: neither answered nor refused-again. */
+    private static final String RESET_FAULTED = "reset-faulted";
+
     /** The domain one applied intent is logged under: the intent channel, which is not a world domain
      * and is ordered by its own frozen sequence. */
     private static final String INTENT_DOMAIN = "intent";
@@ -298,6 +301,10 @@ public final class KernelModule {
     private RequestItem resetDeferredItem;
     /** Whether the mailbox has seen the chain closed; enqueueing is decided against it. */
     private boolean resetMailboxClosed;
+    /** Whether the owner is inside one batch: a call arriving while it is set is a re-entry. */
+    private boolean resetBatchOpen;
+    /** Whether a reset threw after entering the chain: no later reset runs until that chain is given back. */
+    private boolean resetUnfinished;
     /** Items the owner has taken out and not answered: they still count against the capacity. */
     private int resetInProgress;
     private long resetRequestSequence;
@@ -1493,8 +1500,7 @@ public final class KernelModule {
     Mailbox mailbox() {
         synchronized (resetMailbox) {
             List<String> sources = waitingSources();
-            return new Mailbox(sources.size(), sources,
-                resetDeferred || !resetQueue.isEmpty() || resetInProgress > 0,
+            return new Mailbox(sources.size(), sources, owesAReset(),
                 commitResetRequests, commitResetHandOffs, commitResetMerges, commitResetAdmits,
                 commitResetQueueRefusals, commitResetClosedRefusals, resetInProgress);
         }
@@ -1508,6 +1514,11 @@ public final class KernelModule {
         return List.copyOf(sources);
     }
 
+    /** Whether the mailbox still owes an answer. Read under the mailbox lock. */
+    private boolean owesAReset() {
+        return resetDeferred || !resetQueue.isEmpty() || resetBatchOpen || resetUnfinished;
+    }
+
 
     public static int resetQueueCapacity() {
         return RESET_QUEUE_CAPACITY;
@@ -1516,27 +1527,33 @@ public final class KernelModule {
     /** The one request entry for a whole reset, named after where it came from. A request on the thread
      * the host named is answered there; one on any other thread enters a bounded queue, refused outright
      * when that queue is full, and the caller is told to ask on the owner thread. What waits is answered
-     * by {@link #markSafePoint()}, one bounded batch of it per call. */
+     * by {@link #markSafePoint()}, one bounded batch of it per call; the identity of an owner-thread
+     * request is minted before the reset runs, so a late answer is still read as the arrival it was. */
     public ResetRequest requestReadingsReset(String source) {
         String named = source == null || source.isEmpty() ? "unnamed" : source;
         if (!guard.serverThreadBound()) {
-            return publishRequest(named, "owner-thread-unbound", false, false);
+            return publishRequest(named, null, "owner-thread-unbound", false, false);
         }
         if (!guard.onServerThread()) {
             return queueResetRequest(named);
         }
+        ResetRequest merged = mergeOwningReset(named);
+        if (merged != null) {
+            return merged;
+        }
+        RequestItem item = mintItem(named);
         if (carryOutOwningReset()) {
-            return publishRequest(named, "reset-at-safe-point", true, false);
+            return publishRequest(named, item, "reset-at-safe-point", true, false);
         }
-        boolean closed = commitChainClosed();
-        if (!closed) {
-            deferOwningReset(named);
+        if (!commitChainClosed()) {
+            deferOwningReset(item);
+            return publishRequest(named, item, "deferred", false, false);
         }
-        return publishRequest(named, closed ? "lifecycle-closed" : "deferred", false, false);
+        return publishRequest(named, item, "lifecycle-closed", false, false);
     }
 
-    /** Counts one request that minted no item and publishes its own trace. */
-    private ResetRequest publishRequest(String source, String result, boolean carriedOut,
+    /** Counts one call through the request entry and publishes the line it ended on. */
+    private ResetRequest publishRequest(String source, RequestItem item, String result, boolean carriedOut,
                                         boolean handedOff) {
         long answeredBy = 0L;
         long epoch = NO_CARRIED_EPOCH;
@@ -1547,10 +1564,30 @@ public final class KernelModule {
         }
         synchronized (resetMailbox) {
             commitResetRequests++;
-            resetTrace = new ResetTrace(source, ++resetRequestSequence, Thread.currentThread().threadId(),
-                answeredBy, epoch, result);
+            resetTrace = new ResetTrace(source, item == null ? ++resetRequestSequence : item.requestId(),
+                Thread.currentThread().threadId(), answeredBy, epoch, result);
         }
         return new ResetRequest(carriedOut, source, handedOff, result);
+    }
+
+    /** Mints one logical request's identity: its id and the turn it arrived in, before the caller acts. */
+    private RequestItem mintItem(String source) {
+        synchronized (resetMailbox) {
+            return new RequestItem(source, ++resetRequestSequence, Thread.currentThread().threadId(),
+                ++resetArrivals);
+        }
+    }
+
+    /** The whole merge an owner reset has: a call finding one reset already owed still unanswered mints
+     * nothing and keeps that item's source, id and arrival. */
+    private ResetRequest mergeOwningReset(String source) {
+        synchronized (resetMailbox) {
+            if (resetMailboxClosed || !resetDeferred) {
+                return null;
+            }
+            commitResetRequests++;
+            return new ResetRequest(false, source, false, "deferred");
+        }
     }
 
     /** The whole other-thread path as one atomic step: merged, refused, or enqueued. Only an item
@@ -1587,19 +1624,21 @@ public final class KernelModule {
         }
     }
 
-    /** Records the one reset an owner-thread call could not carry out: a second such call is the same
-     * owed reset and not a second generation. */
-    private void deferOwningReset(String source) {
+    /** Records the one reset an owner-thread call could not carry out; the item keeps its own identity. */
+    private void deferOwningReset(RequestItem item) {
         synchronized (resetMailbox) {
             resetDeferred = true;
-            resetDeferredItem = new RequestItem(source, ++resetRequestSequence,
-                Thread.currentThread().threadId(), ++resetArrivals);
+            resetDeferredItem = item;
         }
     }
 
-    /** Writes one answer back into the trace of the item it belongs to, and only while that trace is
-     * still the one it published, so one trace never mixes two calls. */
+    /** Writes one answer into the trace of the item it belongs to while that trace is still its own. */
     private void noteResetAnswered(RequestItem item, String result) {
+        noteResetAnswered(item, result, false);
+    }
+
+    /** An item a reset threw on is answered even where a newer request holds the line. */
+    private void noteResetAnswered(RequestItem item, String result, boolean force) {
         long thread = Thread.currentThread().threadId();
         CommitController controller = this.commitController;
         long epoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
@@ -1612,12 +1651,17 @@ public final class KernelModule {
                 }
                 return;
             }
-            if (resetTrace.requestId() != item.requestId()) {
+            if (!force && resetTrace.requestId() != item.requestId() && !traceHoldsAFault()) {
                 return;
             }
             resetTrace = new ResetTrace(item.source(), item.requestId(), item.arrivalThreadId(), thread,
                 epoch, result);
         }
+    }
+
+    /** Whether the line the trace holds is a fault instead of a request's answer. */
+    private boolean traceHoldsAFault() {
+        return resetTrace.result().startsWith(RESET_FAULTED);
     }
 
     /** Answers what the queue of the owner holds, at a safe point and nowhere else. One call carries
@@ -1638,23 +1682,29 @@ public final class KernelModule {
         }
     }
 
-    /** One batch, one pass. The deferred request is answered first and takes nothing else with it. An
-     * item refused again keeps its identity and goes back to the head of the queue; one a closed
-     * lifecycle refuses is dropped and counted, because no safe point could ever carry it out. */
+    /** One batch, one pass. The deferred request is answered first and holds one place of this budget,
+     * so at most the capacity including it is started here. An item refused again keeps its identity and
+     * goes back to the head of the queue; one a closed lifecycle refuses is dropped and counted. A call
+     * already inside a batch, or one reaching an unfinished mailbox, is refused instead. */
     private SafePoint drainQueuedResets() {
         List<RequestItem> batch = new ArrayList<>(RESET_QUEUE_CAPACITY);
         RequestItem deferred;
         boolean deferredOwed;
         synchronized (resetMailbox) {
+            if (resetBatchOpen || resetUnfinished) {
+                return new SafePoint(0, resetQueue.size(), resetQueue.size(), false);
+            }
             commitSafePointCalls++;
             deferredOwed = resetDeferred;
             deferred = resetDeferredItem;
             resetDeferred = false;
             resetDeferredItem = null;
-            while (batch.size() < RESET_QUEUE_CAPACITY && !resetQueue.isEmpty()) {
+            int budget = deferredOwed ? RESET_QUEUE_CAPACITY - 1 : RESET_QUEUE_CAPACITY;
+            while (batch.size() < budget && !resetQueue.isEmpty()) {
                 batch.add(resetQueue.removeFirst());
             }
             resetInProgress = batch.size();
+            resetBatchOpen = true;
         }
         int carried = 0;
         int owed = 0;
@@ -1662,6 +1712,7 @@ public final class KernelModule {
         boolean disposition = false;
         boolean closed = false;
         boolean stillOwed = false;
+        int attempted = 0;
         List<RequestItem> retry = new ArrayList<>();
         try {
             if (deferredOwed) {
@@ -1678,6 +1729,7 @@ public final class KernelModule {
                 }
             }
             for (RequestItem item : batch) {
+                attempted++;
                 if (carryOutOwningReset()) {
                     carried++;
                     noteResetAnswered(item, "reset-at-safe-point");
@@ -1692,9 +1744,22 @@ public final class KernelModule {
                 disposition |= waitingDispositions();
                 retry.add(item);
             }
+        } catch (Throwable failure) {
+            // A reset that threw has already entered the chain: the item is answered with its fault and
+            // never retried, and the mailbox is left unfinished. A fatal Error is marked and handed on.
+            noteResetAnswered(attempted == 0 ? deferred : batch.get(attempted - 1), resetFault(failure),
+                true);
+            latchUnfinishedReset();
+            if (failure instanceof Error fatal) {
+                throw fatal;
+            }
         } finally {
             synchronized (resetMailbox) {
                 resetInProgress = 0;
+                resetBatchOpen = false;
+                for (int index = attempted; index < batch.size(); index++) {
+                    retry.add(batch.get(index));
+                }
                 for (int index = retry.size() - 1; index >= 0; index--) {
                     resetQueue.addFirst(retry.get(index));
                 }
@@ -1709,6 +1774,18 @@ public final class KernelModule {
             }
         }
         return new SafePoint(carried, owed, queued, disposition);
+    }
+
+    /** What the trace of a request whose reset threw names: the fault it hit. */
+    private static String resetFault(Throwable failure) {
+        return RESET_FAULTED + ":" + failure.getClass().getSimpleName();
+    }
+
+    /** Leaves the mailbox unfinished; only binding or giving back a chain clears it. */
+    private void latchUnfinishedReset() {
+        synchronized (resetMailbox) {
+            resetUnfinished = true;
+        }
     }
 
     /** Whether the chain holds an item whose side effect ran and whose line is not written. */
@@ -2325,6 +2402,7 @@ public final class KernelModule {
         this.commitController = controller;
         synchronized (resetMailbox) {
             resetMailboxClosed = false;
+            resetUnfinished = false;
         }
         declarationGeneration++;
         declarationHistory.retire();
@@ -2415,6 +2493,7 @@ public final class KernelModule {
         this.commits = ownCommits;
         synchronized (resetMailbox) {
             resetMailboxClosed = false;
+            resetUnfinished = false;
         }
         declarationGeneration++;
         declarationHistory.retire();
@@ -2473,10 +2552,10 @@ public final class KernelModule {
     }
 
     /** Whether this module owes a reset it could not carry out when it was asked for: an item in the
-     * queue, a batch taken out and not answered, or the one owner-thread request refused. */
+     * queue, a batch taken out, the one owner-thread request refused, or a mailbox left unfinished. */
     public boolean commitResetPending() {
         synchronized (resetMailbox) {
-            return resetDeferred || !resetQueue.isEmpty() || resetInProgress > 0;
+            return owesAReset();
         }
     }
 
@@ -2574,7 +2653,7 @@ public final class KernelModule {
             return;
         }
         if (!commitChainClosed()) {
-            deferOwningReset("");
+            deferOwningReset(mintItem(""));
         }
     }
 

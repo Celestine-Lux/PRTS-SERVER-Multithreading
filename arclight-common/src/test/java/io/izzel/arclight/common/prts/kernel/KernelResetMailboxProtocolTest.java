@@ -9,10 +9,12 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -89,22 +91,74 @@ class KernelResetMailboxProtocolTest {
 
     private static KernelModule.ResetRequest onAnotherThread(KernelModule module, String source)
         throws InterruptedException {
+        return requestFromThread(module, source, new AtomicReference<>());
+    }
+
+    /** One request from its own thread, with the identity of that thread. What the worker threw is kept
+     * and asserted instead of leaving the caller with an answer that was never set. */
+    private static KernelModule.ResetRequest requestFromThread(KernelModule module, String source,
+                                                              AtomicReference<Long> threadId)
+        throws InterruptedException {
+        List<Throwable> failures = workerFailures();
         AtomicReference<KernelModule.ResetRequest> answer = new AtomicReference<>();
-        Thread thread = new Thread(() -> answer.set(module.requestReadingsReset(source)));
+        Thread thread = worker(failures, () -> {
+            threadId.set(Thread.currentThread().threadId());
+            answer.set(module.requestReadingsReset(source));
+        });
         thread.start();
         thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
         assertFalse(thread.isAlive(), "a request from another thread returns within its timeout");
+        assertNoWorkerFailed(failures);
         return answer.get();
+    }
+
+    /** Where the throw of a worker is kept, so a case fails for what a worker hit instead of passing
+     * because the throw died with the thread that ran it. */
+    private static List<Throwable> workerFailures() {
+        return Collections.synchronizedList(new ArrayList<>());
+    }
+
+    private static Thread worker(List<Throwable> failures, Runnable body) {
+        return new Thread(() -> {
+            try {
+                body.run();
+            } catch (Throwable failure) {
+                failures.add(failure);
+            }
+        });
+    }
+
+    private static void assertNoWorkerFailed(List<Throwable> failures) {
+        assertTrue(failures.isEmpty(), "no worker of this case failed: " + failures);
+    }
+
+    private static String reading(String key) {
+        return HostDriveFixture.reading(key);
+    }
+
+    private static long counter(String key) {
+        return HostDriveFixture.counter(key);
+    }
+
+    /** The trace line the readout publishes, split: the source, the thread that asked, the thread that
+     * answered, the generation it ran, and the result. */
+    private static String[] traceFields() {
+        return reading("product.commit.reset_trace").split("\\|", -1);
+    }
+
+    private static String traceResult() {
+        return traceFields()[4];
     }
 
     /** Fills the queue from one thread per source, released together, so the case sees the admission
      * path on its own with no owner draining in the middle of it. */
-    private void fill(int attempts, KernelModule.ResetRequest[] answers) throws Exception {
+    private void fill(int attempts, KernelModule.ResetRequest[] answers, List<Throwable> failures)
+        throws Exception {
         CyclicBarrier barrier = new CyclicBarrier(attempts + 1);
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < attempts; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(failures, () -> {
                 try {
                     barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
                     answers[slot] = module.requestReadingsReset("host:console-" + slot);
@@ -120,16 +174,18 @@ class KernelResetMailboxProtocolTest {
             thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
             assertFalse(thread.isAlive(), "every producer returns within its timeout");
         }
+        assertNoWorkerFailed(failures);
     }
 
     @Test
     void oneReadOfTheQueueExitsNeverTears() throws Exception {
         install();
         AtomicBoolean stop = new AtomicBoolean();
+        List<Throwable> failures = workerFailures();
         List<Thread> threads = new ArrayList<>();
         for (int index = 0; index < 4; index++) {
             int slot = index;
-            Thread thread = new Thread(() -> {
+            Thread thread = worker(failures, () -> {
                 for (int round = 0; round < 3000 && !stop.get(); round++) {
                     module.requestReadingsReset("host:console-" + slot + "-" + round);
                 }
@@ -138,27 +194,31 @@ class KernelResetMailboxProtocolTest {
             thread.start();
         }
         List<String> torn = new ArrayList<>();
-        for (int round = 0; round < 3000; round++) {
-            KernelModule.Mailbox read = module.mailbox();
-            if (read.depth() != read.sources().size()) {
-                torn.add("depth=" + read.depth() + " sources=" + read.sources().size());
-                break;
+        try {
+            for (int round = 0; round < 3000; round++) {
+                KernelModule.Mailbox read = module.mailbox();
+                if (read.depth() != read.sources().size()) {
+                    torn.add("depth=" + read.depth() + " sources=" + read.sources().size());
+                    break;
+                }
+                if (read.depth() + read.inProgress() > KernelModule.resetQueueCapacity()) {
+                    torn.add("depth=" + read.depth() + " inProgress=" + read.inProgress());
+                    break;
+                }
+                if (!read.pending() && (read.depth() > 0 || read.inProgress() > 0)) {
+                    torn.add("pending=false depth=" + read.depth() + " inProgress=" + read.inProgress());
+                    break;
+                }
+                module.markSafePoint();
             }
-            if (read.depth() + read.inProgress() > KernelModule.resetQueueCapacity()) {
-                torn.add("depth=" + read.depth() + " inProgress=" + read.inProgress());
-                break;
+        } finally {
+            stop.set(true);
+            for (Thread thread : threads) {
+                thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+                assertFalse(thread.isAlive(), "every producer returns within its timeout");
             }
-            if (!read.pending() && (read.depth() > 0 || read.inProgress() > 0)) {
-                torn.add("pending=false depth=" + read.depth() + " inProgress=" + read.inProgress());
-                break;
-            }
-            module.markSafePoint();
         }
-        stop.set(true);
-        for (Thread thread : threads) {
-            thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
-            assertFalse(thread.isAlive(), "every producer returns within its timeout");
-        }
+        assertNoWorkerFailed(failures);
 
         assertTrue(torn.isEmpty(), "the exits come out of one read and agree: " + torn);
         for (int round = 0; round < 64 && module.commitResetPending(); round++) {
@@ -173,7 +233,7 @@ class KernelResetMailboxProtocolTest {
         install();
         int attempts = KernelModule.resetQueueCapacity() + 4;
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[attempts];
-        fill(attempts, answers);
+        fill(attempts, answers, workerFailures());
         // Four calls join a source already waiting: the same request twice leaves the queue as it was.
         for (int index = 0; index < 4; index++) {
             onAnotherThread(module, "host:console-" + index);
@@ -210,7 +270,7 @@ class KernelResetMailboxProtocolTest {
         int attempts = KernelModule.resetQueueCapacity() + 4;
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[attempts];
         KernelModule.Mailbox before = module.mailbox();
-        fill(attempts, answers);
+        fill(attempts, answers, workerFailures());
         for (int index = 0; index < 3; index++) {
             onAnotherThread(module, "host:console-" + index);
         }
@@ -314,7 +374,7 @@ class KernelResetMailboxProtocolTest {
         install();
         int producers = KernelModule.resetQueueCapacity();
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[producers];
-        fill(producers, answers);
+        fill(producers, answers, workerFailures());
 
         KernelModule.Mailbox before = module.mailbox();
         fixture.postTick(WORLDS);
@@ -332,5 +392,378 @@ class KernelResetMailboxProtocolTest {
         assertEquals((long) producers, chain.epochs.current());
         assertEquals(0, after.depth());
         assertFalse(after.pending());
+    }
+
+    // ---- the owner request: one item, one line, and the request that merges into it ----------------
+
+    @Test
+    void anOwnerRequestRefusedWhileALineIsInFlightIsAnsweredAtTheSafePoint() {
+        install();
+        long requests = counter("product.commit.reset_requests");
+        try {
+            beginLine(71L);
+            KernelModule.ResetRequest answer = module.requestReadingsReset("host:console-owner");
+
+            assertFalse(answer.carriedOut(), "a line in flight refuses the reset where the owner asked");
+            assertEquals("deferred", answer.reason());
+            assertFalse(answer.handedOff(), "and the request is not an entry of the queue");
+            assertTrue(module.commitResetPending(), "it is one owed reset, held apart from the queue");
+            assertEquals(0, module.resetQueueDepth());
+            assertEquals(1L, counter("product.commit.reset_requests") - requests,
+                "one call through the request entry is counted once");
+
+            String[] owed = traceFields();
+            assertEquals("host:console-owner", owed[0], "the line names the request that is owed");
+            assertEquals(Long.toString(Thread.currentThread().threadId()), owed[1],
+                "made on the thread the host named");
+            assertEquals("-", owed[2], "and answered by no thread yet");
+            assertEquals("none", owed[3], "with no generation behind it");
+            assertEquals("deferred", owed[4]);
+        } finally {
+            releaseTheLine();
+        }
+
+        fixture.postTick(WORLDS);
+
+        String[] answered = traceFields();
+        assertEquals("host:console-owner", answered[0],
+            "the answer lands in the line of the item that was owed, not in a line of its own");
+        assertEquals(Long.toString(Thread.currentThread().threadId()), answered[1],
+            "and the request is still read as the one made on this thread");
+        assertEquals(Long.toString(Thread.currentThread().threadId()), answered[2],
+            "the safe point answered it on the owner thread");
+        assertEquals("1", answered[3], "naming the generation that carried it");
+        assertEquals("reset-at-safe-point", answered[4]);
+        assertEquals(1L, chain.controller.resets(), "one owed reset is one generation");
+        assertFalse(module.commitResetPending(), "and nothing is left owed");
+    }
+
+    @Test
+    void aDeferredOwnerRequestWithNothingBehindItTurnsItsOwnTraceComplete() {
+        install();
+        long requests = counter("product.commit.reset_requests");
+        try {
+            beginLine(81L);
+            module.requestReadingsReset("host:console-owner");
+        } finally {
+            releaseTheLine();
+        }
+
+        KernelModule.SafePoint point = module.markSafePoint();
+
+        assertEquals(1, point.carried(), "the owed reset is the one thing this safe point carried");
+        assertEquals(0, point.queued());
+        String[] answered = traceFields();
+
+        assertEquals("reset-at-safe-point", answered[4],
+            "the line turns complete without a second request having to be made");
+        assertEquals("1", answered[3], "and it names the generation the reset ran");
+        assertEquals(1L, chain.epochs.current());
+        assertEquals(1L, counter("product.commit.reset_requests") - requests,
+            "one call, one item, one line: the request entry counted nothing twice");
+        assertEquals(1L, chain.controller.resets());
+        assertFalse(module.commitResetPending());
+    }
+
+    @Test
+    void aRequestThatTakesTheTraceOverDoesNotMixTheTwoItems() throws Exception {
+        install();
+        try {
+            beginLine(91L);
+            module.requestReadingsReset("host:console-owner");
+            assertTrue(module.commitResetPending());
+        } finally {
+            releaseTheLine();
+        }
+
+        AtomicReference<Long> otherThread = new AtomicReference<>();
+        requestFromThread(module, "host:console-other", otherThread);
+
+        String[] other = traceFields();
+
+        assertEquals("host:console-other", other[0], "the newer request owns the line now");
+        assertEquals(Long.toString(otherThread.get()), other[1]);
+
+        fixture.postTick(WORLDS);
+
+        String[] after = traceFields();
+
+        assertEquals("host:console-other", after[0],
+            "the answer of the owed item is not written into the line of another request");
+        assertEquals(Long.toString(otherThread.get()), after[1]);
+        assertEquals(Long.toString(Thread.currentThread().threadId()), after[2],
+            "the line is answered once, by the thread the safe point ran on");
+        assertEquals("reset-at-safe-point", after[4]);
+        assertEquals(2L, chain.controller.resets(), "each of the two items is answered once");
+        assertEquals(2L, chain.epochs.current());
+        assertFalse(module.commitResetPending());
+    }
+
+    @Test
+    void aSecondOwnerRequestMergesIntoTheOwedResetAndDoesNotReplaceIt() {
+        install();
+        long requests = counter("product.commit.reset_requests");
+        try {
+            beginLine(101L);
+            module.requestReadingsReset("host:console-first");
+            String owed = reading("product.commit.reset_trace");
+
+            KernelModule.ResetRequest second = module.requestReadingsReset("host:console-second");
+
+            assertEquals("deferred", second.reason(), "the second call is the same owed reset");
+            assertEquals(owed, reading("product.commit.reset_trace"),
+                "so it mints nothing and does not move the line of the item it joined");
+            assertEquals(2L, counter("product.commit.reset_requests") - requests,
+                "and both calls are counted once each");
+        } finally {
+            releaseTheLine();
+        }
+
+        fixture.postTick(WORLDS);
+
+        String[] answered = traceFields();
+
+        assertEquals("host:console-first", answered[0],
+            "the item keeps the source it was minted with: the call that merged does not rename it");
+        assertEquals("reset-at-safe-point", answered[4]);
+        assertEquals(1L, chain.controller.resets(), "two calls on one owed reset are one generation");
+        assertEquals(1L, chain.epochs.current());
+        assertFalse(module.commitResetPending());
+    }
+
+    // ---- the budget of one safe point, and a reset that throws -------------------------------------
+
+    @Test
+    void aDeferredResetAndAFullQueueAreTakenWithinOneBudget() throws Exception {
+        install();
+        try {
+            beginLine(111L);
+            module.requestReadingsReset("host:console-owner");
+            assertTrue(module.commitResetPending(), "one owner reset is owed");
+            int capacity = KernelModule.resetQueueCapacity();
+            KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[capacity];
+            fill(capacity, answers, workerFailures());
+            assertEquals(capacity, module.resetQueueDepth(),
+                "the queue holds its own bound while the owner reset is owed");
+        } finally {
+            releaseTheLine();
+        }
+
+        KernelModule.SafePoint first = module.markSafePoint();
+        int capacity = KernelModule.resetQueueCapacity();
+
+        assertEquals(capacity, first.carried(),
+            "the owed reset holds one place of the budget, so seven waiters are taken with it");
+        assertEquals(1, module.resetQueueDepth(), "the last waiter keeps its place for the next point");
+
+        KernelModule.SafePoint second = module.markSafePoint();
+
+        assertEquals(1, second.carried(), "and the next safe point answers it");
+        assertEquals(0, module.resetQueueDepth());
+        assertEquals((long) capacity + 1L, chain.controller.resets(),
+            "one generation per logical request: the owed reset and the waiters");
+        assertEquals((long) capacity + 1L, chain.epochs.current());
+        assertFalse(module.commitResetPending());
+    }
+
+    @Test
+    void aResetThatThrowsOnTheOwedItemIsAnsweredWithItsFaultAndNotTriedAgain() {
+        install();
+        try {
+            beginLine(121L);
+            module.requestReadingsReset("host:console-owner");
+            assertTrue(module.commitResetPending());
+        } finally {
+            releaseTheLine();
+        }
+        TestDomain domain = new TestDomain("fixture-fault").throwingOnCall(1);
+        module.installDomain(domain);
+        try {
+            KernelModule.SafePoint point = module.markSafePoint();
+
+            assertEquals(0, point.carried(), "the reset threw, so nothing was carried out");
+            String[] faulted = traceFields();
+
+            assertEquals("host:console-owner", faulted[0]);
+            assertEquals(Long.toString(Thread.currentThread().threadId()), faulted[2],
+                "the item is answered with the fault it hit, not with a completion");
+            assertEquals("1", faulted[3],
+                "and the generation it had already entered when it threw is the one it names");
+            assertEquals("reset-faulted:RuntimeException", faulted[4]);
+            assertEquals(1L, chain.controller.resets(),
+                "the chain entered the reset: a throw does not give the generation back");
+            assertEquals(0, module.mailbox().inProgress(), "and the batch is not left half open");
+            assertTrue(module.commitResetPending(), "the mailbox says it is not settled");
+
+            KernelModule.SafePoint again = module.markSafePoint();
+
+            assertEquals(0, again.carried(), "the item that threw is not tried a second time");
+            assertEquals(1, domain.calls(), "the reset ran exactly once");
+            assertEquals(1L, chain.controller.resets(), "and no second generation is invented for it");
+            assertEquals(1L, chain.epochs.current());
+            assertEquals("reset-faulted:RuntimeException", traceResult(),
+                "the fault it was answered with stands");
+        } finally {
+            module.installDomain(new TestDomain("fixture-fault"));
+        }
+
+        assertTrue(module.rollbackCommitChain(), "the chain that saw the throw is given back");
+        assertFalse(module.commitResetPending(), "and that is what ends the unfinished mark");
+    }
+
+    @Test
+    void aResetThatThrowsInsideABatchKeepsTheTailAndWhatAlreadyRan() throws Exception {
+        install();
+        for (int index = 0; index < 3; index++) {
+            onAnotherThread(module, "host:console-" + index);
+        }
+        assertEquals(3, module.resetQueueDepth());
+        TestDomain domain = new TestDomain("fixture-fault").throwingOnCall(2);
+        TestDomain idle = new TestDomain("fixture-fault");
+        module.installDomain(domain);
+        try {
+            KernelModule.SafePoint point = module.markSafePoint();
+
+            assertEquals(1, point.carried(), "the item before the throw ran and is not run again");
+            assertEquals(2, domain.calls(), "the reset of the item that threw was entered, once");
+            assertEquals(2L, chain.controller.resets(),
+                "the item that threw had already entered the chain");
+            assertEquals(2L, chain.epochs.current(), "and its generation is not given back");
+            assertEquals(List.of("host:console-2"), module.resetQueueSources(),
+                "the item behind it never started and keeps its own source and place");
+            assertEquals(0, module.mailbox().inProgress(), "the batch is not left half open");
+            assertTrue(module.commitResetPending(), "and the mailbox says it is not settled");
+
+            String[] faulted = traceFields();
+
+            assertEquals("host:console-1", faulted[0], "the item that threw is answered with its fault");
+            assertEquals(Long.toString(Thread.currentThread().threadId()), faulted[2]);
+            assertEquals("2", faulted[3]);
+            assertEquals("reset-faulted:RuntimeException", faulted[4]);
+
+            KernelModule.SafePoint again = module.markSafePoint();
+
+            assertEquals(0, again.carried(), "the item that threw is not tried again");
+            assertEquals(2, domain.calls(), "and its reset is not entered a second time");
+            assertEquals(2L, chain.controller.resets(), "and nothing advances the chain further");
+            assertEquals(List.of("host:console-2"), module.resetQueueSources(),
+                "the item behind it is still there to be answered");
+        } finally {
+            module.installDomain(idle);
+        }
+
+        assertTrue(module.rollbackCommitChain(), "the chain that saw the throw is given back");
+        module.markSafePoint();
+
+        assertEquals(0, module.resetQueueDepth(),
+            "and only then is the item that never started answered");
+        assertEquals(2, domain.calls(),
+            "the item that threw was entered once and is not entered again");
+        assertEquals(1, idle.calls(), "the item that never started is the one that runs after it");
+        assertEquals(2L, chain.controller.resets(), "the chain that saw the throw is not asked again");
+        assertFalse(module.commitResetPending());
+    }
+
+    @Test
+    void aSafePointReachedFromInsideAResetDoesNotTakeTheBatchThatIsRunning() throws Exception {
+        install();
+        for (int index = 0; index < 3; index++) {
+            onAnotherThread(module, "host:console-" + index);
+        }
+        TestDomain domain = new TestDomain("fixture-reentry").reenteringOnCall(1);
+        module.installDomain(domain);
+        try {
+            KernelModule.SafePoint point = module.markSafePoint();
+
+            assertEquals(3, point.carried(), "every item of the batch is answered once");
+            assertEquals(3L, chain.controller.resets());
+            assertTrue(domain.reentered(), "the reset did reach the safe point from inside the batch");
+            assertEquals(0, domain.inner().carried(), "and the call from inside it carries nothing out");
+            assertEquals(0, domain.inner().queued(), "and takes nothing out of the queue");
+            assertEquals(3, domain.inProgressSeen(),
+                "the batch that is running keeps its own places instead of being taken over");
+            assertEquals(0, module.mailbox().inProgress(), "and it closes when it is done");
+            assertFalse(module.commitResetPending());
+        } finally {
+            module.installDomain(new TestDomain("fixture-reentry"));
+        }
+    }
+
+    /** A domain the reset of the module reaches on the real carry-out path: it counts the resets it is
+     * given and either throws on the call it was told to or calls the safe point back from inside the
+     * reset that is running. No world data and no fault seam in the code under test are needed for it. */
+    private static final class TestDomain implements KernelDomain {
+
+        private final String id;
+        private final AtomicInteger calls = new AtomicInteger();
+        private final AtomicInteger inProgressSeen = new AtomicInteger(-1);
+        private final AtomicReference<KernelModule.SafePoint> inner = new AtomicReference<>();
+        private int throwingOnCall;
+        private int reenteringOnCall;
+
+        TestDomain(String id) {
+            this.id = id;
+        }
+
+        TestDomain throwingOnCall(int call) {
+            this.throwingOnCall = call;
+            return this;
+        }
+
+        TestDomain reenteringOnCall(int call) {
+            this.reenteringOnCall = call;
+            return this;
+        }
+
+        @Override
+        public String id() {
+            return id;
+        }
+
+        @Override
+        public void tick(long tickIndex) {
+        }
+
+        @Override
+        public void shutdown() {
+        }
+
+        @Override
+        public void readings(DomainReadings readings) {
+        }
+
+        @Override
+        public List<String> selfCheck(List<String> failures, long tick) {
+            return failures;
+        }
+
+        @Override
+        public void reset() {
+            int call = calls.incrementAndGet();
+            if (call == throwingOnCall) {
+                throw new RuntimeException("the reset was refused where it ran");
+            }
+            if (call == reenteringOnCall) {
+                KernelModule module = KernelModule.instance();
+                inner.set(module.markSafePoint());
+                inProgressSeen.set(module.mailbox().inProgress());
+            }
+        }
+
+        int calls() {
+            return calls.get();
+        }
+
+        boolean reentered() {
+            return inner.get() != null;
+        }
+
+        KernelModule.SafePoint inner() {
+            return inner.get();
+        }
+
+        int inProgressSeen() {
+            return inProgressSeen.get();
+        }
     }
 }
