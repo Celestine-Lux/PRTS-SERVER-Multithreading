@@ -28,6 +28,7 @@ import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.kernel.degrade.DegradeLadder;
 import io.izzel.arclight.common.prts.kernel.intent.CommitSegment;
 import io.izzel.arclight.common.prts.kernel.intent.IntentQueue;
+import io.izzel.arclight.common.prts.kernel.jobs.DemandShadowCandidates;
 import io.izzel.arclight.common.prts.kernel.jobs.JobDeclaration;
 import io.izzel.arclight.common.prts.kernel.jobs.JobGraph;
 import io.izzel.arclight.common.prts.kernel.jobs.JobIntake;
@@ -203,6 +204,8 @@ public final class KernelModule {
     private final JobIntake jobIntake = new JobIntake(KernelSettings::jobQueueCap);
     private final JobScheduler scheduler = new JobScheduler();
     private final PipelineRoundJobs pipelineJobs = new PipelineRoundJobs();
+    /** The demands a freeze reads as shadow candidates; nothing read here is sealed. */
+    private final DemandShadowCandidates demandShadows = new DemandShadowCandidates();
     private final PipelineWriteClaims claims = new PipelineWriteClaims(versionSlots,
         guard.worldEpochs(), guard::onServerThread, LiveEntityAccess::level);
     private final ShareMeterPoint jobMeter = new ShareMeterPoint();
@@ -742,6 +745,11 @@ public final class KernelModule {
         if (KernelSettings.pipelineJobs() && KernelSettings.tickPlan()) {
             noteJobDeclarations(pipelineJobs.declareInto(jobIntake));
         }
+        // The demands of this freeze are read before the plan is built and never handed to it:
+        // what they become is a shadow candidate, and the freeze that read it is all it gets.
+        demandShadows.readFor(new DemandShadowCandidates.Freeze(planSequence, worldGeneration,
+            new FrozenDeclarations.FreezeKey(declarationLifecycleKey(), declarationGeneration)
+                .next()), worldId -> guard.worldEpochs().epochOf(worldId));
         List<String> domainIds = new ArrayList<>();
         for (KernelDomain domain : domains) {
             domainIds.add(domain.id());
@@ -968,6 +976,11 @@ public final class KernelModule {
     /** The rounds of the chunk pipeline this kernel declares as jobs. */
     public PipelineRoundJobs pipelineJobs() {
         return pipelineJobs;
+    }
+
+    /** The chunk demands the freeze reads as shadow candidates; no column of them is sealed. */
+    public DemandShadowCandidates demandShadowCandidates() {
+        return demandShadows;
     }
 
     /** The claims the declared write sets of the chunk pipeline are turned into. */
