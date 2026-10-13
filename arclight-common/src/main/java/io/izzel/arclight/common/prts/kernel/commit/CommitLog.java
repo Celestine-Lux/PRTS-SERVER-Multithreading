@@ -83,6 +83,15 @@ public final class CommitLog {
         return worldEpoch > NO_WORLD_EPOCH;
     }
 
+    /** The refusal of a world generation the check above does not read as live, and the empty text for
+     * one it does: untracked and lost are named apart, so a caller can say which one it holds. */
+    public static String worldEpochRefusal(long worldEpoch) {
+        if (liveWorldEpoch(worldEpoch)) {
+            return "";
+        }
+        return worldEpoch == NO_WORLD_EPOCH ? "world-untracked" : "world-not-live";
+    }
+
     /** Whether an instance column names one of the numbers a producer mints: the domain is positive,
      * so zero and every negative value declare no instance. It is the one reading of that domain and
      * a domain check only: what identifies a line is the mapping its own declaration sealed. A chunk

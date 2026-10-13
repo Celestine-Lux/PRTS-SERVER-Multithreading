@@ -807,18 +807,42 @@ public final class KernelModule {
             places.add(new FrozenDeclarations.Assignment(step.worldId(), step.domainId(),
                 step.nodeKey(), step.position()));
         }
+        List<FrozenDeclarations.Candidate> handed = pipelineJobs.candidateDeclarations();
+        String epochRefusal = declarationEpochRefusal(handed);
+        if (!epochRefusal.isEmpty()) {
+            declarationRefusals++;
+        }
         FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(live.next(), plan.planSequence(),
-            declarationInstances.mint(pipelineJobs.candidateDeclarations(), places), places);
+            declarationInstances.mint(handed, places), places);
         if (!sealed.sealed()) {
             declarationRefusal = sealed.refusal();
             declarationRefusals++;
             declarationHistory.retire();
             return;
         }
-        declarationRefusal = "";
+        declarationRefusal = epochRefusal;
         declarationGeneration = sealed.declarations().freeze().generation();
         declarationHistory.seal(sealed.declarations());
         declarationsSealed++;
+    }
+
+    /** The named refusal of the first declaration that carries its artefact and whose world
+     * generation is not live, and the empty text when every one of them names a live world. What such
+     * a declaration gets is no number and no seat, so what is left to say about it is why. */
+    private static String declarationEpochRefusal(List<FrozenDeclarations.Candidate> candidates) {
+        if (candidates == null) {
+            return "";
+        }
+        for (FrozenDeclarations.Candidate candidate : candidates) {
+            if (candidate == null || !candidate.artefactDeclared()) {
+                continue;
+            }
+            String refusal = CommitLog.worldEpochRefusal(candidate.worldEpoch());
+            if (!refusal.isEmpty()) {
+                return refusal;
+            }
+        }
+        return "";
     }
 
     /** The declarations of the freeze that is published, as the readings and the commit chain read

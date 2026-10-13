@@ -6,19 +6,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** The one source of the instance numbers a freeze seals: every declaration carrying its artefact is
- * given a positive number in the order the frozen plan committed its nodes, no number is handed out
- * twice, and the counter only moves forward - a rebuilt plan, a new generation and a refused seal
- * leave the numbers they took spent. A number is not an identity across runs; what identifies a line
- * is the mapping its own declaration sealed. The freeze point holds this source and hands it out to
- * no one, so a caller cannot fill the instance column of the declaration it sends in. */
+/** The one source of the instance numbers a freeze seals: every declaration carrying its artefact and
+ * naming a live world is given a positive number in the order the frozen plan committed its nodes, no
+ * number is handed out twice, and the counter only moves forward - a rebuilt plan, a new generation
+ * and a refused seal leave the numbers they took spent. A number is not an identity across runs; what
+ * identifies a line is the mapping its own declaration sealed. The freeze point holds this source and
+ * hands it out to no one, so a caller cannot fill the instance column of what it sends in. */
 public final class DeclarationInstanceAllocator {
 
     private long minted;
 
     /** Copies the declarations with the next numbers of this source, joined to the places the plan
-     * gave them. A declaration the plan gave no place, or one that carries no artefact, is copied
-     * unchanged: a freeze with nothing to number mints nothing and spends nothing. */
+     * gave them. A declaration the plan gave no place, one that carries no artefact, or one whose
+     * world generation is not live is copied unchanged: nothing to number means nothing is spent. */
     public List<FrozenDeclarations.Candidate> mint(List<FrozenDeclarations.Candidate> candidates,
                                                    List<FrozenDeclarations.Assignment> places) {
         List<FrozenDeclarations.Candidate> declared = candidates == null ? List.of() : candidates;
@@ -44,7 +44,8 @@ public final class DeclarationInstanceAllocator {
                 continue;
             }
             FrozenDeclarations.Candidate candidate = declared.get(index);
-            if (numbers[index] != 0L || !candidate.artefactDeclared()) {
+            if (numbers[index] != 0L || !candidate.artefactDeclared()
+                || !CommitLog.liveWorldEpoch(candidate.worldEpoch())) {
                 continue;
             }
             numbers[index] = ++minted;

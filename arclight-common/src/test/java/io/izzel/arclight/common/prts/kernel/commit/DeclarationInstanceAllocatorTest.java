@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The one source of instance numbers a freeze seals: what it mints, what it refuses to mint, and
@@ -36,6 +37,15 @@ class DeclarationInstanceAllocatorTest {
     private static final long EFFECT = 100L;
     private static final long CHUNK = 64L;
     private static final long OTHER_CHUNK = 65L;
+
+    /** The packed position of the chunk at (-1, 0): a packed chunk is signed, and a negative one is a
+     * legal position rather than the absence of one. */
+    private static final long NEGATIVE_CHUNK = -4294967296L;
+
+    /** The two ways a world generation fails the check: a world the tracked set never held, and one
+     * it has lost. */
+    private static final long UNTRACKED = 0L;
+    private static final long UNLIVE = -1L;
 
     /** The number a caller writes into the instance column itself: no source ever minted it. */
     private static final long SELF_REPORTED = 424242L;
@@ -329,5 +339,101 @@ class DeclarationInstanceAllocatorTest {
         assertEquals(FrozenDeclarations.NOT_WIRED, production.state(),
             "and the production shape reads the named state rather than an empty success");
         assertEquals(0, production.size());
+    }
+
+    @Test
+    void aDeclarationOfALiveWorldIsNumberedAndItsLineIsAdmitted() {
+        DeclarationInstanceAllocator source = new DeclarationInstanceAllocator();
+        List<FrozenDeclarations.Assignment> places = commitOrder(NODE);
+        FrozenDeclarations table =
+            freeze(source, List.of(declaration(NODE, CHUNK, STATUS, 0L, EPOCH)), places, 9L, 1L);
+        FrozenDeclarations.Entry entry = table.entryAt(seat(9L, 0));
+
+        assertEquals(FrozenDeclarations.SEALED, table.state());
+        assertNotNull(entry, "a live world generation is not a reason to refuse a declaration");
+        assertTrue(CommitLog.liveWorldEpoch(EPOCH), "a positive generation names a live world");
+        assertTrue(CommitLog.worldEpochRefusal(EPOCH).isEmpty(),
+            "so the epoch check has nothing to refuse here");
+        assertTrue(CommitLog.liveInstance(entry.instanceId()));
+        assertTrue(entry.bindingDeclared());
+        assertTrue(verify(table, 9L, 0, NODE, worn(entry.instanceId(), CHUNK, STATUS)).accepted());
+    }
+
+    @Test
+    void aDeclarationOfAnUntrackedWorldTakesNoNumberAndNoSeat() {
+        DeclarationInstanceAllocator source = new DeclarationInstanceAllocator();
+        List<FrozenDeclarations.Assignment> places = commitOrder(NODE);
+        FrozenDeclarations table = freeze(source,
+            List.of(declaration(NODE, CHUNK, STATUS, 0L, UNTRACKED)), places, 9L, 1L);
+
+        assertEquals(FrozenDeclarations.NOT_WIRED, table.state(),
+            "a declaration whose world generation is not live takes no entry");
+        assertEquals(0, table.size());
+        assertNull(table.entryAt(seat(9L, 0)), "and no seat is written for it");
+        assertEquals("world-untracked", CommitLog.worldEpochRefusal(UNTRACKED));
+        assertEquals(1L, source.mint(List.of(declaration(NODE, CHUNK, STATUS, 0L, EPOCH)), places)
+            .get(0).instanceId(),
+            "the counter did not move for it, so the first number really minted is still one");
+    }
+
+    @Test
+    void aDeclarationOfAWorldTheTrackedSetLostIsRefusedForAnotherReason() {
+        DeclarationInstanceAllocator source = new DeclarationInstanceAllocator();
+        List<FrozenDeclarations.Assignment> places = commitOrder(NODE);
+        FrozenDeclarations table = freeze(source,
+            List.of(declaration(NODE, CHUNK, STATUS, 0L, UNLIVE)), places, 9L, 1L);
+
+        assertEquals(FrozenDeclarations.NOT_WIRED, table.state());
+        assertEquals(0, table.size());
+        assertNull(table.entryAt(seat(9L, 0)));
+        assertEquals("world-not-live", CommitLog.worldEpochRefusal(UNLIVE));
+        assertNotEquals(CommitLog.worldEpochRefusal(UNTRACKED), CommitLog.worldEpochRefusal(UNLIVE),
+            "a world that was never tracked and one the tracked set lost are two different refusals");
+        assertEquals(1L, source.mint(List.of(declaration(NODE, CHUNK, STATUS, 0L, EPOCH)), places)
+            .get(0).instanceId(), "and the counter did not move for this one either");
+    }
+
+    @Test
+    void theTwoWaysAGenerationFailsTheCheckAreNamedApart() {
+        assertEquals("", CommitLog.worldEpochRefusal(EPOCH));
+        assertEquals("", CommitLog.worldEpochRefusal(EPOCH + 1L),
+            "every generation of a live world is answered with no refusal at all");
+        assertEquals("world-untracked", CommitLog.worldEpochRefusal(UNTRACKED));
+        assertEquals("world-not-live", CommitLog.worldEpochRefusal(UNLIVE));
+        assertEquals("world-not-live", CommitLog.worldEpochRefusal(UNLIVE - 1L),
+            "a lost world is one refusal however negative its generation is");
+        assertNotEquals(CommitLog.worldEpochRefusal(UNTRACKED), CommitLog.worldEpochRefusal(UNLIVE));
+    }
+
+    @Test
+    void aNegativeChunkPositionIsStillAccepted() {
+        DeclarationInstanceAllocator source = new DeclarationInstanceAllocator();
+        List<FrozenDeclarations.Assignment> places = commitOrder(NODE);
+        FrozenDeclarations table = freeze(source,
+            List.of(declaration(NODE, NEGATIVE_CHUNK, STATUS, 0L, EPOCH)), places, 9L, 1L);
+        FrozenDeclarations.Entry entry = table.entryAt(seat(9L, 0));
+
+        assertEquals(FrozenDeclarations.SEALED, table.state());
+        assertNotNull(entry, "a packed chunk is signed, so a negative one is a legal position");
+        assertEquals(NEGATIVE_CHUNK, entry.packedChunkPos());
+        assertTrue(entry.bindingDeclared(), "the check reads the epoch column and not the chunk");
+        assertTrue(verify(table, 9L, 0, NODE, worn(entry.instanceId(), NEGATIVE_CHUNK, STATUS))
+            .accepted());
+        assertEquals("chunk-witness-mismatch",
+            verify(table, 9L, 0, NODE, worn(entry.instanceId(), CHUNK, STATUS)).reason(),
+            "and the column is still read for what it says rather than for its sign");
+    }
+
+    @Test
+    void theNumberARefusedDeclarationNeverTookGoesToTheNextLiveOne() {
+        DeclarationInstanceAllocator source = new DeclarationInstanceAllocator();
+        List<FrozenDeclarations.Assignment> places = commitOrder(NODE, OTHER_NODE);
+        FrozenDeclarations table = freeze(source, List.of(
+            declaration(NODE, CHUNK, STATUS, 0L, UNTRACKED),
+            declaration(OTHER_NODE, OTHER_CHUNK, STATUS, 0L, EPOCH)), places, 9L, 1L);
+
+        assertNull(table.entryAt(seat(9L, 0)), "the declaration of the untracked world takes no seat");
+        assertEquals(1L, table.entryAt(seat(9L, 1)).instanceId(),
+            "and the live one takes the first number, not the second: none was skipped for it");
     }
 }
