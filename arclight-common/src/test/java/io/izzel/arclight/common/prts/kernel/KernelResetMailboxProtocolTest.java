@@ -274,12 +274,35 @@ class KernelResetMailboxProtocolTest {
         KernelModule.ResetRequest[] answers = new KernelModule.ResetRequest[attempts];
         KernelModule.Mailbox before = module.mailbox();
         fill(attempts, answers, workerFailures());
-        for (int index = 0; index < 3; index++) {
-            onAnotherThread(module, "host:console-" + index);
+        // Which producer the mailbox lets in is the scheduler's to decide, so the sources the merge
+        // is made of are read back out of the queue instead of being named here: a call that joins a
+        // source already waiting is a merge by the data, and which three of the waiting sources are
+        // asked changes no reading of the case. The assertions below hold for every arrival order.
+        KernelModule.Mailbox kept = module.mailbox();
+        List<String> waiting = kept.sources();
+        assertEquals((long) KernelModule.resetQueueCapacity(), (long) waiting.size(),
+            "the read the merge is built out of holds one waiting source per place");
+        List<String> merging = List.copyOf(waiting.subList(0, 3));
+        ResetMailboxFlakeWatch.noteMergingSources(merging);
+        for (String source : merging) {
+            KernelModule.ResetRequest joined = onAnotherThread(module, source);
+            assertFalse(joined.carriedOut(), "a call that joins a waiting source is not carried out");
+            assertTrue(joined.handedOff(), "and it took the path of a thread the chain does not own");
+            assertEquals("queued-for-owner-safe-point", joined.reason(),
+                "and it is answered as a merge of the source the queue holds");
         }
         KernelModule.Mailbox filled = module.mailbox();
         long calls = filled.calls() - before.calls();
         long handOffs = filled.handOffs() - before.handOffs();
+
+        assertEquals(3L, filled.calls() - kept.calls(), "the three calls of the step are one call each");
+        assertEquals(3L, filled.handOffs() - kept.handOffs(), "and every one took the queue path");
+        assertEquals(0L, filled.refusedFull() - kept.refusedFull(),
+            "and none is refused for room: the source it names is already waiting");
+        assertEquals(filled.handOffs() - kept.handOffs(),
+            (filled.merged() - kept.merged()) + (filled.admitted() - kept.admitted())
+                + (filled.refusedFull() - kept.refusedFull()) + (filled.refusedClosed() - kept.refusedClosed()),
+            "one outcome per call of the step, and the four of them add up to the calls of the step");
 
         assertEquals((long) attempts + 3L, calls, "every call of the case is one call");
         assertEquals((long) attempts + 3L, handOffs, "and every one of them took the queue path");

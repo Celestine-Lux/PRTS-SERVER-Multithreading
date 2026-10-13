@@ -31,6 +31,10 @@ final class ResetMailboxFlakeWatch implements TestExecutionExceptionHandler, Bef
      * with the rest of the snapshot instead of staying in a list nobody read. */
     private static final List<List<Throwable>> WATCHED = new ArrayList<>();
 
+    /** The sources the running case read back out of the queue and asked again, so a snapshot says
+     * what that case built its merge out of instead of leaving it to be worked out afterwards. */
+    private static final List<String> MERGING = new ArrayList<>();
+
     /** The rows of the readout a snapshot carries: the four outcomes of the queue path, the two debts
      * the pending flag stands for, and what the chain did with them. */
     private static final List<String> ROWS = List.of(
@@ -60,10 +64,22 @@ final class ResetMailboxFlakeWatch implements TestExecutionExceptionHandler, Bef
         return failures;
     }
 
+    /** Registers the sources a case took its merge from. The snapshot reads it and nothing else does:
+     * the case makes its own assertions, and this changes no outcome of any case. */
+    static void noteMergingSources(List<String> sources) {
+        synchronized (MERGING) {
+            MERGING.clear();
+            MERGING.addAll(sources);
+        }
+    }
+
     @Override
     public void beforeTestExecution(ExtensionContext context) {
         synchronized (WATCHED) {
             WATCHED.clear();
+        }
+        synchronized (MERGING) {
+            MERGING.clear();
         }
         context.getStore(NAMESPACE).put(STARTED_AT, Instant.now());
     }
@@ -91,7 +107,10 @@ final class ResetMailboxFlakeWatch implements TestExecutionExceptionHandler, Bef
         row(text, "failure", failure.getClass().getName() + ": " + failure.getMessage());
         row(text, "at", firstFrameOf(failure));
         row(text, "workerFailures", workerFailures());
-        row(text, "mailbox", mailbox());
+        KernelModule.Mailbox read = readMailbox();
+        row(text, "mailbox", mailbox(read));
+        row(text, "mergeSources", mergingSources());
+        row(text, "outcomeSum", outcomeSum(read));
         for (String key : ROWS) {
             row(text, "reading." + key, reading(key));
         }
@@ -103,19 +122,47 @@ final class ResetMailboxFlakeWatch implements TestExecutionExceptionHandler, Bef
         return text.toString();
     }
 
-    /** The one read every exit of the queue and every counter behind it comes out of. */
-    private String mailbox() {
+    /** The one read every exit of the queue and every counter behind it comes out of; a mailbox that
+     * cannot be read says so where it is printed instead of taking the snapshot down with it. */
+    private static KernelModule.Mailbox readMailbox() {
         try {
-            KernelModule.Mailbox mailbox = KernelModule.instance().mailbox();
-            return "depth=" + mailbox.depth() + " sources=" + mailbox.sources()
-                + " pending=" + mailbox.pending() + " inProgress=" + mailbox.inProgress()
-                + " calls=" + mailbox.calls() + " handOffs=" + mailbox.handOffs()
-                + " merged=" + mailbox.merged() + " admitted=" + mailbox.admitted()
-                + " refusedFull=" + mailbox.refusedFull()
-                + " refusedClosed=" + mailbox.refusedClosed();
+            return KernelModule.instance().mailbox();
         } catch (Throwable failure) {
-            return "unreadable: " + failure;
+            System.err.println("mailbox not read: " + failure);
+            return null;
         }
+    }
+
+    private static String mailbox(KernelModule.Mailbox read) {
+        if (read == null) {
+            return "unreadable";
+        }
+        return "depth=" + read.depth() + " sources=" + read.sources()
+            + " pending=" + read.pending() + " inProgress=" + read.inProgress()
+            + " calls=" + read.calls() + " handOffs=" + read.handOffs()
+            + " merged=" + read.merged() + " admitted=" + read.admitted()
+            + " refusedFull=" + read.refusedFull()
+            + " refusedClosed=" + read.refusedClosed();
+    }
+
+    /** The sources the case read back out of the queue and asked again; a case that failed before it
+     * built its merge reads as none recorded, which is itself a reading. */
+    private static String mergingSources() {
+        synchronized (MERGING) {
+            return MERGING.isEmpty() ? "none recorded by the case that failed" : MERGING.toString();
+        }
+    }
+
+    /** Worked out over the counters of the same read: the four outcomes of the queue path add up to
+     * the calls that took that path. It is the identity the cases assert, printed where a red run can
+     * be read, and derived rather than a reading of its own. */
+    private static String outcomeSum(KernelModule.Mailbox read) {
+        if (read == null) {
+            return "unreadable";
+        }
+        long sum = read.merged() + read.admitted() + read.refusedFull() + read.refusedClosed();
+        return "merged+admitted+refusedFull+refusedClosed=" + sum + " handOffs=" + read.handOffs()
+            + " calls=" + read.calls() + " outcomesAddUpToTheQueuePath=" + (sum == read.handOffs());
     }
 
     private String reading(String key) {
