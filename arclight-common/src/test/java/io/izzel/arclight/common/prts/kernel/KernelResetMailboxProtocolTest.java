@@ -6,6 +6,7 @@ import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -27,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * path ends in exactly one of the four outcomes, and a request the owner refused once is not admitted
  * a second time when it comes back. Every count is read as the step the case moved it, because the
  * counters of the module outlive a clear. */
+@ExtendWith(ResetMailboxFlakeWatch.class)
 class KernelResetMailboxProtocolTest {
 
     private static final List<String> WORLDS = List.of(HostDriveFixture.WORLD, HostDriveFixture.SECOND_WORLD);
@@ -116,7 +118,7 @@ class KernelResetMailboxProtocolTest {
     /** Where the throw of a worker is kept, so a case fails for what a worker hit instead of passing
      * because the throw died with the thread that ran it. */
     private static List<Throwable> workerFailures() {
-        return Collections.synchronizedList(new ArrayList<>());
+        return ResetMailboxFlakeWatch.watchWorkerFailures(Collections.synchronizedList(new ArrayList<>()));
     }
 
     private static Thread worker(List<Throwable> failures, Runnable body) {
