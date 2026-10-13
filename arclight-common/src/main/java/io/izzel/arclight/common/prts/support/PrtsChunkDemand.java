@@ -5,7 +5,9 @@ package io.izzel.arclight.common.prts.support;
  * answered with, and the futures it handed out. The calls are not changed and nothing is cancelled,
  * delayed or reordered; every call is a no-op while no tap is installed. A tap that has no use for
  * the chunk implements the entries that do not name it, and is told about each ask once. A tap
- * that throws is not the ask failing: the count is dropped and the host path is left alone. */
+ * that throws is not the ask failing: its count is dropped, and a stamp it cannot answer reads -1,
+ * which is no observation time to report -- not a refusal code, not a failure of the host and not a
+ * new reading key. */
 public final class PrtsChunkDemand {
 
     public interface DemandTap {
@@ -32,7 +34,7 @@ public final class PrtsChunkDemand {
             futureOpened(worldId, status);
         }
 
-        /** @return the stamp the matching open left, or -1 when there is none */
+        /** @return the stamp the matching open left, or -1 when there is no observation time */
         long futureOpenedAt();
 
         /** The future was handed to the caller; it is outstanding until it completes. */
@@ -117,7 +119,15 @@ public final class PrtsChunkDemand {
 
     public static long futureOpenedAt() {
         DemandTap watcher = tap;
-        return watcher == null ? -1L : watcher.futureOpenedAt();
+        if (watcher == null) {
+            return -1L;
+        }
+        try {
+            return watcher.futureOpenedAt();
+        } catch (Throwable ignored) {
+            // A watch that cannot answer leaves no observation time: -1, which is not a refusal.
+            return -1L;
+        }
     }
 
     public static void futureTaken(String worldId, String status) {

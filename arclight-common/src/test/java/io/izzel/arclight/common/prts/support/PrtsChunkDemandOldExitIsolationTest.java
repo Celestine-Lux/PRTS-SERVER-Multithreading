@@ -16,7 +16,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** The four observation entries the seam had before it named the chunk: what the host path sees
  * when the watch on them throws, what it still sees when the host path itself fails, and the one
- * count per event that the guard must not change. */
+ * count per event that the guard must not change. The entry that answers with a stamp is read here
+ * as it now behaves: a watch it cannot question is answered with -1 rather than carried out. */
 class PrtsChunkDemandOldExitIsolationTest {
 
     @AfterEach
@@ -246,12 +247,13 @@ class PrtsChunkDemandOldExitIsolationTest {
     }
 
     @Test
-    void theStampEntryKeepsItsOwnFailure() {
+    void theStampEntryAnswersTheSentinelInsteadOfTheFailure() {
         ThrowingTap tap = new ThrowingTap();
         PrtsChunkDemand.install(tap);
 
-        assertThrows(IllegalStateException.class, () -> PrtsChunkDemand.futureOpenedAt(),
-            "the entry that answers with a stamp answers a value, not a count: it is outside this watch");
+        long stamp = assertDoesNotThrow(PrtsChunkDemand::futureOpenedAt,
+            "a stamp the watch cannot give is answered for, not carried out to the caller");
+        assertEquals(-1L, stamp, "the sentinel is no observation time, and it is what the caller reads");
         assertEquals(1L, tap.stamps.sum(), "the query was reached once");
     }
 }
