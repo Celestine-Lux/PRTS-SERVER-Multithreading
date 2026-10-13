@@ -303,8 +303,6 @@ public final class KernelModule {
     private boolean resetMailboxClosed;
     /** Whether the owner is inside one batch: a call arriving while it is set is a re-entry. */
     private boolean resetBatchOpen;
-    /** Whether a reset threw after entering the chain: no later reset runs until that chain is given back. */
-    private boolean resetUnfinished;
     /** Items the owner has taken out and not answered: they still count against the capacity. */
     private int resetInProgress;
     private long resetRequestSequence;
@@ -316,6 +314,8 @@ public final class KernelModule {
     private long commitResetQueueRefusals;
     private long commitResetClosedRefusals;
     private volatile ResetTrace resetTrace = ResetTrace.NONE;
+    /** The one reset that threw and is owed a recovery: its line, held apart from the newest request. */
+    private volatile ResetTrace resetFaultLine = ResetTrace.NONE;
     private boolean commitSealed;
     private long commitSealedTurn;
     private int commitSealedCount;
@@ -1411,14 +1411,32 @@ public final class KernelModule {
                    long merged, long admitted, long refusedFull, long refusedClosed, int inProgress) {
     }
 
-    /** Carries out one whole reset, once, at the owner safe point. No mailbox lock is held here and
-     * no mailbox state is written: what the answer means for the queue is the caller's to decide. */
-    private boolean carryOutOwningReset() {
+    /** Why a reset is attempted: the gate below reads it, so no batch is refused by its own flag. */
+    private enum ResetAttempt {
+        BATCH_ITEM,
+        OUTSIDE_BATCH
+    }
+
+    /** The one gate every legal path to {@link #clearReadings()} passes through: the whole file reaches
+     * the domain here or not at all. An unfinished reset, or a batch already running, refuses the
+     * attempt — the batch's own items alone are no re-entry — and a throw is answered with its fault. */
+    private boolean carryOutOwningReset(ResetAttempt attempt, RequestItem item) {
+        synchronized (resetMailbox) {
+            if (resetFaultLine != ResetTrace.NONE
+                || (resetBatchOpen && attempt != ResetAttempt.BATCH_ITEM)) {
+                return false;
+            }
+        }
         CommitController controller = this.commitController;
         if (controller != null && !controller.enterReset().granted()) {
             return false;
         }
-        clearReadings();
+        try {
+            clearReadings();
+        } catch (Throwable failure) {
+            holdResetFault(item, failure);
+            throw failure;
+        }
         return true;
     }
 
@@ -1516,7 +1534,8 @@ public final class KernelModule {
 
     /** Whether the mailbox still owes an answer. Read under the mailbox lock. */
     private boolean owesAReset() {
-        return resetDeferred || !resetQueue.isEmpty() || resetBatchOpen || resetUnfinished;
+        return resetDeferred || !resetQueue.isEmpty() || resetBatchOpen
+            || resetFaultLine != ResetTrace.NONE;
     }
 
 
@@ -1542,7 +1561,7 @@ public final class KernelModule {
             return merged;
         }
         RequestItem item = mintItem(named);
-        if (carryOutOwningReset()) {
+        if (carryOutOwningReset(ResetAttempt.OUTSIDE_BATCH, item)) {
             return publishRequest(named, item, "reset-at-safe-point", true, false);
         }
         if (!commitChainClosed()) {
@@ -1564,8 +1583,11 @@ public final class KernelModule {
         }
         synchronized (resetMailbox) {
             commitResetRequests++;
-            resetTrace = new ResetTrace(source, item == null ? ++resetRequestSequence : item.requestId(),
-                Thread.currentThread().threadId(), answeredBy, epoch, result);
+            long requestId = item == null ? ++resetRequestSequence : item.requestId();
+            if (theLineMayBeWrittenFor(requestId)) {
+                resetTrace = new ResetTrace(source, requestId, Thread.currentThread().threadId(),
+                    answeredBy, epoch, result);
+            }
         }
         return new ResetRequest(carriedOut, source, handedOff, result);
     }
@@ -1632,13 +1654,8 @@ public final class KernelModule {
         }
     }
 
-    /** Writes one answer into the trace of the item it belongs to while that trace is still its own. */
+    /** Writes one answer into the line of the item it belongs to, while that line is still its own. */
     private void noteResetAnswered(RequestItem item, String result) {
-        noteResetAnswered(item, result, false);
-    }
-
-    /** An item a reset threw on is answered even where a newer request holds the line. */
-    private void noteResetAnswered(RequestItem item, String result, boolean force) {
         long thread = Thread.currentThread().threadId();
         CommitController controller = this.commitController;
         long epoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
@@ -1651,7 +1668,7 @@ public final class KernelModule {
                 }
                 return;
             }
-            if (!force && resetTrace.requestId() != item.requestId() && !traceHoldsAFault()) {
+            if (!theLineMayBeWrittenFor(item.requestId())) {
                 return;
             }
             resetTrace = new ResetTrace(item.source(), item.requestId(), item.arrivalThreadId(), thread,
@@ -1662,6 +1679,12 @@ public final class KernelModule {
     /** Whether the line the trace holds is a fault instead of a request's answer. */
     private boolean traceHoldsAFault() {
         return resetTrace.result().startsWith(RESET_FAULTED);
+    }
+
+    /** Whether the mailbox may write a line for {@code requestId}: never back to a request that arrived
+     * before the one it names; a line holding a fault is no item's line. Under the mailbox lock. */
+    private boolean theLineMayBeWrittenFor(long requestId) {
+        return requestId >= resetTrace.requestId() || traceHoldsAFault();
     }
 
     /** Answers what the queue of the owner holds, at a safe point and nowhere else. One call carries
@@ -1691,7 +1714,7 @@ public final class KernelModule {
         RequestItem deferred;
         boolean deferredOwed;
         synchronized (resetMailbox) {
-            if (resetBatchOpen || resetUnfinished) {
+            if (resetBatchOpen || resetFaultLine != ResetTrace.NONE) {
                 return new SafePoint(0, resetQueue.size(), resetQueue.size(), false);
             }
             commitSafePointCalls++;
@@ -1716,7 +1739,7 @@ public final class KernelModule {
         List<RequestItem> retry = new ArrayList<>();
         try {
             if (deferredOwed) {
-                if (carryOutOwningReset()) {
+                if (carryOutOwningReset(ResetAttempt.BATCH_ITEM, deferred)) {
                     carried++;
                     noteResetAnswered(deferred, "reset-at-safe-point");
                 } else if (commitChainClosed()) {
@@ -1730,7 +1753,7 @@ public final class KernelModule {
             }
             for (RequestItem item : batch) {
                 attempted++;
-                if (carryOutOwningReset()) {
+                if (carryOutOwningReset(ResetAttempt.BATCH_ITEM, item)) {
                     carried++;
                     noteResetAnswered(item, "reset-at-safe-point");
                     continue;
@@ -1745,11 +1768,7 @@ public final class KernelModule {
                 retry.add(item);
             }
         } catch (Throwable failure) {
-            // A reset that threw has already entered the chain: the item is answered with its fault and
-            // never retried, and the mailbox is left unfinished. A fatal Error is marked and handed on.
-            noteResetAnswered(attempted == 0 ? deferred : batch.get(attempted - 1), resetFault(failure),
-                true);
-            latchUnfinishedReset();
+            // The gate answered the faulty item; a fatal Error is handed on, a RuntimeException is settled here.
             if (failure instanceof Error fatal) {
                 throw fatal;
             }
@@ -1766,6 +1785,9 @@ public final class KernelModule {
                 if (stillOwed && !resetDeferred) {
                     resetDeferred = true;
                     resetDeferredItem = deferred;
+                } else if (stillOwed) {
+                    // The deferred place was taken from inside the batch: the older item keeps its own place.
+                    retry.add(0, deferred);
                 }
                 if (closed) {
                     resetMailboxClosed = true;
@@ -1781,10 +1803,19 @@ public final class KernelModule {
         return RESET_FAULTED + ":" + failure.getClass().getSimpleName();
     }
 
-    /** Leaves the mailbox unfinished; only binding or giving back a chain clears it. */
-    private void latchUnfinishedReset() {
+    /** Holds one reset that threw until that chain is given back, in the line it is answered with. */
+    private void holdResetFault(RequestItem item, Throwable failure) {
+        long thread = Thread.currentThread().threadId();
+        CommitController controller = this.commitController;
+        long epoch = controller == null ? NO_CARRIED_EPOCH : controller.epoch();
         synchronized (resetMailbox) {
-            resetUnfinished = true;
+            ResetTrace line = item == null
+                ? new ResetTrace("", resetTrace.requestId(), thread, thread, epoch,
+                    resetFault(failure))
+                : new ResetTrace(item.source(), item.requestId(), item.arrivalThreadId(), thread, epoch,
+                    resetFault(failure));
+            resetTrace = line;
+            resetFaultLine = line;
         }
     }
 
@@ -1811,11 +1842,11 @@ public final class KernelModule {
             }
         }
         if (deferredOwed) {
-            carryOutOwningReset();
+            carryOutOwningReset(ResetAttempt.OUTSIDE_BATCH, deferred);
             noteResetAnswered(deferred, "lifecycle-closed");
         }
         for (RequestItem item : batch) {
-            carryOutOwningReset();
+            carryOutOwningReset(ResetAttempt.OUTSIDE_BATCH, item);
             noteResetAnswered(item, "lifecycle-closed");
         }
     }
@@ -2197,10 +2228,16 @@ public final class KernelModule {
         return commitOwnerThreadId;
     }
 
+    /** The line the readout holds now: the fault while one is owed, the newest request otherwise. */
+    private ResetTrace heldTrace() {
+        ResetTrace fault = resetFaultLine;
+        return fault == ResetTrace.NONE ? resetTrace : fault;
+    }
+
     /** What the newest request for a whole reset reads back as: where it came from, the thread that made
      * it, the thread that answered it, the generation it carried, and what came of it. */
     public String commitResetTrace() {
-        ResetTrace trace = resetTrace;
+        ResetTrace trace = heldTrace();
         String answeredBy = trace.answeredByThreadId() == 0L ? "-"
             : Long.toString(trace.answeredByThreadId());
         String epoch = trace.carriedEpoch() == NO_CARRIED_EPOCH ? "none"
@@ -2212,7 +2249,7 @@ public final class KernelModule {
 
     /** Whether the newest request was made on one thread and answered on another. */
     public boolean commitResetCrossedThreads() {
-        ResetTrace trace = resetTrace;
+        ResetTrace trace = heldTrace();
         return trace.requestThreadId() != 0L && trace.answeredByThreadId() != 0L
             && trace.requestThreadId() != trace.answeredByThreadId();
     }
@@ -2398,11 +2435,15 @@ public final class KernelModule {
             commitBindingRefusal = refusal;
             return new CommitBinding(false, refusal, 0L, 0L);
         }
+        CommitController previous = this.commitController;
         this.commits = candidate;
         this.commitController = controller;
-        synchronized (resetMailbox) {
-            resetMailboxClosed = false;
-            resetUnfinished = false;
+        if (previous != controller) {
+            // An unfinished reset ends when its chain is taken off or another takes its place, not by reinstalling it.
+            synchronized (resetMailbox) {
+                resetMailboxClosed = false;
+                resetFaultLine = ResetTrace.NONE;
+            }
         }
         declarationGeneration++;
         declarationHistory.retire();
@@ -2493,7 +2534,7 @@ public final class KernelModule {
         this.commits = ownCommits;
         synchronized (resetMailbox) {
             resetMailboxClosed = false;
-            resetUnfinished = false;
+            resetFaultLine = ResetTrace.NONE;
         }
         declarationGeneration++;
         declarationHistory.retire();
@@ -2593,7 +2634,7 @@ public final class KernelModule {
 
     /** Where the newest reset request came from, or an empty string while none was made. */
     public String commitResetSource() {
-        return resetTrace.source();
+        return heldTrace().source();
     }
 
     /** How often the host asked this module to adopt a chain, one call per tick boundary. */
@@ -2645,10 +2686,10 @@ public final class KernelModule {
     /** Clears the live counters. Where a commit controller is bound, its owner safe point decides
      * first: while a publish action or a publishing line is in flight, or while an item whose side
      * effect ran still waits for its terminal line, the whole reset is refused, nothing is cleared and
-     * no generation advances. The request is a request for the whole reset and is never carried out
-     * anywhere but in {@link #carryOutOwningReset()}. */
+     * no generation advances. This entry is a request for the whole reset, and it carries it out
+     * nowhere but at the one gate {@link #carryOutOwningReset}. */
     public void resetReadings() {
-        if (carryOutOwningReset()) {
+        if (carryOutOwningReset(ResetAttempt.OUTSIDE_BATCH, null)) {
             noteResetAnswered(null, "reset-at-safe-point");
             return;
         }
