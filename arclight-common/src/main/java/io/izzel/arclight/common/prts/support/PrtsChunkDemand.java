@@ -3,7 +3,8 @@ package io.izzel.arclight.common.prts.support;
 
 /** The seam the chunk cache reports its demand side through: what was asked of it, what the ask was
  * answered with, and the futures it handed out. The calls are not changed and nothing is cancelled,
- * delayed or reordered; every call is a no-op while no tap is installed. */
+ * delayed or reordered; every call is a no-op while no tap is installed. A tap that has no use for
+ * the chunk implements the entries that do not name it, and is told about each ask once. */
 public final class PrtsChunkDemand {
 
     public interface DemandTap {
@@ -11,11 +12,24 @@ public final class PrtsChunkDemand {
         /** One ask entered the cache. @param blocking whether the caller waits for the answer */
         void demandStarted(String worldId, String status, boolean blocking);
 
+        /** One ask entered the cache, with the chunk it named; the default keeps the old count. */
+        default void demandStarted(String worldId, int chunkX, int chunkZ, String status,
+                                   boolean requireChunk) {
+            demandStarted(worldId, status, requireChunk);
+        }
+
         /** The ask returned. @param satisfied whether it carried a chunk at the wanted status */
         void demandFinished(String worldId, String status, boolean blocking, boolean satisfied);
 
         /** A future-returning ask entered the cache. */
         void futureOpened(String worldId, String status);
+
+        /** A future-returning ask entered the cache, with the chunk it named; the default keeps the
+         * old count. */
+        default void demandDescriptor(String worldId, int chunkX, int chunkZ, String status,
+                                      boolean requireChunk) {
+            futureOpened(worldId, status);
+        }
 
         /** @return the stamp the matching open left, or -1 when there is none */
         long futureOpenedAt();
@@ -51,6 +65,19 @@ public final class PrtsChunkDemand {
         }
     }
 
+    public static void demandStarted(String worldId, int chunkX, int chunkZ, String status,
+                                     boolean requireChunk) {
+        DemandTap watcher = tap;
+        if (watcher == null) {
+            return;
+        }
+        try {
+            watcher.demandStarted(worldId, chunkX, chunkZ, status, requireChunk);
+        } catch (Throwable ignored) {
+            // A watcher that throws is not the ask failing: the count is dropped, the ask goes on.
+        }
+    }
+
     public static void demandFinished(String worldId, String status, boolean blocking,
                                       boolean satisfied) {
         DemandTap watcher = tap;
@@ -63,6 +90,19 @@ public final class PrtsChunkDemand {
         DemandTap watcher = tap;
         if (watcher != null) {
             watcher.futureOpened(worldId, status);
+        }
+    }
+
+    public static void demandDescriptor(String worldId, int chunkX, int chunkZ, String status,
+                                        boolean requireChunk) {
+        DemandTap watcher = tap;
+        if (watcher == null) {
+            return;
+        }
+        try {
+            watcher.demandDescriptor(worldId, chunkX, chunkZ, status, requireChunk);
+        } catch (Throwable ignored) {
+            // A watcher that throws is not the ask failing: the count is dropped, the ask goes on.
         }
     }
 

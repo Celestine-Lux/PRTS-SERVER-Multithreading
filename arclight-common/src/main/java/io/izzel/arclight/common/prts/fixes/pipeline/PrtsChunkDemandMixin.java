@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Counts the demand side of the chunk cache: what was asked of it, whether the ask was satisfied,
- * and the futures it handed out with the moment each one completes. No ask is cancelled, delayed or
- * reordered; every count is read only while the demand tap is installed. */
+/* Counts the demand side of the chunk cache: which chunk was asked for, whether the ask was
+ * satisfied, and the futures it handed out with the moment each one completes. No ask is cancelled,
+ * delayed or reordered; every count is read only while the demand tap is installed. */
 package io.izzel.arclight.common.prts.fixes.pipeline;
 
 import io.izzel.arclight.api.ArclightPlatform;
@@ -22,7 +22,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.util.concurrent.CompletableFuture;
 
 /** The two entries of the cache that answer a chunk request: the synchronous ask and the future. The
- * world comes from the cache's own level field, so a count can never be booked to the wrong one. */
+ * world comes from the cache's own level field, so a count can never be booked to the wrong one, and
+ * the chunk each ask named is handed on with it: both coordinates are parameters the cache itself
+ * turns into the chunk position it schedules, so the report needs no second lookup of the world. */
 @OnlyInPlatform(ArclightPlatform.NEOFORGE)
 @Mixin(ServerChunkCache.class)
 public abstract class PrtsChunkDemandMixin {
@@ -39,7 +41,7 @@ public abstract class PrtsChunkDemandMixin {
     private void prts$demandOpened(int x, int z, ChunkStatus status, boolean blocking,
                                    CallbackInfoReturnable<ChunkAccess> cir) {
         if (PrtsChunkDemand.installed()) {
-            PrtsChunkDemand.demandStarted(prts$worldId(), status.getName(), blocking);
+            PrtsChunkDemand.demandStarted(prts$worldId(), x, z, status.getName(), blocking);
         }
     }
 
@@ -58,7 +60,7 @@ public abstract class PrtsChunkDemandMixin {
     private void prts$futureOpened(int x, int z, ChunkStatus status, boolean load,
                                    CallbackInfoReturnable<CompletableFuture<ChunkResult<ChunkAccess>>> cir) {
         if (PrtsChunkDemand.installed()) {
-            PrtsChunkDemand.futureOpened(prts$worldId(), status.getName());
+            PrtsChunkDemand.demandDescriptor(prts$worldId(), x, z, status.getName(), load);
         }
     }
 
