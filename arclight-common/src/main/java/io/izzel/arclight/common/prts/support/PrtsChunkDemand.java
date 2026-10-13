@@ -4,7 +4,8 @@ package io.izzel.arclight.common.prts.support;
 /** The seam the chunk cache reports its demand side through: what was asked of it, what the ask was
  * answered with, and the futures it handed out. The calls are not changed and nothing is cancelled,
  * delayed or reordered; every call is a no-op while no tap is installed. A tap that has no use for
- * the chunk implements the entries that do not name it, and is told about each ask once. */
+ * the chunk implements the entries that do not name it, and is told about each ask once. A tap
+ * that throws is not the ask failing: the count is dropped and the host path is left alone. */
 public final class PrtsChunkDemand {
 
     public interface DemandTap {
@@ -81,15 +82,23 @@ public final class PrtsChunkDemand {
     public static void demandFinished(String worldId, String status, boolean blocking,
                                       boolean satisfied) {
         DemandTap watcher = tap;
-        if (watcher != null) {
+        if (watcher == null) {
+            return;
+        }
+        try {
             watcher.demandFinished(worldId, status, blocking, satisfied);
+        } catch (Throwable ignored) {
         }
     }
 
     public static void futureOpened(String worldId, String status) {
         DemandTap watcher = tap;
-        if (watcher != null) {
+        if (watcher == null) {
+            return;
+        }
+        try {
             watcher.futureOpened(worldId, status);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -113,16 +122,24 @@ public final class PrtsChunkDemand {
 
     public static void futureTaken(String worldId, String status) {
         DemandTap watcher = tap;
-        if (watcher != null) {
+        if (watcher == null) {
+            return;
+        }
+        try {
             watcher.futureTaken(worldId, status);
+        } catch (Throwable ignored) {
         }
     }
 
     public static void futureCompleted(String worldId, String status, long startedNanos,
                                        boolean satisfied) {
         DemandTap watcher = tap;
-        if (watcher != null) {
+        if (watcher == null) {
+            return;
+        }
+        try {
             watcher.futureCompleted(worldId, status, startedNanos, satisfied);
+        } catch (Throwable ignored) {
         }
     }
 }
