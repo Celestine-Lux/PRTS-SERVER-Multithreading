@@ -1,0 +1,72 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+package io.izzel.arclight.common.prts.kernel.commit;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** The one source of the instance numbers a freeze seals: every declaration carrying its artefact is
+ * given a positive number in the order the frozen plan committed its nodes, no number is handed out
+ * twice, and the counter only moves forward - a rebuilt plan, a new generation and a refused seal
+ * leave the numbers they took spent. A number is not an identity across runs; what identifies a line
+ * is the mapping its own declaration sealed. The freeze point holds this source and hands it out to
+ * no one, so a caller cannot fill the instance column of the declaration it sends in. */
+public final class DeclarationInstanceAllocator {
+
+    private long minted;
+
+    /** Copies the declarations with the next numbers of this source, joined to the places the plan
+     * gave them. A declaration the plan gave no place, or one that carries no artefact, is copied
+     * unchanged: a freeze with nothing to number mints nothing and spends nothing. */
+    public List<FrozenDeclarations.Candidate> mint(List<FrozenDeclarations.Candidate> candidates,
+                                                   List<FrozenDeclarations.Assignment> places) {
+        List<FrozenDeclarations.Candidate> declared = candidates == null ? List.of() : candidates;
+        if (declared.isEmpty()) {
+            return List.of();
+        }
+        Map<FrozenDeclarations.NodeKey, Integer> at = new LinkedHashMap<>();
+        for (int index = 0; index < declared.size(); index++) {
+            FrozenDeclarations.Candidate candidate = declared.get(index);
+            if (candidate != null) {
+                at.putIfAbsent(nodeOf(candidate), index);
+            }
+        }
+        long[] numbers = new long[declared.size()];
+        List<FrozenDeclarations.Assignment> ordered = places == null ? List.of() : places;
+        for (FrozenDeclarations.Assignment place : ordered) {
+            if (place == null) {
+                continue;
+            }
+            Integer index = at.get(new FrozenDeclarations.NodeKey(place.worldId(), place.domainId(),
+                place.nodeKey()));
+            if (index == null) {
+                continue;
+            }
+            FrozenDeclarations.Candidate candidate = declared.get(index);
+            if (numbers[index] != 0L || !candidate.artefactDeclared()) {
+                continue;
+            }
+            numbers[index] = ++minted;
+        }
+        List<FrozenDeclarations.Candidate> numbered = new ArrayList<>(declared.size());
+        for (int index = 0; index < declared.size(); index++) {
+            FrozenDeclarations.Candidate candidate = declared.get(index);
+            long number = candidate == null ? 0L : numbers[index];
+            numbered.add(number == 0L ? candidate : withInstance(candidate, number));
+        }
+        return numbered;
+    }
+
+    private static FrozenDeclarations.Candidate withInstance(FrozenDeclarations.Candidate candidate,
+                                                             long number) {
+        return new FrozenDeclarations.Candidate(candidate.worldId(), candidate.domainId(),
+            candidate.nodeKey(), candidate.chunk(), candidate.targetStatus(), number,
+            candidate.worldEpoch());
+    }
+
+    private static FrozenDeclarations.NodeKey nodeOf(FrozenDeclarations.Candidate candidate) {
+        return new FrozenDeclarations.NodeKey(candidate.worldId(), candidate.domainId(),
+            candidate.nodeKey());
+    }
+}

@@ -17,6 +17,7 @@ import io.izzel.arclight.common.prts.kernel.commit.CommitNamespaces;
 import io.izzel.arclight.common.prts.kernel.commit.CommitReservation;
 import io.izzel.arclight.common.prts.kernel.commit.CommitRing;
 import io.izzel.arclight.common.prts.kernel.commit.CommitTicket;
+import io.izzel.arclight.common.prts.kernel.commit.DeclarationInstanceAllocator;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.commit.IdentityWitness;
@@ -254,6 +255,9 @@ public final class KernelModule {
      * snapshots. */
     private final FrozenDeclarations.History declarationHistory =
         new FrozenDeclarations.History(KernelSettings.planHistoryCap());
+    /** The one source of the instance numbers a freeze seals: held here and handed to no one. */
+    private final DeclarationInstanceAllocator declarationInstances =
+        new DeclarationInstanceAllocator();
     private long declarationGeneration;
     private String declarationRefusal = "";
     private long declarationRefusals;
@@ -804,7 +808,7 @@ public final class KernelModule {
                 step.nodeKey(), step.position()));
         }
         FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(live.next(), plan.planSequence(),
-            pipelineJobs.candidateDeclarations(), places);
+            declarationInstances.mint(pipelineJobs.candidateDeclarations(), places), places);
         if (!sealed.sealed()) {
             declarationRefusal = sealed.refusal();
             declarationRefusals++;
