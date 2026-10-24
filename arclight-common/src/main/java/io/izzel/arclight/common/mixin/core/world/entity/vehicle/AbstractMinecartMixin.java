@@ -1,6 +1,7 @@
 package io.izzel.arclight.common.mixin.core.world.entity.vehicle;
 
 import io.izzel.arclight.common.bridge.core.entity.EntityBridge;
+import io.izzel.arclight.common.bridge.inject.InjectLevelBridge;
 import io.izzel.arclight.common.bridge.core.world.entity.vehicle.AbstractMinecartBridge;
 import io.izzel.arclight.mixin.Decorate;
 import io.izzel.arclight.mixin.DecorationOps;
@@ -77,7 +78,11 @@ public abstract class AbstractMinecartMixin extends VehicleEntityMixin implement
 
     @Inject(method = "tick", at = @At(value = "INVOKE", shift = At.Shift.AFTER, target = "Lnet/minecraft/world/entity/vehicle/AbstractMinecart;setRot(FF)V"))
     private void arclight$vehicleUpdateEvent(CallbackInfo ci) {
-        org.bukkit.World bworld = this.level().bridge$getWorld();
+        org.bukkit.World bworld = ((InjectLevelBridge) this.level()).bridge$getWorldOrNull();
+        // No Bukkit world can host the vehicle events, so the tick still runs.
+        if (bworld == null) {
+            return;
+        }
         Location to = new Location(bworld, this.getX(), this.getY(), this.getZ(), this.getYRot(), this.getXRot());
         Vehicle vehicle = (Vehicle) this.getBukkitEntity();
         Bukkit.getPluginManager().callEvent(new VehicleUpdateEvent(vehicle));

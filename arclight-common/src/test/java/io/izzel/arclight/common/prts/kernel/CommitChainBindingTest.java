@@ -10,12 +10,15 @@ import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.config.ExecutableProductFace;
 import io.izzel.arclight.common.prts.kernel.observe.KernelReadings;
+import net.minecraft.world.level.ChunkPos;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -140,16 +143,19 @@ class CommitChainBindingTest {
         KernelModule module = KernelModule.instance();
         Chain c = new Chain(module.commitOrderSource());
 
-        assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state(),
-            "the plan of this tick declared no artefact, so no entry was sealed");
-        assertEquals(0, module.declarations().size(), "and an empty plan is not read as a table");
-        assertEquals(0L, module.declarationSnapshotsRetired(), "there was nothing to keep");
-        assertEquals(0L, module.declarationSnapshotsWithheld(), "and nothing was owed");
+        // The holder is one for the whole process, so the first boundary of this case ends whatever
+        // freeze a case before it left standing: what is read below is this case's own state.
         long generation = module.declarationGeneration();
-
         module.resetReadings();
         assertEquals(generation + 1L, module.declarationGeneration(),
             "reading a reset takes the holder one generation on");
+        assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state(),
+            "the plan of this tick declared no artefact, so no entry was sealed");
+        assertEquals(0, module.declarations().size(), "and an empty plan is not read as a table");
+        int retained = module.declarationSnapshotsRetained();
+        long retired = module.declarationSnapshotsRetired();
+        long withheld = module.declarationSnapshotsWithheld();
+
         assertTrue(module.installCommitChain(c.log, c.controller).bound());
         assertEquals(generation + 2L, module.declarationGeneration(), "so does an install");
         assertTrue(module.rollbackCommitChain());
@@ -158,8 +164,13 @@ class CommitChainBindingTest {
             "no boundary makes a table out of a plan that carried no artefact");
         assertEquals(generation + 3L, module.declarationGeneration(),
             "and none of them hands a number back");
-        assertEquals("0", reading("product.commit.declaration_snapshots_withheld"),
-            "the retention owed nothing, so nothing was withheld");
+        // Neither of the two boundaries replaced a freeze that carried an entry, so the retention had
+        // no table to keep: the counters are read across the boundaries, never taken for zero.
+        assertEquals(retained, module.declarationSnapshotsRetained(), "no snapshot was kept");
+        assertEquals(retired, module.declarationSnapshotsRetired(), "none was retired");
+        assertEquals(withheld, module.declarationSnapshotsWithheld(), "and nothing was owed");
+        assertEquals(String.valueOf(withheld), reading("product.commit.declaration_snapshots_withheld"),
+            "the reading is the counter this case did not move");
     }
 
     @Test
@@ -305,5 +316,41 @@ class CommitChainBindingTest {
         assertEquals("already-bound", again.refusal());
         assertSame(first.log, module.commits(), "the chain that was taken stays the one it took");
         assertSame(first.controller, module.commitController());
+    }
+
+    private static FrozenDeclarations.Candidate declared(String worldId, String domainId,
+                                                         String nodeKey,
+                                                         FrozenDeclarations.DeclaredChunk chunk) {
+        return new FrozenDeclarations.Candidate(worldId, domainId, nodeKey, chunk, "published", 1L, 7L);
+    }
+
+    /** Two nodes whose three names concatenate to one text stay two nodes: the names are compared as
+     * themselves, so one domain is never read out of another's namespace and the seal is not refused
+     * as a duplicate of a node it never carried. */
+    @Test
+    void twoNodesOfOneSplicedTextStayTwoNodes() {
+        FrozenDeclarations.FreezeKey freeze = new FrozenDeclarations.FreezeKey("lifecycle-a", 3L);
+        FrozenDeclarations.DeclaredChunk chunk =
+            new FrozenDeclarations.DeclaredChunk(ChunkPos.asLong(3, -7));
+        List<FrozenDeclarations.Candidate> candidates = List.of(
+            declared("a/b", "c", "k", chunk),
+            declared("a", "b/c", "k", chunk),
+            declared("w", "d1", "k", chunk),
+            declared("w", "d2", "k", chunk));
+        List<FrozenDeclarations.Assignment> places = List.of(
+            new FrozenDeclarations.Assignment("a/b", "c", "k", 0),
+            new FrozenDeclarations.Assignment("a", "b/c", "k", 1),
+            new FrozenDeclarations.Assignment("w", "d1", "k", 2),
+            new FrozenDeclarations.Assignment("w", "d2", "k", 3));
+
+        FrozenDeclarations.Sealed sealed = FrozenDeclarations.seal(freeze, 7L, candidates, places);
+
+        assertTrue(sealed.sealed(), "the seal holds: " + sealed.refusal());
+        assertEquals(4, sealed.declarations().size(), "four nodes and no collision between them");
+        Set<String> nodes = new TreeSet<>();
+        for (FrozenDeclarations.Entry entry : sealed.declarations().entries()) {
+            nodes.add(entry.seat().worldId() + "|" + entry.seat().domainId() + "|" + entry.nodeKey());
+        }
+        assertEquals(4, nodes.size(), "each of the four is its own node: " + nodes);
     }
 }

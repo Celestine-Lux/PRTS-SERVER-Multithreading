@@ -1,6 +1,7 @@
 package io.izzel.arclight.common.mixin.core.world.entity.vehicle;
 
 import io.izzel.arclight.common.bridge.core.entity.EntityBridge;
+import io.izzel.arclight.common.bridge.inject.InjectLevelBridge;
 import io.izzel.arclight.mixin.Decorate;
 import io.izzel.arclight.mixin.DecorationOps;
 import net.minecraft.world.entity.Entity;
@@ -40,7 +41,11 @@ public abstract class BoatMixin extends VehicleEntityMixin {
 
     @Inject(method = "tick", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/entity/vehicle/Boat;tickBubbleColumn()V"))
     private void arclight$updateVehicle(CallbackInfo ci) {
-        final org.bukkit.World bworld = this.level().bridge$getWorld();
+        final org.bukkit.World bworld = ((InjectLevelBridge) this.level()).bridge$getWorldOrNull();
+        // No Bukkit world can host the vehicle events, so the tick still runs.
+        if (bworld == null) {
+            return;
+        }
         final Location to = new Location(bworld, this.getX(), this.getY(), this.getZ(), this.getYRot(), this.getXRot());
         final Vehicle vehicle = (Vehicle) this.getBukkitEntity();
         Bukkit.getPluginManager().callEvent(new VehicleUpdateEvent(vehicle));

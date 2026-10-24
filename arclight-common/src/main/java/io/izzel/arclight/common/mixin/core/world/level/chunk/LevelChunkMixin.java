@@ -1,5 +1,6 @@
 package io.izzel.arclight.common.mixin.core.world.level.chunk;
 
+import io.izzel.arclight.common.mod.util.ChunkHookCompat;
 import io.izzel.arclight.common.bridge.core.world.level.LevelAccessorBridge;
 import io.izzel.arclight.common.bridge.core.world.level.WorldBridge;
 import io.izzel.arclight.common.bridge.core.world.chunk.ChunkAccessBridge;
@@ -121,45 +122,54 @@ public abstract class LevelChunkMixin extends ChunkAccessMixin implements LevelC
 
     public void loadCallback() {
         org.bukkit.Server server = Bukkit.getServer();
-        if (server != null) {
-            /*
-             * If it's a new world, the first few chunks are generated inside
-             * the World constructor. We can't reliably alter that, so we have
-             * no way of creating a CraftWorld/CraftServer at that point.
-             */
+        if (server == null) {
+            return;
+        }
+        org.bukkit.World world = ((io.izzel.arclight.common.bridge.inject.InjectLevelBridge) this.level).bridge$getWorldOrNull();
+        if (!ChunkHookCompat.runChunkEventHook(world, "load", () -> this.arclight$loadChunkEvents(world))) {
+            return;
+        }
+    }
 
-            var bukkitChunk = new CraftChunk((LevelChunk) (Object) this);
-            server.getPluginManager().callEvent(new ChunkLoadEvent(bukkitChunk, this.needsDecoration));
+    private void arclight$loadChunkEvents(org.bukkit.World world) {
+        var bukkitChunk = new CraftChunk((LevelChunk) (Object) this);
+        Bukkit.getServer().getPluginManager().callEvent(new ChunkLoadEvent(bukkitChunk, this.needsDecoration));
 
-            if (this.needsDecoration) {
-                this.needsDecoration = false;
-                java.util.Random random = new java.util.Random();
-                random.setSeed(((ServerLevel) level).getSeed());
-                long xRand = random.nextLong() / 2L * 2L + 1L;
-                long zRand = random.nextLong() / 2L * 2L + 1L;
-                random.setSeed((long) this.chunkPos.x * xRand + (long) this.chunkPos.z * zRand ^ ((ServerLevel) level).getSeed());
+        if (this.needsDecoration) {
+            this.needsDecoration = false;
+            java.util.Random random = new java.util.Random();
+            random.setSeed(((ServerLevel) level).getSeed());
+            long xRand = random.nextLong() / 2L * 2L + 1L;
+            long zRand = random.nextLong() / 2L * 2L + 1L;
+            random.setSeed((long) this.chunkPos.x * xRand + (long) this.chunkPos.z * zRand ^ ((ServerLevel) level).getSeed());
 
-                org.bukkit.World world = ((WorldBridge) this.level).bridge$getWorld();
-                if (world != null) {
-                    ((WorldBridge) this.level).bridge$setPopulating(true);
-                    try {
-                        for (org.bukkit.generator.BlockPopulator populator : world.getPopulators()) {
-                            populator.populate(world, random, bukkitChunk);
-                        }
-                    } finally {
-                        ((WorldBridge) this.level).bridge$setPopulating(false);
-                    }
+            ((WorldBridge) this.level).bridge$setPopulating(true);
+            try {
+                for (org.bukkit.generator.BlockPopulator populator : world.getPopulators()) {
+                    populator.populate(world, random, bukkitChunk);
                 }
-                server.getPluginManager().callEvent(new org.bukkit.event.world.ChunkPopulateEvent(bukkitChunk));
+            } finally {
+                ((WorldBridge) this.level).bridge$setPopulating(false);
             }
+            Bukkit.getServer().getPluginManager().callEvent(new org.bukkit.event.world.ChunkPopulateEvent(bukkitChunk));
         }
     }
 
     public void unloadCallback() {
         org.bukkit.Server server = Bukkit.getServer();
+        if (server == null) {
+            return;
+        }
+        org.bukkit.World world = ((io.izzel.arclight.common.bridge.inject.InjectLevelBridge) this.level).bridge$getWorldOrNull();
+        if (!ChunkHookCompat.runChunkEventHook(world, "unload", this::arclight$unloadChunkEvents)) {
+            return;
+        }
+    }
+
+    private void arclight$unloadChunkEvents() {
         var bukkitChunk = new CraftChunk((LevelChunk) (Object) this);
         org.bukkit.event.world.ChunkUnloadEvent unloadEvent = new org.bukkit.event.world.ChunkUnloadEvent(bukkitChunk, this.isUnsaved());
-        server.getPluginManager().callEvent(unloadEvent);
+        Bukkit.getServer().getPluginManager().callEvent(unloadEvent);
         // note: saving can be prevented, but not forced if no saving is actually required
         this.mustNotSave = !unloadEvent.isSaveChunk();
     }

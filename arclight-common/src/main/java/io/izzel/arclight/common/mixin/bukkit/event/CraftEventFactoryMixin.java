@@ -5,6 +5,7 @@ import io.izzel.arclight.common.bridge.core.world.entity.LivingEntityBridge;
 import io.izzel.arclight.common.bridge.core.server.level.ServerPlayerBridge;
 import io.izzel.arclight.common.bridge.core.world.damagesource.DamageSourceBridge;
 import io.izzel.arclight.common.bridge.core.world.level.WorldBridge;
+import io.izzel.arclight.common.bridge.inject.InjectLevelBridge;
 import io.izzel.arclight.common.mod.server.event.ArclightEventFactory;
 import io.izzel.arclight.common.mod.util.ArclightCaptures;
 import io.izzel.arclight.common.mod.util.DistValidate;
@@ -156,7 +157,13 @@ public abstract class CraftEventFactoryMixin {
             world.setBlock(pos, newData, flag);
             return true;
         }
-        Block block = world.bridge$getWorld().getBlockAt(pos.getX(), pos.getY(), pos.getZ());
+        org.bukkit.World bukkitWorld = ((InjectLevelBridge) world).bridge$getWorldOrNull();
+        // No Bukkit world can host the grow event, so the block is still placed.
+        if (bukkitWorld == null) {
+            world.setBlock(pos, newData, flag);
+            return true;
+        }
+        Block block = bukkitWorld.getBlockAt(pos.getX(), pos.getY(), pos.getZ());
         CraftBlockState state = (CraftBlockState) block.getState();
         state.setData(newData);
 
@@ -214,6 +221,14 @@ public abstract class CraftEventFactoryMixin {
      */
     @Overwrite
     public static BlockPhysicsEvent callBlockPhysicsEvent(LevelAccessor world, BlockPos blockposition) {
+        if (world instanceof Level level) {
+            Object bukkitWorld = ((io.izzel.arclight.common.bridge.inject.InjectLevelBridge) level)
+                .bridge$getWorldOrNull();
+            if (io.izzel.arclight.common.mod.util.ChunkHookCompat.shouldSkip(bukkitWorld)) {
+                io.izzel.arclight.common.mod.util.ChunkHookCompat.markAndLog("block-physics");
+                return null;
+            }
+        }
         org.bukkit.block.Block block = CraftBlock.at(world, blockposition);
         BlockPhysicsEvent event = new BlockPhysicsEvent(block, block.getBlockData());
         // Suppress during worldgen

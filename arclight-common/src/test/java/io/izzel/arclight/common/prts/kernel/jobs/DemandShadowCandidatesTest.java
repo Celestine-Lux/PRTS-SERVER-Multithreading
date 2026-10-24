@@ -5,7 +5,10 @@ import io.izzel.arclight.common.prts.config.PrtsConfigManager;
 import io.izzel.arclight.common.prts.kernel.KernelModule;
 import io.izzel.arclight.common.prts.kernel.commit.CommitLog;
 import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
+import io.izzel.arclight.common.prts.kernel.config.KernelSettings;
 import io.izzel.arclight.common.prts.kernel.observe.KernelReadings;
+import io.izzel.arclight.common.prts.kernel.plan.TickPlan;
+import io.izzel.arclight.common.prts.kernel.shares.ShareClass;
 import io.izzel.arclight.common.prts.support.PrtsChunkDemand;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
@@ -16,13 +19,16 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.RecordComponent;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
@@ -41,7 +47,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * What one freeze reads out of the chunk demands of its own window: the columns of a candidate are
  * the parameters of the call that asked for the chunk and the freeze that read it, a chunk is judged
  * as the object it is, an operation seen to be done before the freeze is refused, and a window that
- * is complete is still not sealed - a build without an execution witness has no table to put it in.
+ * is complete is still not executable: the freeze that read it declares what the capture carries and
+ * seals it, and no run of it is witnessed.
  *
  * <p>The tap is installed here as a fixture: in a build the demand observer owns the seam, and no
  * production entry installs this reader, so nothing in this class is a reading of a running server.
@@ -50,6 +57,9 @@ class DemandShadowCandidatesTest {
 
     private static final String WORLD = "minecraft:overworld";
     private static final String OTHER_WORLD = "minecraft:the_nether";
+    private static final String MAILBOX = "worldgen";
+    private static final String MAILBOX2 = "worldgen2";
+    private static final String MAILBOX3 = "worldgen3";
     private static final String STATUS = "full";
     private static final long EPOCH = 11L;
     private static final FrozenDeclarations.FreezeKey KEY =
@@ -355,18 +365,184 @@ class DemandShadowCandidatesTest {
         }
 
         assertEquals(new TreeSet<>(List.of("[L" + DemandShadowCandidates.class.getName() + "$Slot;",
-            "boolean", "int", "long", "java.lang.String", "java.util.List",
+            "boolean", "int", "long", "java.lang.Object", "java.util.List", "java.util.Map",
+            "java.util.function.Predicate", "java.lang.String",
             FrozenDeclarations.DeclaredChunk.class.getName(),
             FrozenDeclarations.FreezeKey.class.getName(),
             DemandShadowCandidates.DemandDescriptor.class.getName(),
             "[L" + DemandShadowCandidates.class.getName() + "$Slot;")), types,
-            "every column of a candidate and of the window it waits in, and nothing else: "
-                + types);
+            "every column of a candidate, an opaque task identity and the register map, and "
+                + "nothing else: " + types);
         for (String name : types) {
             assertFalse(name.startsWith("net.minecraft."), name + " is a platform type");
             assertFalse(name.startsWith("org.bukkit."), name + " is a platform type");
             assertFalse(name.startsWith("java.util.concurrent."), name + " is a task type");
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<PipelineBatchLedger.TrackedTask, Object> statusesOf(
+        DemandShadowCandidates candidates) throws ReflectiveOperationException {
+        Field field = DemandShadowCandidates.class.getDeclaredField("statuses");
+        field.setAccessible(true);
+        Map<PipelineBatchLedger.TrackedTask, Object> ordered = new LinkedHashMap<>();
+        field.set(candidates, ordered);
+        return ordered;
+    }
+
+    private static Object statusEntry(PipelineBatchLedger.TrackedTask task,
+                                      PipelineBatchLedger.BatchId batch, long token, String status)
+        throws ReflectiveOperationException {
+        Class<?> type = Class.forName(DemandShadowCandidates.class.getName() + "$StatusEntry");
+        var constructor = type.getDeclaredConstructor(PipelineBatchLedger.TrackedTask.class,
+            PipelineBatchLedger.BatchId.class, DemandShadowCandidates.TaskStamp.class, String.class);
+        constructor.setAccessible(true);
+        PipelineBatchLedger.TaskId id = task.id();
+        DemandShadowCandidates.TaskStamp stamp = new DemandShadowCandidates.TaskStamp(id.ordinal(),
+            id.worldId(), id.mailbox(), id.cell(), id.mintTick(), batch.freezeOrdinal(),
+            batch.planSequence(), token);
+        return constructor.newInstance(task, batch, stamp, status);
+    }
+
+    private static void remember(DemandShadowCandidates candidates,
+                                 PipelineBatchLedger.TrackedTask task, String status, long token)
+        throws ReflectiveOperationException {
+        var method = DemandShadowCandidates.class.getDeclaredMethod("rememberStatus", Object.class,
+            String.class, long.class);
+        method.setAccessible(true);
+        method.invoke(candidates, task, status, token);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void setState(PipelineBatchLedger.TrackedTask task,
+                                 PipelineBatchLedger.TaskState state) throws ReflectiveOperationException {
+        Field field = PipelineBatchLedger.TrackedTask.class.getDeclaredField("state");
+        field.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicReference<PipelineBatchLedger.TaskState>) field.get(task))
+            .set(state);
+    }
+
+    @Test
+    void aFullStatusRegisterEvictsTheUnretainedDoneEntry() throws Exception {
+        DemandShadowCandidates small = new DemandShadowCandidates(2);
+        PipelineBatchLedger ledger = new PipelineBatchLedger();
+        PipelineBatchLedger.TrackedTask retainedTask = ledger.mint(new Object(), WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.TrackedTask otherTask = ledger.mint(new Object(), WORLD, MAILBOX2, 2L, 2L);
+        PipelineBatchLedger.BatchId retainedBatch = ledger.freeze(WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.BatchId otherBatch = ledger.freeze(WORLD, MAILBOX2, 2L, 1L);
+        assertNotNull(retainedBatch);
+        assertNotNull(otherBatch);
+        setState(retainedTask, new PipelineBatchLedger.Done(retainedBatch));
+        setState(otherTask, new PipelineBatchLedger.Done(otherBatch));
+        small.retained(batch -> batch.equals(retainedBatch));
+        Map<PipelineBatchLedger.TrackedTask, Object> statuses = statusesOf(small);
+        statuses.put(retainedTask, statusEntry(retainedTask, retainedBatch, 1L, "full"));
+        statuses.put(otherTask, statusEntry(otherTask, otherBatch, 2L, "full"));
+
+        PipelineBatchLedger.TrackedTask newcomer = ledger.mint(new Object(), WORLD, MAILBOX3, 3L, 3L);
+        PipelineBatchLedger.BatchId newcomerBatch = ledger.freeze(WORLD, MAILBOX3, 3L, 1L);
+        assertNotNull(newcomerBatch);
+        setState(newcomer, new PipelineBatchLedger.Running(newcomerBatch));
+        remember(small, newcomer, "full", 3L);
+
+        assertEquals(2, statuses.size());
+        assertTrue(statuses.containsKey(retainedTask), "the retained status is not evicted");
+        assertFalse(statuses.containsKey(otherTask), "the unretained done status is evicted");
+        assertEquals(0L, small.retainedFallbackEvictions());
+    }
+
+    @Test
+    void aFullStatusRegisterEvictsTheUnretainedDoneEntryWhenItIsInsertedFirst() throws Exception {
+        DemandShadowCandidates small = new DemandShadowCandidates(2);
+        PipelineBatchLedger ledger = new PipelineBatchLedger();
+        PipelineBatchLedger.TrackedTask retainedTask = ledger.mint(new Object(), WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.TrackedTask otherTask = ledger.mint(new Object(), WORLD, MAILBOX2, 2L, 2L);
+        PipelineBatchLedger.BatchId retainedBatch = ledger.freeze(WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.BatchId otherBatch = ledger.freeze(WORLD, MAILBOX2, 2L, 1L);
+        assertNotNull(retainedBatch);
+        assertNotNull(otherBatch);
+        setState(retainedTask, new PipelineBatchLedger.Done(retainedBatch));
+        setState(otherTask, new PipelineBatchLedger.Done(otherBatch));
+        small.retained(batch -> batch.equals(retainedBatch));
+        Map<PipelineBatchLedger.TrackedTask, Object> statuses = statusesOf(small);
+        statuses.put(otherTask, statusEntry(otherTask, otherBatch, 2L, "full"));
+        statuses.put(retainedTask, statusEntry(retainedTask, retainedBatch, 1L, "full"));
+
+        PipelineBatchLedger.TrackedTask newcomer = ledger.mint(new Object(), WORLD, MAILBOX3, 3L, 3L);
+        PipelineBatchLedger.BatchId newcomerBatch = ledger.freeze(WORLD, MAILBOX3, 3L, 1L);
+        assertNotNull(newcomerBatch);
+        setState(newcomer, new PipelineBatchLedger.Running(newcomerBatch));
+        remember(small, newcomer, "full", 3L);
+
+        assertEquals(2, statuses.size());
+        assertTrue(statuses.containsKey(retainedTask), "the retained status is not evicted");
+        assertFalse(statuses.containsKey(otherTask), "the unretained done status is evicted");
+        assertEquals(0L, small.retainedFallbackEvictions());
+    }
+
+    @Test
+    void anAllRetainedRegisterFallsBackAndIsStillBounded() throws Exception {
+        DemandShadowCandidates small = new DemandShadowCandidates(2);
+        PipelineBatchLedger ledger = new PipelineBatchLedger();
+        PipelineBatchLedger.TrackedTask first = ledger.mint(new Object(), WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.TrackedTask second = ledger.mint(new Object(), WORLD, MAILBOX2, 2L, 2L);
+        PipelineBatchLedger.BatchId firstBatch = ledger.freeze(WORLD, MAILBOX, 1L, 1L);
+        PipelineBatchLedger.BatchId secondBatch = ledger.freeze(WORLD, MAILBOX2, 2L, 1L);
+        assertNotNull(firstBatch);
+        assertNotNull(secondBatch);
+        setState(first, new PipelineBatchLedger.Done(firstBatch));
+        setState(second, new PipelineBatchLedger.Done(secondBatch));
+        small.retained(batch -> true);
+        Map<PipelineBatchLedger.TrackedTask, Object> statuses = statusesOf(small);
+        statuses.put(first, statusEntry(first, firstBatch, 1L, "full"));
+        statuses.put(second, statusEntry(second, secondBatch, 2L, "full"));
+
+        PipelineBatchLedger.TrackedTask newcomer = ledger.mint(new Object(), WORLD, MAILBOX3, 3L, 3L);
+        PipelineBatchLedger.BatchId newcomerBatch = ledger.freeze(WORLD, MAILBOX3, 3L, 1L);
+        assertNotNull(newcomerBatch);
+        setState(newcomer, new PipelineBatchLedger.Running(newcomerBatch));
+        remember(small, newcomer, "full", 3L);
+
+        assertEquals(2, statuses.size(), "the register stays bounded");
+        assertEquals(1L, small.retainedFallbackEvictions(), "only the fallback path took a retained entry");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Long, Object> pendingOf(DemandShadowCandidates candidates)
+        throws ReflectiveOperationException {
+        Field field = DemandShadowCandidates.class.getDeclaredField("pending");
+        field.setAccessible(true);
+        return (Map<Long, Object>) field.get(candidates);
+    }
+
+    private static Object pendingEntry(long token, String status, long cell, long plan, long tick)
+        throws ReflectiveOperationException {
+        Class<?> type = Class.forName(DemandShadowCandidates.class.getName() + "$PendingDemand");
+        var constructor = type.getDeclaredConstructor(long.class, String.class, long.class,
+            String.class, long.class, long.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(token, status, cell, WORLD, plan, tick);
+    }
+
+    private static void purge(DemandShadowCandidates candidates, long now)
+        throws ReflectiveOperationException {
+        var method = DemandShadowCandidates.class.getDeclaredMethod("purgePending", long.class);
+        method.setAccessible(true);
+        method.invoke(candidates, now);
+    }
+
+    @Test
+    void oldPlanPendingBeyondPlanDistanceIsPurged() throws Exception {
+        DemandShadowCandidates candidates = new DemandShadowCandidates(4, () -> 200L);
+        Map<Long, Object> pending = pendingOf(candidates);
+        pending.put(1L, pendingEntry(1L, "full", 1L, 2L, 0L));
+        pending.put(2L, pendingEntry(2L, "full", 2L, 0L, 0L));
+        pending.put(3L, pendingEntry(3L, "full", 3L, 200L, 0L));
+
+        purge(candidates, 0L);
+        assertFalse(pending.containsKey(1L), "a too-far old plan pending is purged");
+        assertTrue(pending.containsKey(2L), "the early zero-plan pending stays for its tick TTL");
+        assertTrue(pending.containsKey(3L), "the current plan pending is untouched");
     }
 
     @Test
@@ -406,12 +582,19 @@ class DemandShadowCandidatesTest {
     /** A tick plan is off in the declared defaults, so the fixture switches the one feature on for
      * the life of the case and puts the directory back the way it found it. */
     private static void switchTheTickPlanOn() throws IOException {
+        switchTheDeclaredValues("  tick-plan: false", "  tick-plan: true");
+    }
+
+    /** The same switch with one further declared value moved, for a case that needs the other
+     * producer or a smaller intake than the defaults declare. */
+    private static void switchTheDeclaredValues(String declared, String wanted) throws IOException {
         assumeTrue(!Files.exists(CONFIG_DIR),
             "a prts-config directory already exists in the test working directory");
         Files.createDirectories(CONFIG_DIR);
         PrtsConfigManager.Entry entry = PrtsConfigManager.entries().get(PrtsConfigManager.KERNEL);
-        Files.writeString(CONFIG_DIR.resolve("kernel.yml"),
-            PrtsConfigManager.defaults(entry).replace("  tick-plan: false", "  tick-plan: true"),
+        String text = PrtsConfigManager.defaults(entry)
+            .replace("  tick-plan: false", "  tick-plan: true");
+        Files.writeString(CONFIG_DIR.resolve("kernel.yml"), text.replace(declared, wanted),
             StandardCharsets.UTF_8);
         PrtsConfigManager.ensureAndLoad();
         System.setProperty("arclight.prts.kernel", "true");
@@ -437,27 +620,421 @@ class DemandShadowCandidatesTest {
         }
     }
 
-    @Test
-    void aDrivenFreezeReadsItsOwnWindowAndSealsNoneOfIt() throws IOException {
-        switchTheTickPlanOn();
-        try {
-            KernelModule module = KernelModule.instance();
-            DemandShadowCandidates reader = module.demandShadowCandidates();
-            module.serverTick(List.of(TICK_WORLD));
-            // The first tick only takes the control frame the plan needs. The window of the freeze is
-            // filled after it and read by the next tick, which is the order the host walks.
-            reader.reset();
-            PrtsChunkDemand.install(reader);
-            PrtsChunkDemand.demandDescriptor(TICK_WORLD, 3, -7, STATUS, true);
-            long sealed = module.declarationsSealed();
 
-            module.serverTick(List.of(TICK_WORLD));
+    // ---- the freeze of a driven tick: the hand-off this batch adds ----
+
+    private static final String NODE_WORLD = TICK_WORLD;
+    private static final String FOREIGN_DOMAIN = "fixture-domain";
+
+    /** The control frame the plan needs, with the reader installed and its counters cleared. The
+     * window of the freeze is filled after this call and read by the next tick, which is the order
+     * the host walks. */
+    private static KernelModule openTheDrivenFreeze() throws IOException {
+        switchTheTickPlanOn();
+        return takeTheControlFrame();
+    }
+
+    /** The same, with one further declared value of the fixture moved. */
+    private static KernelModule openTheDrivenFreezeWith(String declared, String wanted)
+        throws IOException {
+        switchTheDeclaredValues(declared, wanted);
+        return takeTheControlFrame();
+    }
+
+    private static KernelModule takeTheControlFrame() {
+        KernelModule module = KernelModule.instance();
+        DemandShadowCandidates reader = module.demandShadowCandidates();
+        module.serverTick(List.of(NODE_WORLD));
+        reader.reset();
+        PrtsChunkDemand.install(reader);
+        return module;
+    }
+
+    /** The steps of the newest plan that the named domain carries. */
+    private static List<TickPlan.CommitStep> stepsOf(KernelModule module, String domainId) {
+        List<TickPlan.CommitStep> steps = new ArrayList<>();
+        for (TickPlan.CommitStep step : module.plans().latest().commitOrder()) {
+            if (step.domainId().equals(domainId)) {
+                steps.add(step);
+            }
+        }
+        return steps;
+    }
+
+    private static DemandShadowCandidates.Shadow capturedNode(
+        List<DemandShadowCandidates.Shadow> window, String nodeKey) {
+        for (DemandShadowCandidates.Shadow shadow : window) {
+            if (shadow.nodeKey().equals(nodeKey)) {
+                return shadow;
+            }
+        }
+        return null;
+    }
+
+    /** The direct association reading: the declaration the plan took and the candidate the table
+     * sealed name the capture the window read, three names at a time as themselves and never one
+     * spliced text. Answers how many comparisons it made - one per step and one per entry - so a
+     * window with nothing to hand over is read as the control it is and not as a failure. */
+    private static int compareTheTwoHandOffs(KernelModule module) {
+        List<DemandShadowCandidates.Shadow> window = module.demandShadowCandidates().lastCandidates();
+        int compared = 0;
+        for (TickPlan.CommitStep step : stepsOf(module, DemandShadowCandidates.DOMAIN)) {
+            DemandShadowCandidates.Shadow shadow = capturedNode(window, step.nodeKey());
+            assertNotNull(shadow, "the plan carries the node of a capture the window read");
+            assertEquals(shadow.worldId(), step.worldId());
+            assertEquals(shadow.domainId(), step.domainId());
+            assertEquals(shadow.nodeKey(), step.nodeKey());
+            compared++;
+        }
+        for (FrozenDeclarations.Entry entry : module.declarations().entries()) {
+            DemandShadowCandidates.Shadow shadow = capturedNode(window, entry.nodeKey());
+            assertNotNull(shadow, "the table carries the node of a capture the window read");
+            assertEquals(shadow.worldId(), entry.seat().worldId());
+            assertEquals(shadow.domainId(), entry.seat().domainId());
+            assertEquals(shadow.nodeKey(), entry.nodeKey());
+            compared++;
+        }
+        return compared;
+    }
+
+    private static JobDeclaration foreignDeclaration() {
+        return new JobDeclaration(FOREIGN_DOMAIN + "/" + NODE_WORLD + "/fixture", 1L, NODE_WORLD,
+            FOREIGN_DOMAIN, 0, List.of(), 0, "fixture", "world:" + NODE_WORLD, List.of(), List.of(),
+            ShareClass.OTHER, JobDeclaration.SiteClass.PARALLEL, 0, 1, List.of());
+    }
+
+    @Test
+    void aDemandCaptureWithAnArtefactBecomesACandidateAtTheFreeze() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            List<DemandShadowCandidates.Shadow> window = reader.lastCandidates();
+            assertEquals(1, window.size());
+            DemandShadowCandidates.Shadow shadow = window.get(0);
+            FrozenDeclarations table = module.declarations();
+            assertEquals(FrozenDeclarations.SEALED, table.state(),
+                "the capture carries every column, so the freeze seals a table of it");
+            assertEquals(1, table.size());
+            FrozenDeclarations.Entry entry = table.entries().get(0);
+            assertEquals(shadow.nodeKey(), entry.nodeKey());
+            assertEquals(shadow.chunk().packedPos(), entry.packedChunkPos());
+            assertEquals(shadow.targetStatus(), entry.targetStatus());
+            assertTrue(entry.instanceId() > 0L, "the one mint numbered the seat of this capture");
+            assertEquals(shadow.worldEpoch(), entry.worldEpoch());
+            assertEquals(shadow.worldId(), entry.seat().worldId());
+            assertEquals(shadow.domainId(), entry.seat().domainId());
+            assertEquals(module.plans().latest().planSequence(), table.planSequence());
+            assertEquals("", module.declarationRefusal());
+            assertEquals("SEALED", reading("product.commit.declaration_state"));
+            assertEquals("1", reading("product.commit.declaration_entries"));
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void theFreezeHandsTheMergedListToSealAndNotASecondTable() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreezeWith("  pipeline-jobs: false",
+                "  pipeline-jobs: true");
+            module.pipelineBatches().mint("fixture-mailbox", NODE_WORLD, "fixture-mailbox",
+                ChunkPos.asLong(0, 0), 0L);
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(1, module.pipelineJobCandidates(),
+                "the round producer still hands its own candidate to the same merge");
+            assertEquals(1, stepsOf(module, PipelineRoundJobs.DOMAIN).size(),
+                "and its declaration still reaches the plan");
+            assertEquals(1, stepsOf(module, DemandShadowCandidates.DOMAIN).size());
+            FrozenDeclarations table = module.declarations();
+            assertEquals(FrozenDeclarations.SEALED, table.state(),
+                "the one merged list reaches the one table");
+            assertEquals(1, table.size(),
+                "the shadow capture is the declaration of the two that carries an artefact");
+            assertEquals(module.demandShadowCandidates().lastCandidates().get(0).nodeKey(),
+                table.entries().get(0).nodeKey());
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aCandidateWithoutAChunkIsNeverHandedToThePlan() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            long submitted = module.jobIntake().submitted();
+            PrtsChunkDemand.futureOpened(NODE_WORLD, STATUS);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            List<DemandShadowCandidates.Shadow> window =
+                module.demandShadowCandidates().lastCandidates();
+            assertEquals(1, window.size(), "the ask is read as a capture of the window");
+            assertFalse(window.get(0).declared(),
+                "an ask that named no coordinates carries no artefact and is never the origin");
+            assertEquals(DemandShadowCandidates.NOT_WIRED, window.get(0).state());
+            assertEquals(submitted, module.jobIntake().submitted(),
+                "no declaration is handed for a capture that carries no artefact");
+            assertEquals(0, stepsOf(module, DemandShadowCandidates.DOMAIN).size());
+            assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state());
+            assertEquals(0, module.declarations().size());
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aDeclaredNodeWithoutASeatIsNotNumbered() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreezeWith("  job-queue-cap: 256",
+                "  job-queue-cap: 1");
+            module.jobIntake().submit(foreignDeclaration());
+            long refused = module.jobIntake().refused();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            assertEquals(DemandShadowCandidates.NOT_EXECUTABLE,
+                reader.lastCandidates().get(0).state(),
+                "the capture carries every column and the plan still gave it no seat");
+            assertEquals(refused + 1L, module.jobIntake().refused(),
+                "the one intake refused the declaration and counted it");
+            assertEquals(0, stepsOf(module, DemandShadowCandidates.DOMAIN).size(),
+                "a declaration that never reached the intake is no node of the plan");
+            assertEquals(1, stepsOf(module, FOREIGN_DOMAIN).size(),
+                "the node the plan did carry takes a rank");
+            assertEquals(0, module.declarations().size(), "and no entry, so nothing was numbered");
+            assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state());
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aDrivenFreezeReadsTheWindowOnceAndHandsEachCaptureOnce() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 4, -7, STATUS, true);
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            long submitted = module.jobIntake().submitted();
+            long windows = reader.windows();
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(windows + 1L, reader.windows(), "one window read per freeze and never two");
+            assertEquals(2L, reader.lastRead(), "both hand-offs derive from the one returned list");
+            assertEquals(2L, module.jobIntake().submitted() - submitted,
+                "one declaration per handed capture and never two for one");
+            assertEquals(2, stepsOf(module, DemandShadowCandidates.DOMAIN).size());
+            assertEquals(2, module.declarations().size(), "the one merge hands both to the one table");
+            assertEquals("2", reading("product.commit.declaration_entries"));
+            assertEquals(4, compareTheTwoHandOffs(module),
+                "two steps of the plan and two entries of the table, each compared element by element");
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aDrivenFreezeReadsBothStatesAtTheWindowLevel() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+            PrtsChunkDemand.futureOpened(NODE_WORLD, STATUS);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            TreeSet<String> states = new TreeSet<>();
+            for (DemandShadowCandidates.Shadow shadow : reader.lastCandidates()) {
+                states.add(shadow.state());
+            }
+            assertEquals(new TreeSet<>(List.of(DemandShadowCandidates.NOT_WIRED,
+                DemandShadowCandidates.NOT_EXECUTABLE)), states,
+                "a driven freeze reads exactly the two states the class answers");
+            assertEquals(1L, reader.unexecutable(), "the capture carrying every column");
+            assertEquals(1L, reader.notWired(), "and the one that carries no chunk");
+            assertEquals(FrozenDeclarations.SEALED, module.declarations().state());
+            assertEquals(1, module.declarations().size(), "only the complete capture is handed over");
+            assertEquals(1, stepsOf(module, DemandShadowCandidates.DOMAIN).size());
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aDrivenFreezeCountsTheAsksItDroppedOrRefused() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            // The bound first: 65 asks fill the ring once, the oldest is dropped and counted, and the
+            // freeze that reads it keeps 64 of them.
+            for (int index = 0; index <= DemandShadowCandidates.CAP; index++) {
+                PrtsChunkDemand.demandDescriptor(NODE_WORLD, index, 0, STATUS, true);
+            }
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(DemandShadowCandidates.CAP + 1L, reader.captured(),
+                "the drop is a bound and never the number of asks that happened");
+            assertEquals(1L, reader.dropped(), "the capture the full ring cost is counted");
+            assertEquals(DemandShadowCandidates.CAP, reader.lastRead(),
+                "the window kept the bound and not one more");
+            assertEquals(DemandShadowCandidates.CAP, module.declarations().size(),
+                "and the freeze sealed exactly the captures the window kept");
+            assertEquals("SEALED", reading("product.commit.declaration_state"));
+            assertEquals(String.valueOf(DemandShadowCandidates.CAP),
+                reading("product.commit.declaration_entries"));
+
+            // Then the whole-window refusal: three asks of which one world-and-status pair a
+            // completion marked before the freeze.
+            reader.reset();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 4, -7, STATUS, true);
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 5, -7, "empty", true);
+            PrtsChunkDemand.futureCompleted(NODE_WORLD, "empty", 0L, true);
+            long submitted = module.jobIntake().submitted();
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(3L, reader.captured(),
+                "the three asks happened: a refusal is never read as no ask at all");
+            assertEquals(1L, reader.windows(), "one freeze read the window once");
+            assertEquals(1L, reader.lateRefusals(), "one pair of them was marked by a completion");
+            assertEquals(2L, reader.unexecutable(), "the window holds complete captures");
+            assertEquals(1L, reader.notWired(), "and the marked one is never read as an absence");
+            assertEquals(submitted, module.jobIntake().submitted(),
+                "a window refused as a whole hands no declaration over");
+            assertEquals(0, stepsOf(module, DemandShadowCandidates.DOMAIN).size());
+            assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state());
+            assertEquals(0, module.declarations().size(),
+                "handing the captures the marking did not reach over is the failure this forbids");
+            assertEquals("0", reading("product.commit.declaration_entries"));
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void theTwoHandOffsOfOneCaptureCarryTheSameThreeNames() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(2, compareTheTwoHandOffs(module),
+                "the declaration and the candidate name the same node, element by element");
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    @Test
+    void aWindowWithNothingToDeclareLeavesTheAssociationUntouched() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            PrtsChunkDemand.futureOpened(NODE_WORLD, STATUS);
+
+            module.serverTick(List.of(NODE_WORLD));
+
+            assertEquals(0, compareTheTwoHandOffs(module),
+                "a window that hands nothing over has no pair to compare and trips nothing");
+            assertEquals(0, module.declarations().size(),
+                "and it ends with no entry, which is the reading that is not the discriminator");
+            assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state());
+        } finally {
+            restoreTheDeclaredDefaults();
+        }
+    }
+
+    /** The conversion of one window as the carrier itself answers it: one declaration and one
+     * candidate per handed capture, the same three names on both sides, the number column left to the
+     * freeze point, and a copy of the window refused where the one read returned it.
+     *
+     * <p>The two entry points are reached by name here on purpose: this case has to compile on the
+     * tree that has neither of them, which is the tree the break-first reading and the rollback of
+     * the production files are taken on.
+     */
+    @Test
+    void theConversionOfOneWindowHandsOneDeclarationAndOneCandidatePerCapture() throws Exception {
+        PrtsChunkDemand.demandDescriptor(WORLD, 0, 0, STATUS, true);
+        PrtsChunkDemand.demandDescriptor(WORLD, 3, -7, STATUS, true);
+        PrtsChunkDemand.futureOpened(WORLD, STATUS);
+
+        List<DemandShadowCandidates.Shadow> window = read(5L);
+
+        List<DemandShadowCandidates.Shadow> copy = new ArrayList<>(window);
+        assertThrows(InvocationTargetException.class, () -> candidatesOf(copy),
+            "an equal but distinct copy is not the window the one read returned");
+        assertThrows(InvocationTargetException.class, () -> declarationsOf(copy),
+            "and neither hand-off reads one");
+        List<?> declared = declarationsOf(window);
+        List<?> handed = candidatesOf(window);
+        assertEquals(2, declared.size(), "one declaration per handed capture");
+        assertEquals(2, handed.size(), "and one candidate per handed capture");
+        for (int index = 0; index < handed.size(); index++) {
+            JobDeclaration declaration = (JobDeclaration) declared.get(index);
+            FrozenDeclarations.Candidate candidate = (FrozenDeclarations.Candidate) handed.get(index);
+            assertEquals(candidate.worldId(), declaration.worldId());
+            assertEquals(candidate.domainId(), declaration.domainId());
+            assertEquals(candidate.nodeKey(), declaration.key(),
+                "the key the plan matches the candidate on is the capture's own node key");
+            assertTrue(candidate.artefactDeclared(), "only a capture of every column is handed over");
+            assertEquals(0L, candidate.instanceId(),
+                "the freeze point mints the number and this side never fills the column in");
+        }
+        FrozenDeclarations.Candidate origin = (FrozenDeclarations.Candidate) handed.get(0);
+        assertEquals(ChunkPos.asLong(0, 0), origin.chunk().packedPos(),
+            "an ask that named the origin is a capture like any other and is handed over");
+
+        // A window a completion marked is refused as a whole, and never capture by capture.
+        PrtsChunkDemand.demandDescriptor(WORLD, 5, 5, STATUS, true);
+        PrtsChunkDemand.demandDescriptor(WORLD, 6, 5, "empty", true);
+        PrtsChunkDemand.futureCompleted(WORLD, "empty", 0L, true);
+        List<DemandShadowCandidates.Shadow> marked = read(6L);
+
+        assertEquals(2, marked.size());
+        assertTrue(marked.get(1).late(), "the completion marked the pair it answers");
+        assertTrue(declarationsOf(marked).isEmpty(), "and the window is refused as a whole");
+        assertTrue(candidatesOf(marked).isEmpty(),
+            "so the capture the marking did not reach is not handed over either");
+    }
+
+    private List<?> declarationsOf(List<DemandShadowCandidates.Shadow> window) throws Exception {
+        return (List<?>) DemandShadowCandidates.class.getMethod("declarationsOf", List.class)
+            .invoke(candidates, window);
+    }
+
+    private List<?> candidatesOf(List<DemandShadowCandidates.Shadow> window) throws Exception {
+        return (List<?>) DemandShadowCandidates.class.getMethod("candidatesOf", List.class)
+            .invoke(candidates, window);
+    }
+
+    @Test
+    void aDrivenFreezeSealsTheOneCaptureItsOwnWindowCarried() throws IOException {
+        try {
+            KernelModule module = openTheDrivenFreeze();
+            DemandShadowCandidates reader = module.demandShadowCandidates();
+            PrtsChunkDemand.demandDescriptor(NODE_WORLD, 3, -7, STATUS, true);
+            long sealed = module.declarationsSealed();
+            long roundCandidates = module.pipelineJobCandidates();
+
+            module.serverTick(List.of(NODE_WORLD));
 
             assertEquals(1L, reader.windows(), "the freeze read the window of its own tick");
             List<DemandShadowCandidates.Shadow> read = reader.lastCandidates();
             assertEquals(1, read.size());
             DemandShadowCandidates.Shadow shadow = read.get(0);
-            assertEquals(TICK_WORLD, shadow.worldId());
+            assertEquals(NODE_WORLD, shadow.worldId());
             assertEquals(ChunkPos.asLong(3, -7), shadow.chunk().packedPos());
             assertEquals(STATUS, shadow.targetStatus());
             assertTrue(shadow.worldEpoch() > 0L, "the world was tracked and its generation was read");
@@ -467,14 +1044,14 @@ class DemandShadowCandidatesTest {
                 "the capture is complete and the freeze still has no witness for it");
             assertEquals(sealed + 1L, module.declarationsSealed(),
                 "the freeze sealed a table of the plan's own declarations");
-            assertEquals(FrozenDeclarations.NOT_WIRED, module.declarations().state(),
-                "and none of the shadow window became an entry of it");
-            assertEquals(0, module.declarations().size());
+            assertEquals(FrozenDeclarations.SEALED, module.declarations().state(),
+                "and the capture the window read is the one entry of it");
+            assertEquals(1, module.declarations().size());
             assertEquals("", module.declarationRefusal(), "nothing was refused, nothing was taken");
-            assertEquals(0L, module.pipelineJobCandidates(),
+            assertEquals(roundCandidates, module.pipelineJobCandidates(),
                 "the shadow window is not the pipeline producer's candidate list");
-            assertEquals("NOT_WIRED", reading("product.commit.declaration_state"));
-            assertEquals("0", reading("product.commit.declaration_entries"));
+            assertEquals("SEALED", reading("product.commit.declaration_state"));
+            assertEquals("1", reading("product.commit.declaration_entries"));
         } finally {
             restoreTheDeclaredDefaults();
         }

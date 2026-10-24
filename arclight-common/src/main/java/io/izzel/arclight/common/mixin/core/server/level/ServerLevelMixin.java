@@ -21,6 +21,7 @@ import io.izzel.arclight.common.mod.mixins.annotation.ShadowConstructor;
 import io.izzel.arclight.common.mod.server.ArclightServer;
 import io.izzel.arclight.common.mod.server.entity.ArclightSpawnReason;
 import io.izzel.arclight.common.mod.server.event.ArclightEventFactory;
+import io.izzel.arclight.common.mod.server.world.BukkitValueSkip;
 import io.izzel.arclight.common.mod.server.world.LevelPersistentData;
 import io.izzel.arclight.common.mod.server.world.WorldSymlink;
 import io.izzel.arclight.common.mod.util.ArclightCaptures;
@@ -259,8 +260,12 @@ public abstract class ServerLevelMixin extends LevelMixin implements ServerLevel
         if (arclight$isActual()) {
             ((PrimaryLevelDataBridge) this.K).bridge$setWorld((ServerLevel) (Object) this);
             var data = this.getDataStorage().computeIfAbsent(LevelPersistentData.factory(), "bukkit_pdc");
-            this.getWorld().readBukkitValues(data.getTag());
-            this.getCraftServer().addWorld(this.getWorld());
+            if (!BukkitValueSkip.runIfWorld(this.world, () -> {
+                this.getWorld().readBukkitValues(data.getTag());
+                this.getCraftServer().addWorld(this.getWorld());
+            })) {
+                BukkitValueSkip.markAndLog("load");
+            }
         }
     }
 

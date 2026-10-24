@@ -2,6 +2,7 @@
 package io.izzel.arclight.common.prts.kernel.observe;
 
 import io.izzel.arclight.common.prts.support.PrtsChunkDemand;
+import io.izzel.arclight.common.prts.support.PrtsChunkDemand.DemandTap;
 import io.izzel.arclight.common.prts.support.PrtsCpuClock;
 
 import java.util.ArrayList;
@@ -54,6 +55,9 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
         final long[] futureStamp = new long[PENDING_CAP];
         int depth;
         int futureDepth;
+        // Pushes this thread refused because the stamp stack was already full. Each one is paid by
+        // the matching read at that ask's return, and never by popping an older ask's stamp.
+        int futureRefusals;
         long overflow;
     }
 
@@ -98,6 +102,11 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
     private volatile String mainThreadName = "-";
     private volatile long startedAtNanos;
 
+    /** The second reader of the same asks, told after this face's own work. Null while none is
+     * attached, which is also why a completion that arrives after a detach is dropped rather than
+     * booked. */
+    private volatile PrtsChunkDemand.DemandTap secondPath;
+
     public void attach() {
         installed = true;
         mainThread = Thread.currentThread();
@@ -108,7 +117,19 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
 
     public void detach() {
         installed = false;
+        // The second path is dropped first: a callback that already holds this face still finds no
+        // receiver, and no reader of the next run inherits a window of this one.
+        secondPath = null;
         PrtsChunkDemand.install(null);
+    }
+
+    /** Hands the same asks to a second reader, which is told after this face has counted them. */
+    public void attachSecondPath(PrtsChunkDemand.DemandTap second) {
+        secondPath = second;
+    }
+
+    public void releaseSecondPath() {
+        secondPath = null;
     }
 
     public boolean installed() {
@@ -129,6 +150,9 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
         requests.increment();
         world(worldId).requests.increment();
         status(statusRequests, status).increment();
+        // Told once per ask, before the timing stack: a non-blocking ask and an ask whose stack is
+        // already full are still asks, and neither one is this face's timing record.
+        tellSecondPath(worldId, status, blocking);
         if (!blocking) {
             return;
         }
@@ -144,8 +168,44 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
         stack.depth++;
     }
 
+    /** The second path is told once per ask and after the count above, in its own catch: a reader
+     * that throws costs its own reading and neither this face's counts nor the ask. */
+    private void tellSecondPath(String worldId, String status, boolean blocking) {
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.demandStarted(worldId, status, blocking);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** A synchronous ask that named the chunk it wants: the chunk is read here and kept nowhere. */
+    @Override
+    public void demandStarted(String worldId, int chunkX, int chunkZ, String status,
+                              boolean requireChunk) {
+        // Answered by this face rather than by the seam's default, which drops the chunk before the
+        // ask reaches anyone: the count is the one the ask without a chunk keeps, and no row of this
+        // face is per chunk.
+        demandStarted(worldId, status, requireChunk);
+    }
+
     @Override
     public void demandFinished(String worldId, String status, boolean blocking, boolean answered) {
+        countDemandFinished(worldId, status, blocking, answered);
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.demandFinished(worldId, status, blocking, answered);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void countDemandFinished(String worldId, String status, boolean blocking,
+                                     boolean answered) {
         if (answered) {
             satisfied.increment();
             world(worldId).satisfied.increment();
@@ -176,17 +236,94 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
 
     @Override
     public void futureOpened(String worldId, String status) {
+        if (!openFutureStamp()) {
+            return;
+        }
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.futureOpened(worldId, status);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Pushes the stamp of one future-returning ask, once, and answers whether it was pushed with a
+     * usable value: the caller of the ask learns of a full stack from this return and from nowhere
+     * else, so nothing has to be popped to find out. */
+    private boolean openFutureStamp() {
         Pending stack = pending.get();
         if (stack.futureDepth >= PENDING_CAP) {
-            return;
+            // The ask still returns through futureOpenedAt. Counting the refusal here is what keeps
+            // that read from spending a stamp that belongs to an ask already on the stack.
+            stack.futureRefusals++;
+            return false;
         }
         stack.futureStamp[stack.futureDepth] = System.nanoTime();
         stack.futureDepth++;
+        return true;
+    }
+
+    /** A future-returning ask that named the chunk it wants: the chunk is read here and the stamp
+     * is taken once. */
+    @Override
+    public void demandDescriptor(String worldId, int chunkX, int chunkZ, String status,
+                                 boolean requireChunk) {
+        // An ask that arrives without a name is still an ask: it is stamped and told on, and the
+        // reader that needs a name reads none rather than one made up here.
+        if (!openFutureStamp()) {
+            return;
+        }
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.demandDescriptor(worldId, chunkX, chunkZ, status, requireChunk);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    public void demandDescriptor(String worldId, int chunkX, int chunkZ, String status,
+                                 boolean requireChunk, long token) {
+        if (!openFutureStamp()) {
+            return;
+        }
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.demandDescriptor(worldId, chunkX, chunkZ, status, requireChunk, token);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    public void demandDescriptor(String worldId, int chunkX, int chunkZ, String status,
+                                 boolean requireChunk, long token, Object taskToken) {
+        if (!openFutureStamp()) {
+            return;
+        }
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.demandDescriptor(worldId, chunkX, chunkZ, status, requireChunk, token, taskToken);
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
     public long futureOpenedAt() {
         Pending stack = pending.get();
+        if (stack.futureRefusals > 0) {
+            stack.futureRefusals--;
+            return -1L;
+        }
         if (stack.futureDepth <= 0) {
             return -1L;
         }
@@ -196,6 +333,23 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
 
     @Override
     public void futureTaken(String worldId, String status) {
+        countFutureTaken(worldId);
+    }
+
+    @Override
+    public void futureTaken(String worldId, String status, long token) {
+        countFutureTaken(worldId);
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.futureTaken(worldId, status, token);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void countFutureTaken(String worldId) {
         futuresTaken.increment();
         world(worldId).futures.increment();
         futuresInFlight.increment();
@@ -207,6 +361,39 @@ public final class ChunkDemandObserver implements PrtsChunkDemand.DemandTap {
 
     @Override
     public void futureCompleted(String worldId, String status, long startedNanos, boolean answered) {
+        countFutureCompleted(worldId, status, startedNanos, answered);
+    }
+
+    @Override
+    public void futureCompleted(String worldId, String status, long startedNanos, boolean answered,
+                                long token) {
+        countFutureCompleted(worldId, status, startedNanos, answered);
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.futureCompleted(worldId, status, startedNanos, answered, token);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** The confirmation of one registration: this face keeps no count of it, so all it can do is
+     * hand it to the reader that asked for the stage. */
+    @Override
+    public void registrationConfirmed(String worldId, String status, long token, boolean ok) {
+        DemandTap second = secondPath;
+        if (second == null) {
+            return;
+        }
+        try {
+            second.registrationConfirmed(worldId, status, token, ok);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void countFutureCompleted(String worldId, String status, long startedNanos,
+                                      boolean answered) {
         futuresCompleted.increment();
         world(worldId).futuresCompleted.increment();
         futuresInFlight.decrement();

@@ -13,6 +13,7 @@ import io.izzel.arclight.common.mod.server.BukkitRegistry;
 import io.izzel.arclight.common.mod.server.world.border.ArclightBorderChangeListener;
 import io.izzel.arclight.common.mod.server.world.border.ArclightDelegatedBorderListener;
 import io.izzel.arclight.common.mod.util.ArclightCaptures;
+import io.izzel.arclight.common.mod.util.WorldHookCompat;
 import io.izzel.arclight.common.mod.util.BukkitOptionParser;
 import io.izzel.arclight.common.util.IteratorUtil;
 import io.izzel.arclight.i18n.ArclightConfig;
@@ -65,6 +66,7 @@ import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.command.RemoteConsoleCommandSender;
 import org.bukkit.craftbukkit.v.CraftRegistry;
 import org.bukkit.craftbukkit.v.CraftServer;
+import org.bukkit.craftbukkit.v.CraftWorld;
 import org.bukkit.craftbukkit.v.scoreboard.CraftScoreboardManager;
 import org.bukkit.event.server.ServerLoadEvent;
 import org.bukkit.event.world.WorldInitEvent;
@@ -287,12 +289,15 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
             if (((CraftServer) Bukkit.getServer()).scoreboardManager == null) {
                 ((CraftServer) Bukkit.getServer()).scoreboardManager = new CraftScoreboardManager((MinecraftServer) (Object) this, level.getScoreboard());
             }
-            if (((WorldBridge) level).bridge$getGenerator() != null) {
-                level.bridge$getWorld().getPopulators().addAll(
-                    ((WorldBridge) level).bridge$getGenerator().getDefaultPopulators(
-                        level.bridge$getWorld()));
-            }
-            Bukkit.getPluginManager().callEvent(new WorldInitEvent(level.bridge$getWorld()));
+            CraftWorld craftWorld = level.bridge$getWorldOrNull();
+            WorldHookCompat.enterBukkitHook("worldInit.populators", craftWorld != null, () -> {
+                if (((WorldBridge) level).bridge$getGenerator() != null) {
+                    craftWorld.getPopulators().addAll(
+                        ((WorldBridge) level).bridge$getGenerator().getDefaultPopulators(craftWorld));
+                }
+            });
+            WorldHookCompat.enterBukkitHook("worldInit.event", craftWorld != null,
+                () -> Bukkit.getPluginManager().callEvent(new WorldInitEvent(craftWorld)));
 
             // Arclight: move world border listener initialization to world registration
             // Arclight: ArclightBorderChangeListener is singleton so won't be added more than once
@@ -328,7 +333,9 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
         this.executeModerately();
 
         for (ServerLevel serverWorld : this.levels.values()) {
-            if (serverWorld.bridge$getWorld().getKeepSpawnInMemory()) {
+            CraftWorld craftWorld = serverWorld.bridge$getWorldOrNull();
+            WorldHookCompat.enterBukkitHook("prepareLevels.keepSpawn", craftWorld != null, () -> {
+            if (craftWorld.getKeepSpawnInMemory()) {
                 ForcedChunksSavedData forcedchunkssavedata = serverWorld.getDataStorage().get(ForcedChunksSavedData.factory(), "chunks");
                 if (forcedchunkssavedata != null) {
                     LongIterator longiterator = forcedchunkssavedata.getChunks().iterator();
@@ -341,7 +348,9 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
                     this.bridge$forge$reinstatePersistentChunks(serverWorld, forcedchunkssavedata);
                 }
             }
-            Bukkit.getPluginManager().callEvent(new WorldLoadEvent(serverWorld.bridge$getWorld()));
+            });
+            WorldHookCompat.enterBukkitHook("prepareLevels.loadEvent", craftWorld != null,
+                () -> Bukkit.getPluginManager().callEvent(new WorldLoadEvent(craftWorld)));
         }
 
         this.executeModerately();
@@ -353,11 +362,13 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
     // bukkit methods
     public void initWorld(ServerLevel serverWorld, ServerLevelData worldInfo, WorldData saveData, WorldOptions worldOptions) {
         boolean flag = saveData.isDebugWorld();
-        if (((WorldBridge) serverWorld).bridge$getGenerator() != null) {
-            serverWorld.bridge$getWorld().getPopulators().addAll(
-                ((WorldBridge) serverWorld).bridge$getGenerator().getDefaultPopulators(
-                    serverWorld.bridge$getWorld()));
-        }
+        CraftWorld craftWorld = serverWorld.bridge$getWorldOrNull();
+        WorldHookCompat.enterBukkitHook("initWorld.populators", craftWorld != null, () -> {
+            if (((WorldBridge) serverWorld).bridge$getGenerator() != null) {
+                craftWorld.getPopulators().addAll(
+                    ((WorldBridge) serverWorld).bridge$getGenerator().getDefaultPopulators(craftWorld));
+            }
+        });
         WorldBorder worldborder = serverWorld.getWorldBorder();
         worldborder.applySettings(worldInfo.getWorldBorder());
 
@@ -371,7 +382,8 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
         // See [PlotSquared] BukkitSetupUtils#setupWorld(PlotAreaBuilder).
         // See CraftServer.
         // CraftBukkit - SPIGOT-5569: Call WorldInitEvent before any chunks are generated
-        this.server.getPluginManager().callEvent(new WorldInitEvent(serverWorld.bridge$getWorld()));
+        WorldHookCompat.enterBukkitHook("initWorld.event", craftWorld != null,
+            () -> this.server.getPluginManager().callEvent(new WorldInitEvent(craftWorld)));
 
         if (!worldInfo.isInitialized()) {
             try {
@@ -396,7 +408,9 @@ public abstract class MinecraftServerMixin extends ReentrantBlockableEventLoop<T
     // bukkit methods
     public void prepareLevels(ChunkProgressListener listener, ServerLevel serverWorld) {
         this.bridge$forge$markLevelsDirty();
-        if (!serverWorld.bridge$getWorld().getKeepSpawnInMemory()) {
+        CraftWorld craftWorld = serverWorld.bridge$getWorldOrNull();
+        WorldHookCompat.enterBukkitHook("prepareLevelsSingle.guard", craftWorld != null, () -> { });
+        if (craftWorld == null || !craftWorld.getKeepSpawnInMemory()) {
             return;
         }
         this.forceTicks = true;

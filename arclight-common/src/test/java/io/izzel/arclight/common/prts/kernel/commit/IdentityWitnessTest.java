@@ -57,8 +57,16 @@ class IdentityWitnessTest {
         }
 
         @Override
-        public long liveAuthorization(String worldId, String domainId, String nodeKey) {
-            return authorization;
+        public IdentityWitness.Authorization liveAuthorization(long planSequence,
+                CommitNamespaces.Namespace planController, String worldId, String domainId,
+                String nodeKey) {
+            if (planController == null || (current != null
+                && !planController.lifecycleKey().equals(current.lifecycleKey()))) {
+                return IdentityWitness.Authorization.refused("", 0L,
+                    IdentityWitness.Authorization.Face.notRead(), "not-this-double");
+            }
+            return IdentityWitness.Authorization.answered(planController.lifecycleKey(), planSequence,
+                authorization, IdentityWitness.Authorization.Face.present(authorization));
         }
 
         @Override
@@ -139,6 +147,73 @@ class IdentityWitnessTest {
                                                   CommitNamespaces.Namespace current) {
         return IdentityWitness.verify(table, new CommitLog.Resolved(plan, position, false), WORLD,
             DOMAIN, node, identity, current);
+    }
+
+    /** The cross-run key is rebuilt at the one point both sides read, and the text the witness core
+     * answers is that rebuild's canonical form and not a second formulation that renders alike. */
+    @Test
+    void theLogicalKeyIsRebuiltAtOnePointAndBothSidesReadThatOnePoint() {
+        FrozenDeclarations table = sealed(9L, NODE, 0, 64L, "full");
+        CommitLog.Identity line = identity(INSTANCE, 64L, "full", controller());
+        IdentityWitness.Verdict witness = verify(table, 9L, 0, NODE, line, controller());
+
+        assertTrue(witness.accepted(), witness.reason());
+        FrozenDeclarations.Entry entry = table.entryAt(seat(9L, 0));
+        assertNotNull(entry);
+        IdentityWitness.LogicalKey declared = CommitLog.logicalKeyOf(entry);
+        IdentityWitness.LogicalKey carried = CommitLog.logicalKeyOf(WORLD, DOMAIN, NODE, entry.role(),
+            line);
+        assertNotNull(declared);
+        assertNotNull(carried);
+        assertEquals(declared, carried);
+        assertEquals(declared.canonical(), witness.instance());
+        assertEquals(declared, IdentityWitness.parse(witness.instance()));
+    }
+
+    /** A seat the table wrote nothing for is answered with no key at all: an empty key would compare
+     * equal to another empty one and read as an identity nothing declared. */
+    @Test
+    void aSeatTheTableWroteNothingForIsAnsweredWithNoKeyInsteadOfAnEmptyOne() {
+        FrozenDeclarations table = sealed(9L, NODE, 0, 64L, "full");
+
+        assertNull(CommitLog.logicalKeyOf((FrozenDeclarations.Entry) null));
+        assertNull(CommitLog.logicalKeyOf(table.entryAt(seat(9L, 3))));
+        assertNull(CommitLog.logicalKeyOf(WORLD, DOMAIN, NODE, 1, null));
+    }
+
+    /** The number a run assigned is not in the key: two freezes of the same declaration that minted
+     * different instance numbers rebuild one key, and the write side still reads both. */
+    @Test
+    void twoRunsThatAssignedOtherInstanceNumbersRebuildTheSameLogicalKey() {
+        FrozenDeclarations first = sealed(9L, NODE, 0, 64L, "full", 11L, EPOCH);
+        FrozenDeclarations second = sealed(9L, NODE, 0, 64L, "full", 12L, EPOCH);
+        IdentityWitness.LogicalKey a = CommitLog.logicalKeyOf(first.entryAt(seat(9L, 0)));
+        IdentityWitness.LogicalKey b = CommitLog.logicalKeyOf(second.entryAt(seat(9L, 0)));
+
+        assertNotNull(a);
+        assertNotNull(b);
+        assertEquals(a, b);
+        assertEquals(a.canonical(), b.canonical());
+        assertEquals(11L, first.entryAt(seat(9L, 0)).instanceId());
+        assertEquals(12L, second.entryAt(seat(9L, 0)).instanceId());
+    }
+
+    /** Another logical declaration never rebuilds to the same key, however alike the run's numbers
+     * were: the chunk and the state are part of what was declared. */
+    @Test
+    void anotherLogicalDeclarationNeverRebuildsToTheSameKey() {
+        IdentityWitness.LogicalKey base = CommitLog.logicalKeyOf(
+            sealed(9L, NODE, 0, 64L, "full").entryAt(seat(9L, 0)));
+        IdentityWitness.LogicalKey otherChunk = CommitLog.logicalKeyOf(
+            sealed(9L, NODE, 0, 65L, "full").entryAt(seat(9L, 0)));
+        IdentityWitness.LogicalKey otherStatus = CommitLog.logicalKeyOf(
+            sealed(9L, NODE, 0, 64L, "empty").entryAt(seat(9L, 0)));
+
+        assertNotNull(base);
+        assertNotEquals(base, otherChunk);
+        assertNotEquals(base, otherStatus);
+        assertNotEquals(base.canonical(), otherChunk.canonical());
+        assertNotEquals(base.canonical(), otherStatus.canonical());
     }
 
     @Test
@@ -1121,8 +1196,16 @@ class IdentityWitnessTest {
         }
 
         @Override
-        public long liveAuthorization(String worldId, String domainId, String nodeKey) {
-            return authorization;
+        public IdentityWitness.Authorization liveAuthorization(long planSequence,
+                CommitNamespaces.Namespace planController, String worldId, String domainId,
+                String nodeKey) {
+            if (planController == null || (!lifecycleKey.isEmpty()
+                && !lifecycleKey.equals(planController.lifecycleKey()))) {
+                return IdentityWitness.Authorization.refused("", 0L,
+                    IdentityWitness.Authorization.Face.notRead(), "not-this-double");
+            }
+            return IdentityWitness.Authorization.answered(planController.lifecycleKey(), planSequence,
+                authorization, IdentityWitness.Authorization.Face.present(authorization));
         }
 
         @Override
@@ -1226,4 +1309,86 @@ class IdentityWitnessTest {
         return new CommitLog.SchemaReplay(side.schemaVersion(), side.plainSteps(), steps,
             side.effectMissing());
     }
+
+    @Test
+    void anEntryCanonicalRoundTripsByteForByte() {
+        String golden = "I17:world-a14:chunk-pipeline3:a/0#2;#64;4:full";
+        IdentityWitness.LogicalKey key = new IdentityWitness.LogicalKey(WORLD, DOMAIN, "a/0", 2, 64L,
+            "full");
+
+        assertEquals(golden, key.canonical());
+        assertFalse(key.ranged());
+        IdentityWitness.LogicalKey parsed = IdentityWitness.parse(golden);
+        assertNotNull(parsed);
+        assertEquals(key, parsed);
+        assertEquals(golden, parsed.canonical());
+        assertFalse(parsed.ranged(), "an entry form is never read as a range form");
+        assertNull(IdentityWitness.parse(golden + "x"), "trailing text after the last segment is refused");
+    }
+
+    @Test
+    void aRangeCanonicalRoundTripsAndKeepsBothFolds() {
+        IdentityWitness.LogicalKey key = IdentityWitness.LogicalKey.ranged(WORLD, DOMAIN, "a/0", 2,
+            "abc", "def");
+        String golden = "I27:world-a14:chunk-pipeline3:a/0#2;#3:abc;3:def";
+
+        assertEquals(golden, key.canonical());
+        assertTrue(key.ranged());
+        IdentityWitness.LogicalKey parsed = IdentityWitness.parse(golden);
+        assertNotNull(parsed);
+        assertEquals(key, parsed);
+        assertEquals("abc", parsed.spaceDigest());
+        assertEquals("def", parsed.statusMapDigest());
+        assertEquals(golden, parsed.canonical());
+    }
+
+    @Test
+    void anUnknownTruncatedOrNegativeLengthFormIsRefused() {
+        assertNull(IdentityWitness.parse(null));
+        assertNull(IdentityWitness.parse(""));
+        assertNull(IdentityWitness.parse("X1whatever"));
+        assertNull(IdentityWitness.parse("I1"));
+        assertNull(IdentityWitness.parse("I1-1:world-a"));
+        assertNull(IdentityWitness.parse("I17:world-a14:chunk-pipeline3:a/0#2;#64;"));
+        assertNull(IdentityWitness.parse("I27:world-a14:chunk-pipeline3:a/0#2;#3:abc"));
+        assertNull(IdentityWitness.parse("I27:world-a14:chunk-pipeline3:a/0#2;#:abc;3:def"),
+            "an empty fold is not a range key");
+        assertNull(IdentityWitness.parse("I2"));
+    }
+
+    @Test
+    void anEntryKeyAndARangeKeyAreNeverEqual() {
+        IdentityWitness.LogicalKey entry = new IdentityWitness.LogicalKey(WORLD, DOMAIN, "a/0", 2, 64L,
+            "full");
+        IdentityWitness.LogicalKey range = IdentityWitness.LogicalKey.ranged(WORLD, DOMAIN, "a/0", 2,
+            "abc", "def");
+
+        assertNotEquals(entry, range);
+        assertNotEquals(entry.canonical(), range.canonical());
+        assertFalse(entry.canonical().startsWith("I2"));
+        assertFalse(range.canonical().startsWith("I1"));
+        assertEquals(entry, IdentityWitness.parse("I17:world-a14:chunk-pipeline3:a/0#2;#64;4:full"));
+        assertEquals(range, IdentityWitness.parse("I27:world-a14:chunk-pipeline3:a/0#2;#3:abc;3:def"));
+    }
+
+    @Test
+    void aSourceThatKeepsNoHistoryAnswersNoRangeAndHoldsNoObligation() {
+        IdentityWitness.Source none = IdentityWitness.NONE;
+        FrozenDeclarations.Seat seat = new FrozenDeclarations.Seat(WORLD, DOMAIN, 9L, 0);
+
+        assertNull(none.range(seat, 64L));
+        assertFalse(none.hasRange(seat));
+        FrozenDeclarations.RangeSeal seal = new RangeSealFixture().build();
+        assertSame(IdentityWitness.Obligation.NONE, none.oblige(seal));
+        assertSame(IdentityWitness.Obligation.NONE,
+            IdentityWitness.combine(IdentityWitness.Obligation.NONE,
+                IdentityWitness.Obligation.NONE));
+        AtomicLong settled = new AtomicLong();
+        IdentityWitness.Obligation second = () -> settled.incrementAndGet();
+        IdentityWitness.Obligation combined = IdentityWitness.combine(second, second);
+        combined.settle();
+        combined.settle();
+        assertEquals(2L, settled.get(), "one combined obligation settles each part exactly once");
+    }
 }
+

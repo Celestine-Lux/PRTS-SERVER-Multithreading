@@ -312,11 +312,22 @@ public final class WriteControlledSlots {
     public static final WriteControlledSlots NOTHING = new WriteControlledSlots(new OwnerRegistry(),
         WriteVersionSlots.NOTHING, new WorldEpochs(), Source.NONE);
 
+    /** Seats the retained declarations that can cover one position before the write is judged. It
+     * returns how many slots it registered; zero leaves the table exactly as it was. */
+    @FunctionalInterface
+    public interface LazySeat {
+
+        int seat(Object levelRef, String domainKey, WritePosition position, long tickIndex);
+    }
+
     private final OwnerRegistry owners;
     private final WriteVersionSlots versions;
     private final WorldEpochs epochs;
     private final Source source;
+    private volatile LazySeat lazySeat = (level, domain, position, tick) -> 0;
     private final Map<SlotKey, Slot> slots = new ConcurrentHashMap<>();
+    private final Set<SlotKey> declarationHeld = ConcurrentHashMap.newKeySet();
+    private final Map<SlotKey, OwnerToken> declarationOwners = new ConcurrentHashMap<>();
     private final Map<SlotKey, Long> generations = new ConcurrentHashMap<>();
     private final AtomicLong registered = new AtomicLong();
     private final AtomicLong renewed = new AtomicLong();
@@ -352,9 +363,29 @@ public final class WriteControlledSlots {
         return enabled;
     }
 
+    /** Names the retained declarations a write may lazy-seat before it is judged. */
+    public void lazySeat(LazySeat seated) {
+        lazySeat = seated == null ? (level, domain, position, tick) -> 0 : seated;
+    }
+
     /** Declares one slot. A slot that names no usable range, or whose key does not spell the range
      * it carries, is refused here and not repaired when a write arrives. */
     public Refusal register(Slot slot) {
+        return registerInternal(slot, false, null);
+    }
+
+    /** Registers one declaration-held slot without a frozen owner token. */
+    public Refusal register(Slot slot, boolean fromDeclaration) {
+        return registerInternal(slot, fromDeclaration, null);
+    }
+
+    /** Registers one declaration-held slot with the owner token it carried at declaration. The
+     * token is an internal marker; a manual slot still takes the live owner lookup. */
+    public Refusal register(Slot slot, OwnerToken declarationOwner) {
+        return registerInternal(slot, true, declarationOwner);
+    }
+
+    private Refusal registerInternal(Slot slot, boolean fromDeclaration, OwnerToken declarationOwner) {
         Refusal refusal = refusalOf(slot);
         if (refusal != Refusal.NONE) {
             noteRefusal(refusal);
@@ -371,13 +402,32 @@ public final class WriteControlledSlots {
         }
         slots.put(key, slot);
         generations.put(key, slot.slotGeneration());
+        if (fromDeclaration) {
+            declarationHeld.add(key);
+            if (declarationOwner != null) {
+                declarationOwners.put(key, declarationOwner);
+            } else {
+                declarationOwners.remove(key);
+            }
+        } else {
+            declarationHeld.remove(key);
+            declarationOwners.remove(key);
+        }
         registered.incrementAndGet();
         return Refusal.NONE;
+    }
+
+    /** The owner token a declaration-held slot carried when it was registered, or null for a
+     * manual slot. The write path uses it ahead of the live registry lookup. */
+    OwnerToken declarationOwnerOf(SlotKey key) {
+        return key == null ? null : declarationOwners.get(key);
     }
 
     /** Retires the slot of one key: the writes it covered fall back to the default path. */
     public boolean retire(SlotKey key) {
         generations.remove(key);
+        declarationHeld.remove(key);
+        declarationOwners.remove(key);
         return slots.remove(key) != null;
     }
 
@@ -402,6 +452,16 @@ public final class WriteControlledSlots {
             return lastDecision = Decision.defaultPath("");
         }
         List<Slot> candidates = candidates(levelRef, domainKey);
+        boolean lazyTried = false;
+        if (candidates.isEmpty()) {
+            // A retained declaration may cover the write although no slot was seated yet: ask it
+            // once before the default path, then judge the registered candidates normally.
+            lazyTried = true;
+            if (lazySeat.seat(levelRef, domainKey,
+                position == null ? WritePosition.NONE : position, tickIndex) > 0) {
+                candidates = candidates(levelRef, domainKey);
+            }
+        }
         if (candidates.isEmpty()) {
             defaultPath.incrementAndGet();
             return lastDecision = Decision.defaultPath("");
@@ -411,10 +471,12 @@ public final class WriteControlledSlots {
             // read: refusing is the only answer that does not match it against a whole world.
             return refuse(candidates.get(0), REASON_UNREADABLE_POSITION, 0, tickIndex);
         }
-        Map<String, Slot> covering = new LinkedHashMap<>();
-        for (Slot slot : candidates) {
-            if (slot.space().covers(position)) {
-                covering.putIfAbsent(identityOf(slot), slot);
+        Map<String, Slot> covering = covering(candidates, position);
+        if (covering.isEmpty() && !lazyTried) {
+            lazyTried = true;
+            if (lazySeat.seat(levelRef, domainKey, position, tickIndex) > 0) {
+                candidates = candidates(levelRef, domainKey);
+                covering = covering(candidates, position);
             }
         }
         if (covering.isEmpty()) {
@@ -432,6 +494,9 @@ public final class WriteControlledSlots {
         String world = source.worldOf(levelRef);
         Source.Step step = source.stepOf(slot.key().worldId(), slot.key().domainId(),
             slot.planNodeKey());
+        if (step == null && declarationHeld.contains(slot.key())) {
+            step = new Source.Step(slot.key().planSequence(), slot.position());
+        }
         WriteRefusal refusal = inspect(slot, world, step, tickIndex, covering.size());
         if (refusal != null) {
             rejected.incrementAndGet();
@@ -452,10 +517,23 @@ public final class WriteControlledSlots {
         return judge(levelRef, domainKey, WritePosition.NONE, tickIndex);
     }
 
+    private static Map<String, Slot> covering(List<Slot> candidates, WritePosition position) {
+        Map<String, Slot> covering = new LinkedHashMap<>();
+        for (Slot slot : candidates) {
+            if (slot.space().covers(position)) {
+                covering.putIfAbsent(identityOf(slot), slot);
+            }
+        }
+        return covering;
+    }
+
     private List<Slot> candidates(Object levelRef, String domainKey) {
         List<Slot> found = new ArrayList<>();
+        String world = levelRef == null ? "" : source.worldOf(levelRef);
         for (Slot slot : slots.values()) {
-            if (slot.levelRef() == levelRef && slot.writeSet().contains(domainKey)
+            boolean sameLevel = slot.levelRef() == levelRef;
+            boolean sameWorld = !world.isEmpty() && slot.key().worldId().equals(world);
+            if ((sameLevel || sameWorld) && slot.writeSet().contains(domainKey)
                 && slot.space().wellFormed()) {
                 found.add(slot);
             }
@@ -491,10 +569,25 @@ public final class WriteControlledSlots {
                                  int covering) {
         SlotKey key = slot.key();
         long carried = versions.carried(key.worldId(), key.level(), key.domainId());
+        Long granted = versions.grantedFor(key.planSequence(), key.worldId(), key.level(),
+            key.domainId());
         if (world.isEmpty() || !world.equals(key.worldId())) {
             return refusal(slot, "world", carried, tickIndex, covering);
         }
-        OwnerToken token = owners.lookup(key.worldId(), key.level(), key.domainId()).orElse(null);
+        OwnerToken token = declarationOwners.get(key);
+        if (token != null && (!token.worldId().equals(key.worldId())
+            || token.level() != key.level() || !token.domainId().equals(key.domainId()))) {
+            return refusal(slot, "owner", carried, tickIndex, covering);
+        }
+        OwnerToken liveToken = owners.lookup(key.worldId(), key.level(), key.domainId()).orElse(null);
+        if (token != null) {
+            if (liveToken != null && (liveToken.holderKind() != token.holderKind()
+                || !liveToken.holderSiteId().equals(token.holderSiteId()))) {
+                return refusal(slot, "owner", carried, tickIndex, covering);
+            }
+        } else {
+            token = liveToken;
+        }
         if (token == null || token.holderKind() != slot.holderKind()
             || !token.holderSiteId().equals(slot.holderSiteId())) {
             return refusal(slot, "owner", carried, tickIndex, covering);
@@ -502,7 +595,13 @@ public final class WriteControlledSlots {
         if (token.expiredAt(tickIndex) || slot.expireTick() <= 0L || tickIndex >= slot.expireTick()) {
             return refusal(slot, "expiry", carried, tickIndex, covering);
         }
-        if (carried <= WriteVersionSlots.NOT_CARRIED || carried != slot.expectedVersion()
+        // The generation the row wears has to be the one its own plan's grant answered: a plan
+        // that granted nothing here, and a row that names a generation of its own, are both a
+        // version this row does not carry, and the drift of the live slot is read the same way.
+        boolean grantMismatch = granted != null && granted != slot.expectedVersion();
+        boolean missingGrant = granted == null && !declarationHeld.contains(slot.key());
+        if (grantMismatch || missingGrant
+            || carried <= WriteVersionSlots.NOT_CARRIED || carried != slot.expectedVersion()
             || token.expectedVersion() != slot.expectedVersion()) {
             return refusal(slot, "version", carried, tickIndex, covering);
         }
@@ -514,10 +613,13 @@ public final class WriteControlledSlots {
         if (live <= 0L || live != slot.worldEpoch()) {
             return refusal(slot, "world_epoch", carried, tickIndex, covering);
         }
-        if (slot.planNodeKey().isEmpty() || step == null) {
+        if (slot.planNodeKey().isEmpty()) {
             return refusal(slot, "plan", carried, tickIndex, covering);
         }
-        if (step.planSequence() != key.planSequence()) {
+        if (step == null && !declarationHeld.contains(key)) {
+            return refusal(slot, "plan", carried, tickIndex, covering);
+        }
+        if (step != null && step.planSequence() != key.planSequence()) {
             return refusal(slot, "plan_sequence", carried, tickIndex, covering);
         }
         return null;
@@ -638,6 +740,8 @@ public final class WriteControlledSlots {
     public void reset() {
         slots.clear();
         generations.clear();
+        declarationHeld.clear();
+        declarationOwners.clear();
         registered.set(0L);
         renewed.set(0L);
         advanced.set(0L);

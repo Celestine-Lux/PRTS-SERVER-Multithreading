@@ -4,6 +4,7 @@ package io.izzel.arclight.common.prts.kernel;
 import io.izzel.arclight.common.prts.kernel.arena.ArenaLedger;
 import io.izzel.arclight.common.prts.kernel.arena.ArenaPassthrough;
 import io.izzel.arclight.common.prts.kernel.auth.OwnerRegistry;
+import io.izzel.arclight.common.prts.kernel.auth.OwnerRegistry.OwnershipDomain;
 import io.izzel.arclight.common.prts.kernel.auth.WriteAuthority;
 import io.izzel.arclight.common.prts.kernel.auth.WriteLedger;
 import io.izzel.arclight.common.prts.kernel.auth.WriteLevel;
@@ -21,6 +22,8 @@ import io.izzel.arclight.common.prts.kernel.commit.DeclarationInstanceAllocator;
 import io.izzel.arclight.common.prts.kernel.commit.EffectStore;
 import io.izzel.arclight.common.prts.kernel.commit.FrozenDeclarations;
 import io.izzel.arclight.common.prts.kernel.commit.IdentityWitness;
+import io.izzel.arclight.common.prts.kernel.commit.RangeSealTable;
+import io.izzel.arclight.common.prts.kernel.commit.RangeSettlementObligations;
 import io.izzel.arclight.common.prts.kernel.exits.DualExits;
 import io.izzel.arclight.common.prts.kernel.safety.SafetyNet;
 import io.izzel.arclight.common.prts.kernel.safety.ZeroEffectDetector;
@@ -33,7 +36,9 @@ import io.izzel.arclight.common.prts.kernel.jobs.JobDeclaration;
 import io.izzel.arclight.common.prts.kernel.jobs.JobGraph;
 import io.izzel.arclight.common.prts.kernel.jobs.JobIntake;
 import io.izzel.arclight.common.prts.kernel.jobs.JobScheduler;
+import io.izzel.arclight.common.prts.kernel.jobs.PipelineBatchLedger;
 import io.izzel.arclight.common.prts.kernel.jobs.PipelineRoundJobs;
+import io.izzel.arclight.common.prts.kernel.jobs.PipelineRunSeal;
 import io.izzel.arclight.common.prts.kernel.jobs.ShareMeterPoint;
 import io.izzel.arclight.common.prts.kernel.plan.TickPlan;
 import io.izzel.arclight.common.prts.kernel.plan.TickPlanPlanner;
@@ -75,9 +80,10 @@ import io.izzel.arclight.common.prts.kernel.observe.RegionIdentityObserver;
 import io.izzel.arclight.common.prts.kernel.observe.SaveIdentityObserver;
 import io.izzel.arclight.common.prts.kernel.observe.StallAttributionObserver;
 import io.izzel.arclight.common.prts.kernel.observe.TickDigestObserver;
-import io.izzel.arclight.common.prts.kernel.domain.entity.LiveEntityAccess;
 import io.izzel.arclight.common.prts.kernel.meter.SelfCostTap;
+import io.izzel.arclight.common.prts.support.PrtsChunkDemand;
 import io.izzel.arclight.common.prts.support.PrtsChunkMaterialization;
+import io.izzel.arclight.common.prts.support.PrtsPipelineBatches;
 import io.izzel.arclight.common.prts.support.PrtsPipelineRows;
 import io.izzel.arclight.common.prts.support.PrtsSelfCosts;
 import io.izzel.arclight.common.prts.support.PrtsWaitSites;
@@ -87,6 +93,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Deque;
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -203,11 +210,25 @@ public final class KernelModule {
     private final List<KernelDomain> domains = new ArrayList<>();
     private final JobIntake jobIntake = new JobIntake(KernelSettings::jobQueueCap);
     private final JobScheduler scheduler = new JobScheduler();
+    private final PipelineBatchLedger pipelineBatches = new PipelineBatchLedger();
+    /** The range seals a run start may publish: the table the identity source reads, sized by the
+     * ledger's own pending bound and by no literal. */
+    private final RangeSealTable rangeSeals = new RangeSealTable(pipelineBatches.pendingLimit());
+    /** The settlement obligations the seals a run start publishes owe: a published seal is held here
+     * until the settlement that names its seat releases it. */
+    private final RangeSettlementObligations settlementObligations =
+        new RangeSettlementObligations();
     private final PipelineRoundJobs pipelineJobs = new PipelineRoundJobs();
-    /** The demands a freeze reads as shadow candidates; nothing read here is sealed. */
-    private final DemandShadowCandidates demandShadows = new DemandShadowCandidates();
+    /** The demands a freeze reads as shadow candidates. This reader seals nothing; the freeze does. */
+    private final DemandShadowCandidates demandShadows =
+        new DemandShadowCandidates(pipelineBatches.pendingLimit(), pipelineBatches::currentPlan);
     private final PipelineWriteClaims claims = new PipelineWriteClaims(versionSlots,
-        guard.worldEpochs(), guard::onServerThread, LiveEntityAccess::level);
+        guard.worldEpochs(), guard::onServerThread, LiveLevels::level,
+        this::noteTypedSettlement);
+    /** A bounded exact order for a plan a retained claim still names; cleared with the claim floor. */
+    private final Map<Long, RetainedOrder> retainedOrders = new ConcurrentHashMap<>();
+    private record RetainedOrder(long lifecycle, List<TickPlan.CommitStep> order) {
+    }
     private final ShareMeterPoint jobMeter = new ShareMeterPoint();
     private final TickPlanStore plans = new TickPlanStore(KernelSettings.planHistoryCap());
     private final SafetyNet safety = new SafetyNet(KernelSettings::safetyDegrade,
@@ -216,7 +237,19 @@ public final class KernelModule {
     private final DualExits exits = new DualExits(KernelSettings.exitWindowTicks());
     /** The one plan authority of this module. A chain is adopted only when the log it carries asks
      * this very instance, so the identity of an order source is a reference and not a shape. */
-    private final CommitLog.OrderSource commitOrderSource = this::resolveCommitOrder;
+    private final CommitLog.OrderSource commitOrderSource = new CommitLog.OrderSource() {
+
+        @Override
+        public CommitLog.Resolved resolve(String worldId, String domainId, String nodeKey) {
+            return resolveCommitOrder(worldId, domainId, nodeKey);
+        }
+
+        @Override
+        public CommitLog.Resolved resolveAt(long planSequence, long lifecycle, String worldId,
+                                            String domainId, String nodeKey) {
+            return resolveCommitOrderAt(planSequence, lifecycle, worldId, domainId, nodeKey);
+        }
+    };
     /** Where a typed line's freeze is read from: the declarations this module sealed and the
      * generations live right now. The table is written by the freeze alone. */
     private final IdentityWitness.Source commitIdentitySource = new IdentityWitness.Source() {
@@ -239,13 +272,66 @@ public final class KernelModule {
         }
 
         @Override
+        public FrozenDeclarations.RangeSeal range(FrozenDeclarations.Seat seat, long cell) {
+            return rangeSeals.locate(seat, cell);
+        }
+
+        @Override
+        public boolean hasRange(FrozenDeclarations.Seat seat) {
+            return rangeSeals.hasSeat(seat);
+        }
+
+        @Override
+        public IdentityWitness.Obligation oblige(FrozenDeclarations.RangeSeal seal) {
+            return rangeSeals.oblige(seal);
+        }
+
+        @Override
         public long liveWorldEpoch(String worldId) {
             return guard.worldEpochs().epochOf(worldId);
         }
 
         @Override
-        public long liveAuthorization(String worldId, String domainId, String nodeKey) {
-            return versionSlots.peek(worldId, WriteLevel.REGION, domainId);
+        public IdentityWitness.Authorization liveAuthorization(long planSequence,
+                CommitNamespaces.Namespace planController, String worldId, String domainId,
+                String nodeKey) {
+            String lifecycleKey = declarationLifecycleKey();
+            long held = versionSlots.grantedPlan();
+            if (planController == null || !planController.lifecycleKey().equals(lifecycleKey)) {
+                // The record is published under this module's own lifecycle and the reset path clears
+                // it in the same move, so a plan controller of any other lifecycle is answered with a
+                // refusal and never with the number the record happens to carry.
+                return IdentityWitness.Authorization.refused(lifecycleKey, held,
+                    IdentityWitness.Authorization.Face.notRead(), "record-of-another-lifecycle");
+            }
+            if (held == 0L) {
+                // Nothing was published for any plan: this is not the same state as a record that
+                // belongs to another plan, so it names the record's own sentinel and no lifecycle.
+                return IdentityWitness.Authorization.refused("", 0L,
+                    IdentityWitness.Authorization.Face.notRead(), "no-record");
+            }
+            if (held != planSequence) {
+                return IdentityWitness.Authorization.refused(lifecycleKey, held,
+                    IdentityWitness.Authorization.Face.notRead(), "record-of-another-plan");
+            }
+            Long granted = versionSlots.grantedFor(planSequence, worldId, WriteLevel.REGION, domainId);
+            if (granted == null) {
+                return IdentityWitness.Authorization.refused(lifecycleKey, planSequence,
+                    IdentityWitness.Authorization.Face.absent(), "domain-not-granted");
+            }
+            if (granted == WriteVersionSlots.NOT_CARRIED) {
+                return IdentityWitness.Authorization.refused(lifecycleKey, planSequence,
+                    IdentityWitness.Authorization.Face.present(WriteVersionSlots.NOT_CARRIED),
+                    "grant-not-carried");
+            }
+            // The validity face is the live slot read here and now, uncounted and never written back
+            // over the frozen number; a slot that was retired is a declared absence, and a slot never
+            // carries the declared zero because every value is minted from one.
+            long live = versionSlots.peek(worldId, WriteLevel.REGION, domainId);
+            return IdentityWitness.Authorization.answered(lifecycleKey, planSequence, granted,
+                live == WriteVersionSlots.NOT_CARRIED
+                    ? IdentityWitness.Authorization.Face.absent()
+                    : IdentityWitness.Authorization.Face.present(live));
         }
 
         @Override
@@ -261,6 +347,14 @@ public final class KernelModule {
     /** The one source of the instance numbers a freeze seals: held here and handed to no one. */
     private final DeclarationInstanceAllocator declarationInstances =
         new DeclarationInstanceAllocator();
+    /** The factory of the range seals a run start may publish. It is handed the same table the
+     * identity source reads and the declarations in force, and it seals nothing until a window
+     * asks. A seal it publishes is held by the settlement obligations until the settlement that
+     * names its seat releases it. */
+    private final PipelineRangeSeals rangeSealFactory = new PipelineRangeSeals(pipelineBatches,
+        rangeSeals, plans, declarationInstances::mintOne,
+        worldId -> guard.worldEpochs().epochOf(worldId), this::declarations,
+        settlementObligations);
     private long declarationGeneration;
     private String declarationRefusal = "";
     private long declarationRefusals;
@@ -271,9 +365,15 @@ public final class KernelModule {
     /** The log in use: the module's own until a whole chain is adopted, and the log of that chain
      * afterwards. Only an install moves it, and an install moves it whole or not at all. */
     private CommitLog commits = ownCommits;
+    /** The typed fan-out of one settlement period: it validates a whole batch before it writes a line
+     * and writes nothing for a batch any of whose inputs is missing. */
+    private final TypedConsumerSettlement typedConsumer = new TypedConsumerSettlement(
+        () -> commits, rangeSeals, () -> commitIdentitySource.currentController());
     /** The generation holder of a chain this module adopts: the module is its lifecycle owner. */
     private final CommitNamespaces.ResetEpochs commitChainEpochs = new CommitNamespaces.ResetEpochs();
     private long tickIndex;
+    /** The server whose live levels the claim point resolves; the host names it before the tick. */
+    private volatile net.minecraft.server.MinecraftServer liveServer;
     private int waitCrossStreak;
     private boolean waitSiteTapInstalled;
     private boolean pipelineRowTapInstalled;
@@ -363,10 +463,17 @@ public final class KernelModule {
         intents.bindPayload(guard);
         guard.versionSlots(versionSlots);
         guard.controlledSlots(controlledSlots);
-        // The claim point seats the slot a declared job covers and reports the batches that landed;
-        // the guard hands a captured write over to it and the judged path decides the write.
+        // The claim point seats a declared job's slot and reports the batches that landed.
         claims.table(controlledSlots);
-        guard.claimLandedTap((slot, worldId, tick) -> claims.noteLanded(slot, worldId));
+        claims.owners(owners);
+        claims.writeSpaces(KernelWriteRanges.reader());
+        guard.claimLandedTap((slot, worldId, tick, row) -> claims.noteLanded(slot, worldId, row));
+        pipelineJobs.bind(pipelineBatches);
+        claims.ledger(pipelineBatches);
+        // A seal of an older plan stays readable while a retained claim still names its batch.
+        rangeSealFactory.retained(claims::retainsBatch);
+        demandShadows.retained(claims::retainsBatch);
+        rangeSealFactory.retainedOrders(this::retainedOrder);
         // The progress side of the two rows whose producer already exists: the intent channel depth
         // and the world epoch change count are the same counters the readout publishes, so a signal
         // reading and its control-plane value can never disagree.
@@ -402,6 +509,7 @@ public final class KernelModule {
     /** Advances the kernel by one tick. */
     public void serverTick(List<String> worldIds) {
         if (!KernelSettings.enabled()) {
+            LiveLevels.clear();
             guard.refresh(false, false, false, tickIndex);
             versionSlots.refresh(false);
             ownerGrants.refresh(false);
@@ -415,6 +523,7 @@ public final class KernelModule {
         }
         long startedAt = System.nanoTime();
         tickIndex++;
+        LiveLevels.refresh(liveServer);
         loadThread.noteTick(tickIndex);
         chunkMaterialization.noteTick(tickIndex);
         if (!started) {
@@ -433,6 +542,7 @@ public final class KernelModule {
         claims.refresh(KernelSettings.writeControlledSlot() && KernelSettings.pipelineJobs()
             && KernelSettings.tickPlan());
         claims.noteTick(tickIndex);
+        pipelineBatches.noteTick(tickIndex);
         guard.refresh(KernelSettings.writePathGuard(),
             KernelSettings.enforceUnregisteredWrites(),
             KernelSettings.routeUnregisteredWrites(), tickIndex);
@@ -529,6 +639,8 @@ public final class KernelModule {
     /** Remembers the server the tick source is, so the save identity and the partition can be named
      * at a read. */
     public void noteTickSource(net.minecraft.server.MinecraftServer server) {
+        liveServer = server;
+        LiveLevels.refresh(server);
         saveIdentity.source(server);
         regionIdentity.source(server);
         tickDigest.source(server);
@@ -550,6 +662,12 @@ public final class KernelModule {
             chunkMaterialization.attach();
             attribution.attach();
             chunkDemand.attach();
+            chunkDemand.attachSecondPath(demandShadows);
+            demandShadows.clearPending();
+            PrtsChunkDemand.installPendingBinder(task -> demandShadows.bindPending(
+                (PipelineBatchLedger.TrackedTask) task, pipelineBatches));
+            PipelineRunSeal.install(demandShadows::statusFor);
+            PipelineRunSeal.installRange(rangeSealFactory);
             PrtsSelfCosts.install(selfCosts);
             // The chunk row's declared signal is bound only while its producer is installed: a row
             // whose producer is switched off keeps reporting an unbound slot rather than a zero.
@@ -563,6 +681,10 @@ public final class KernelModule {
             chunkMaterialization.detach();
             attribution.detach();
             chunkDemand.detach();
+            PrtsChunkDemand.installPendingBinder(null);
+            demandShadows.clearPending();
+            PipelineRunSeal.install(null);
+            PipelineRunSeal.installRange(null);
             PrtsSelfCosts.install(null);
         }
     }
@@ -593,9 +715,8 @@ public final class KernelModule {
         }
     }
 
-    /** Installs or removes the reader that turns the rounds of the chunk pipeline into jobs. It
-     * reads the same rows the digest reads and takes nothing away from it, and it is only installed
-     * while a plan exists to consume the declarations. */
+    /** Installs or removes the reader that turns the rounds of the chunk pipeline into jobs; it is
+     * only installed while a plan exists to consume the declarations. */
     private void syncPipelineOwnerTap(boolean wanted) {
         boolean claimTap = wanted && KernelSettings.writeControlledSlot();
         if (pipelineOwnerTapInstalled == wanted && claimsTapInstalled == claimTap) {
@@ -611,6 +732,9 @@ public final class KernelModule {
         claimsTapInstalled = claimTap;
         if (wanted) {
             PrtsPipelineRows.installOwnerTap(pipelineJobs);
+            PrtsPipelineBatches.install(pipelineBatches, () -> tickIndex);
+        } else {
+            PrtsPipelineBatches.uninstall();
         }
         if (claimTap) {
             PrtsPipelineRows.installOwnerTap(claims);
@@ -743,13 +867,18 @@ public final class KernelModule {
         }
         planSequence++;
         if (KernelSettings.pipelineJobs() && KernelSettings.tickPlan()) {
-            noteJobDeclarations(pipelineJobs.declareInto(jobIntake));
+            noteJobDeclarations(pipelineJobs.declareInto(jobIntake, planSequence, tickIndex));
         }
-        // The demands of this freeze are read before the plan is built and never handed to it:
-        // what they become is a shadow candidate, and the freeze that read it is all it gets.
-        demandShadows.readFor(new DemandShadowCandidates.Freeze(planSequence, worldGeneration,
-            new FrozenDeclarations.FreezeKey(declarationLifecycleKey(), declarationGeneration)
-                .next()), worldId -> guard.worldEpochs().epochOf(worldId));
+        // The demands of this freeze are read once, before the plan is built, and the declarations of
+        // that one window are handed to the same intake the plan takes from below: a capture the
+        // window handed over declares the node its candidate is matched at, and no other key is made.
+        List<DemandShadowCandidates.Shadow> window = demandShadows.readFor(
+            new DemandShadowCandidates.Freeze(planSequence, worldGeneration,
+                new FrozenDeclarations.FreezeKey(declarationLifecycleKey(), declarationGeneration)
+                    .next()), worldId -> guard.worldEpochs().epochOf(worldId));
+        for (JobDeclaration declaration : demandShadows.declarationsOf(window)) {
+            jobIntake.submit(declaration);
+        }
         List<String> domainIds = new ArrayList<>();
         for (KernelDomain domain : domains) {
             domainIds.add(domain.id());
@@ -768,6 +897,19 @@ public final class KernelModule {
             planNanosMax = freezeNanos;
         }
         if (result.ok()) {
+            // The declared-level seals of the span that just closed are published from the retained
+            // real statuses before the new plan's declarations replace the ones they name; a status
+            // that cannot be proved publishes nothing.
+            FrozenDeclarations settledDeclarations = declarations();
+            rangeSealFactory.rememberDeclarations(settledDeclarations);
+            List<DemandShadowCandidates.TaskStatus> retainedStatuses =
+                demandShadows.retainedStatuses();
+            if (!retainedStatuses.isEmpty()) {
+                rangeSealFactory.publishDeclaredDeclared(settledDeclarations, retainedStatuses,
+                    rangeSeals.generation());
+                demandShadows.releaseBefore(result.plan().planSequence(),
+                    claimsEnabled() ? claims::retainsBatch : null);
+            }
             // Sealed against this plan's own commit order and bound before the plan is published:
             // the interval authorizes nothing because the pair is told apart by the plan sequence.
             sealDeclarations(result.plan());
@@ -775,11 +917,25 @@ public final class KernelModule {
             grantVersionSlots(result.plan());
             ownerGrants.apply(result.plan().graph(), tickIndex);
             if (claimsEnabled()) {
-                // The span the pipeline just closed is reported to the commit log first, so the
-                // batches of a landed write are ordered by the plan that carries their node, and the
-                // declarations of the plan that just froze are taken for the span that follows.
-                claims.reportLanded(result.plan().graph(), this::noteLandedBatch);
-                claims.declare(result.plan().graph(), result.plan().planSequence(), tickIndex);
+                // The span that closed is settled against the plan that authorized it; the plan
+                // that just froze is taken for the span that follows, after the settlement.
+                claims.reportLanded(this::noteLandedBatch);
+                claims.declare(result.plan().graph(), result.plan().planSequence(), tickIndex,
+                    plans.lifecycle());
+                // A plan that declared a write set is its own writer for the span that follows: the
+                // seat comes from the declaration itself, so a span whose jobs run no task body still
+                // covers the writes its own range names until the next freeze replaces the set.
+                claims.seatDeclared();
+                retainOrder(result.plan());
+            }
+            if (KernelSettings.pipelineJobs() && KernelSettings.tickPlan()) {
+                // A seal whose plan the settlement has moved past can no longer be named by it: the
+                // sweep ends its obligation here, so a window that published one leaves no pin.
+                // A claim still holding an older plan keeps that plan's seals readable for the
+                // settlement that has not reached it yet.
+                long retainedFloor = claimsEnabled() ? claims.retainedPlanFloor() : Long.MAX_VALUE;
+                rangeSealFactory.settleBefore(result.plan().planSequence(), retainedFloor);
+                trimRetainedOrders(Math.min(result.plan().planSequence(), retainedFloor));
             }
             if (KernelSettings.pipelineJobs() && KernelSettings.tickPlan()) {
                 dispatchFrozen(result.plan());
@@ -815,7 +971,9 @@ public final class KernelModule {
             places.add(new FrozenDeclarations.Assignment(step.worldId(), step.domainId(),
                 step.nodeKey(), step.position()));
         }
-        List<FrozenDeclarations.Candidate> handed = pipelineJobs.candidateDeclarations();
+        List<FrozenDeclarations.Candidate> handed =
+            new ArrayList<>(pipelineJobs.candidateDeclarations());
+        handed.addAll(demandShadows.candidatesOf(demandShadows.lastCandidates()));
         String epochRefusal = declarationEpochRefusal(handed);
         if (!epochRefusal.isEmpty()) {
             declarationRefusals++;
@@ -947,14 +1105,29 @@ public final class KernelModule {
             && KernelSettings.tickPlan();
     }
 
-    /** A batch no plan ordered is counted as unplanned rather than reordered. */
+    /** A batch no plan ordered is counted as unplanned rather than reordered. The plan, seat and
+     * lifecycle the claim point saved are carried to the log; the log checks them against the order
+     * source instead of resolving the node key to the newest plan again. */
     private void noteLandedBatch(PipelineWriteClaims.Report report) {
         if (!KernelSettings.commitLog()) {
             return;
         }
         commits.reach(new CommitLog.Batch(report.worldId(), report.domainId(), report.nodeKey(),
             CommitLog.Batch.Kind.APPLY, report.expectedVersion(), report.writeSetDigest(),
-            report.rows()));
+            report.rows()), report.planSequence(), report.position(), report.lifecycle());
+    }
+
+    /** Settles one attributed batch: the typed fan-out writes the lines its inputs support, and the
+     * seal obligations of its seat are settled whatever it wrote, so a refused batch cannot pin the
+     * table. A settlement that names no seat settles nothing. */
+    private void noteTypedSettlement(PipelineWriteClaims.Attributed payload) {
+        if (payload == null) {
+            return;
+        }
+        typedConsumer.settle(payload);
+        PipelineWriteClaims.Report report = payload.report();
+        rangeSealFactory.settleSeat(new FrozenDeclarations.Seat(report.worldId(), report.domainId(),
+            report.planSequence(), report.position()));
     }
 
     /** Counts the declarations the domains handed to the planning period, whether the intake took
@@ -978,7 +1151,46 @@ public final class KernelModule {
         return pipelineJobs;
     }
 
-    /** The chunk demands the freeze reads as shadow candidates; no column of them is sealed. */
+    /** The batches the chunk pipeline submitted, as the ledger that tracks them reads them. */
+    public PipelineBatchLedger pipelineBatches() {
+        return pipelineBatches;
+    }
+
+    /** The range seals a run start may publish: the one table the identity source reads and the
+     * run-start factory is handed. Read-only for every caller. */
+    public RangeSealTable rangeSeals() {
+        return rangeSeals;
+    }
+
+    /** The read-only readiness of a typed consumer: which inputs the kernel already holds. The
+     * settlement point is wired, so the columns describe the inputs of a build rather than the
+     * build's own wiring. */
+    public record TypedConsumerReadiness(boolean effectsBound, boolean controllerBound,
+                                         boolean obligationsRegistered, boolean attributionArmed) {
+
+        /** Whether this build wires the settlement point. */
+        public static final boolean SETTLEMENT_WIRED = true;
+
+        /** Whether every input a typed line needs is present and the settlement point is wired. */
+        public boolean ready() {
+            return SETTLEMENT_WIRED && inputsBound();
+        }
+
+        /** Whether every input except the settlement point itself is present. */
+        public boolean inputsBound() {
+            return effectsBound && controllerBound && obligationsRegistered && attributionArmed;
+        }
+    }
+
+    /** The read-only readiness of a typed consumer: what the module already holds at this moment. It
+     * reads state and produces nothing. */
+    public TypedConsumerReadiness typedConsumerReadiness() {
+        return new TypedConsumerReadiness(commits.effects() != null, commitController() != null,
+            rangeSealFactory.settlementObligationsRegistered(), claims.settlementArmed());
+    }
+
+    /** The chunk demands the freeze reads as shadow candidates. The reader seals nothing; the freeze
+     * seals a capture that carries every column. */
     public DemandShadowCandidates demandShadowCandidates() {
         return demandShadows;
     }
@@ -988,16 +1200,23 @@ public final class KernelModule {
         return claims;
     }
 
-    /** The value is minted once per domain and kept until an invalidation retires it. */
+    /** The value is minted once per domain and kept until an invalidation retires it. The answer of
+     * each grant is taken here and published as this plan's own record before the plan is handed
+     * out, so a row that comes later wears the number this loop read back. */
     private void grantVersionSlots(TickPlan plan) {
         if (plan.graph() == null) {
             return;
         }
+        Map<OwnershipDomain, Long> granted = new HashMap<>();
         for (JobGraph.Node node : plan.graph().nodes()) {
             for (JobDeclaration.DomainRef ref : node.writeSet()) {
-                versionSlots.grant(ref.worldId(), WriteLevel.REGION, ref.domainId());
+                OwnershipDomain domain =
+                    new OwnershipDomain(ref.worldId(), WriteLevel.REGION, ref.domainId());
+                granted.put(domain,
+                    versionSlots.grant(ref.worldId(), WriteLevel.REGION, ref.domainId()));
             }
         }
+        versionSlots.noteGranted(plan.planSequence(), granted);
     }
 
     /** The four detectors of the safety net, reading the counters the layers around it published
@@ -1101,7 +1320,11 @@ public final class KernelModule {
 
         @Override
         public String worldOf(Object levelRef) {
-            return claims.worldOf(levelRef);
+            String world = claims.worldOf(levelRef);
+            if (world.isEmpty()) {
+                world = LiveLevels.worldOf(levelRef);
+            }
+            return LiveLevels.ambiguous(world) ? "" : world;
         }
 
         @Override
@@ -1118,6 +1341,57 @@ public final class KernelModule {
             return null;
         }
         return new CommitLog.Resolved(ref.planSequence(), ref.position(), ref.intent());
+    }
+
+    /** Resolves one commit against the exact plan and lifecycle a landing report names; the newest
+     * plan that reused the key is never consulted here. */
+    private CommitLog.Resolved resolveCommitOrderAt(long planSequence, long lifecycle,
+                                                    String worldId, String domainId,
+                                                    String nodeKey) {
+        TickPlanStore.StepRef ref = plans.resolveIn(planSequence, lifecycle, worldId, domainId,
+            nodeKey);
+        if (ref == null) {
+            if (!claimsEnabled() || !claims.holdsPlan(planSequence)) {
+                return null;
+            }
+            return retainedOrderAt(planSequence, lifecycle, worldId, domainId, nodeKey);
+        }
+        return new CommitLog.Resolved(ref.planSequence(), ref.position(), ref.intent());
+    }
+
+    /** The exact seat of one retained plan when the bounded plan history no longer carries it. */
+    private CommitLog.Resolved retainedOrderAt(long planSequence, long lifecycle, String worldId,
+                                               String domainId, String nodeKey) {
+        RetainedOrder held = retainedOrders.get(planSequence);
+        if (held == null || held.lifecycle() != lifecycle) {
+            return null;
+        }
+        for (TickPlan.CommitStep step : held.order()) {
+            if (step.worldId().equals(worldId) && step.domainId().equals(domainId)
+                && step.nodeKey().equals(nodeKey)) {
+                return new CommitLog.Resolved(planSequence, step.position(), step.intent());
+            }
+        }
+        return null;
+    }
+
+    /** The order of one plan a retained claim still names, or null when nothing retained it. */
+    List<TickPlan.CommitStep> retainedOrder(long planSequence, long lifecycle) {
+        RetainedOrder held = retainedOrders.get(planSequence);
+        return held == null || held.lifecycle() != lifecycle ? null : held.order();
+    }
+
+    private void retainOrder(TickPlan plan) {
+        if (!claimsEnabled()) {
+            return;
+        }
+        retainedOrders.put(plan.planSequence(),
+            new RetainedOrder(plans.lifecycle(), List.copyOf(plan.commitOrder())));
+        trimRetainedOrders(claims.retainedPlanFloor());
+    }
+
+    private void trimRetainedOrders(long floor) {
+        retainedOrders.keySet().removeIf(sequence -> sequence < floor);
     }
 
     /** The state the control plane publishes: the phase, and the rung the ladder stands on when it
@@ -2783,7 +3057,14 @@ public final class KernelModule {
         jobIntake.reset();
         scheduler.reset();
         pipelineJobs.reset();
+        pipelineBatches.reset();
+        rangeSeals.reset();
+        retainedOrders.clear();
+        rangeSealFactory.reset();
+        rangeSealFactory.resetObligations();
+        demandShadows.resetStatuses();
         claims.reset();
+        typedConsumer.reset();
         jobDeclarations = 0L;
         lastDispatchHandedOut = 0L;
         jobMeter.reset();
